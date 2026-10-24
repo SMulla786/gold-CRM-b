@@ -5,6 +5,7 @@ import helmet from 'helmet';
 import { env } from './config/env';
 import { prisma } from './lib/prisma';
 import { errorHandler } from './middleware/error';
+import { authRouter } from './modules/auth/routes';
 
 /** App factory (no listen) so supertest can mount it. Module routers get registered here. */
 export function createApp() {
@@ -18,6 +19,8 @@ export function createApp() {
     await prisma.$queryRaw`SELECT 1`;
     res.json({ ok: true });
   });
+
+  app.use('/api/auth', authRouter);
 
   app.use(errorHandler);
   return app;
