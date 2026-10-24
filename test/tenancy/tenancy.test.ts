@@ -142,7 +142,7 @@ describe('(b) admin consolidation & branch-admin subtree', () => {
     const mv = await api
       .post(`/api/admin/branches/${a.kothrud.id}/move`)
       .set('Authorization', bearer(token!))
-      .send({ parentId: a.mumbai.id });
+      .send({ newParentId: a.mumbai.id });
     expect([200, 204]).toContain(mv.status);
     const moved = await db.branch.findUniqueOrThrow({ where: { id: a.kothrud.id } });
     expect(moved.path.startsWith(a.mumbai.path)).toBe(true);
@@ -157,7 +157,7 @@ describe('(c) subscription read-only guard', () => {
     const res = await api
       .post('/api/admin/users')
       .set('Authorization', bearer(token!))
-      .send({ name: 'X', username: 'blocked-write', password: 'Passw0rd!', level: 'BRANCH_USER', branchId: a.kothrud.id });
+      .send({ name: 'Blocked Write', username: 'blocked-write', password: 'Passw0rd!', level: 'BRANCH_USER', branchId: a.kothrud.id });
     expect(res.status).toBe(403);
     expect(res.body.error.code).toBe('READ_ONLY');
   });
@@ -203,7 +203,7 @@ describe('(d) plan-limit guards', () => {
     const res = await api
       .post('/api/admin/users')
       .set('Authorization', bearer(token!))
-      .send({ name: 'Y', username: 'overflow-user', password: 'Passw0rd!', level: 'BRANCH_USER', branchId: a.kothrud.id });
+      .send({ name: 'Overflow User', username: 'overflow-user', password: 'Passw0rd!', level: 'BRANCH_USER', branchId: a.kothrud.id });
     expect(res.status).toBe(403);
     expect(res.body.error.code).toBe('PLAN_LIMIT');
     expect(await db.user.count({ where: { businessId: a.business.id } })).toBe(before);
