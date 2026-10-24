@@ -114,6 +114,13 @@ model Business {
   subscriptions Subscription[]
   payments      SubscriptionPayment[]
   signupRequest SignupRequest?
+  parties       Party[]
+  bankAccounts  BankAccount[]
+  hsnCodes      BusinessHsn[]
+  settings      Setting[]
+  karats        KaratMapping[]
+  metalRates    MetalRate[]
+  rateLimits    RateLimit[]
 }
 
 /// Subscription snapshots plan limits/modules so later plan edits don't change running subscriptions.
@@ -184,29 +191,29 @@ model SignupRequest {
 /// Branch tree. Root branch (parentId = null) is created with the business and owned by the owner admin.
 /// path = ancestor ids incl. self, e.g. "/1/4/9/"; subtree of X = path startsWith X.path.
 model Branch {
-  id           Int       @id @default(autoincrement())
+  id           Int                @id @default(autoincrement())
   businessId   Int
   parentId     Int?
   path         String
-  depth        Int       @default(0)
+  depth        Int                @default(0)
   /// Branch-admin node: an ADMIN user attached here manages this subtree.
-  isAdminNode  Boolean   @default(false)
+  isAdminNode  Boolean            @default(false)
   name         String
   code         String?
   inchargeName String?
-  countryCode  String    @default("+91")
+  countryCode  String             @default("+91")
   mobile       String?
   gstin        String?
   stateId      Int?
   districtId   Int?
   address      String?
   disclaimer   String?
-  isActive     Boolean   @default(true)
-  createdAt    DateTime  @default(now())
-  updatedAt    DateTime  @updatedAt
-  business     Business  @relation(fields: [businessId], references: [id])
-  parent       Branch?   @relation("BranchTree", fields: [parentId], references: [id])
-  children     Branch[]  @relation("BranchTree")
+  isActive     Boolean            @default(true)
+  createdAt    DateTime           @default(now())
+  updatedAt    DateTime           @updatedAt
+  business     Business           @relation(fields: [businessId], references: [id])
+  parent       Branch?            @relation("BranchTree", fields: [parentId], references: [id])
+  children     Branch[]           @relation("BranchTree")
   counters     Counter[]
   users        User[]
   extraUsers   UserBranchAccess[]
@@ -388,4 +395,182 @@ model ImpersonationLog {
   endedAt      DateTime?
 
   @@index([businessId])
+}
+
+// ═════════════ Phase 1 — masters & settings (spec: docs/modules/11-masters-settings.md) ═════════════
+
+enum PartyType {
+  CUSTOMER
+  SUPPLIER
+  KARIGAR
+  WHOLESALER
+}
+
+enum MetalKind {
+  GOLD
+  SILVER
+}
+
+enum RateUnit {
+  GRAM_1
+  GRAM_10
+  TOLA
+  KG_1
+}
+
+enum BankApplyTo {
+  ALL
+  SYSTEM
+  JUST_BILL
+  STOCK_BILL
+  STOCK_AND_JUST_BILL
+}
+
+enum HsnCategory {
+  GOLD
+  SILVER
+  ARTIFICIAL
+  STONE
+  FRANCHISE
+  FINDINGS
+}
+
+/// Customers / suppliers / karigars — shared across all branches of a business.
+model Party {
+  id              Int       @id @default(autoincrement())
+  businessId      Int
+  type            PartyType
+  /// family sub-profile under a parent customer
+  parentId        Int?
+  name            String
+  countryCode     String    @default("+91")
+  mobile          String
+  email           String?
+  address         String?
+  birthday        DateTime? @db.Date
+  anniversary     DateTime? @db.Date
+  aadhaar         String?
+  pan             String?
+  gstin           String?
+  licenseNo       String?
+  regNo           String?
+  logoTitle       String?
+  shopName        String?
+  stateId         Int?
+  districtId      Int?
+  area            String?
+  shopAddress     String?
+  pinCode         String?
+  /// karigar specialty
+  specialty       String?
+  photoUrl        String?
+  shopLogoUrl     String?
+  isActive        Boolean   @default(true)
+  createdBranchId Int?
+  createdById     Int?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+  business        Business  @relation(fields: [businessId], references: [id])
+  parent          Party?    @relation("PartyFamily", fields: [parentId], references: [id])
+  members         Party[]   @relation("PartyFamily")
+
+  @@index([businessId, type, name])
+  @@index([businessId, mobile])
+}
+
+/// branchId 0 = available to all branches of the business.
+model BankAccount {
+  id         Int         @id @default(autoincrement())
+  businessId Int
+  branchId   Int         @default(0)
+  bankName   String
+  branchName String?
+  accountNo  String
+  ifsc       String
+  applyTo    BankApplyTo @default(ALL)
+  isActive   Boolean     @default(true)
+  createdAt  DateTime    @default(now())
+  business   Business    @relation(fields: [businessId], references: [id])
+
+  @@index([businessId])
+}
+
+/// Global HSN master (Super Admin maintains). Businesses switch codes on/off via BusinessHsn.
+model HsnCode {
+  id          Int           @id @default(autoincrement())
+  code        String
+  category    HsnCategory
+  productType String
+  gstRate     Decimal       @db.Decimal(5, 2)
+  isActive    Boolean       @default(true)
+  businesses  BusinessHsn[]
+
+  @@unique([code, category, productType])
+}
+
+model BusinessHsn {
+  businessId Int
+  hsnId      Int
+  isActive   Boolean  @default(true)
+  business   Business @relation(fields: [businessId], references: [id])
+  hsn        HsnCode  @relation(fields: [hsnId], references: [id])
+
+  @@id([businessId, hsnId])
+}
+
+/// Key/value settings. branchId 0 = business-wide; a branch row overrides it. Keys + value shapes defined in src/shared/contracts/settings.ts.
+model Setting {
+  businessId  Int
+  branchId    Int      @default(0)
+  key         String
+  value       Json
+  updatedById Int?
+  updatedAt   DateTime @updatedAt
+  business    Business @relation(fields: [businessId], references: [id])
+
+  @@id([businessId, branchId, key])
+}
+
+/// Karat/purity → touch % (24K=100, 22K=91.67 …, 999/925/800 for silver) incl. custom karats.
+model KaratMapping {
+  id         Int       @id @default(autoincrement())
+  businessId Int
+  metal      MetalKind
+  code       String
+  title      String
+  touch      Decimal   @db.Decimal(6, 3)
+  isSystem   Boolean   @default(false)
+  sort       Int       @default(0)
+  business   Business  @relation(fields: [businessId], references: [id])
+
+  @@unique([businessId, metal, code])
+}
+
+/// Rate history; current rate = latest effectiveAt per (business, branch, metal, karatCode, unit). branchId 0 = business-wide.
+model MetalRate {
+  id          Int       @id @default(autoincrement())
+  businessId  Int
+  branchId    Int       @default(0)
+  metal       MetalKind
+  karatCode   String
+  rateUnit    RateUnit
+  sellRate    Decimal   @db.Decimal(14, 2)
+  buyRate     Decimal   @db.Decimal(14, 2)
+  effectiveAt DateTime  @default(now())
+  createdById Int?
+  business    Business  @relation(fields: [businessId], references: [id])
+
+  @@index([businessId, branchId, metal, karatCode, rateUnit, effectiveAt(sort: Desc)])
+}
+
+/// Sanity guard: billing rejects rates outside [minRate, maxRate] unless overridden.
+model RateLimit {
+  businessId Int
+  metal      MetalKind
+  rateUnit   RateUnit
+  minRate    Decimal   @db.Decimal(14, 2)
+  maxRate    Decimal   @db.Decimal(14, 2)
+  business   Business  @relation(fields: [businessId], references: [id])
+
+  @@id([businessId, metal, rateUnit])
 }
