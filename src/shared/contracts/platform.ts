@@ -100,3 +100,93 @@ export interface PlatformDashboardDto {
   branches: number;
   users: number;
 }
+
+// ───── Response DTOs (dates are ISO strings, money/decimals are strings) ─────
+
+export interface SignupRequestDto {
+  id: number;
+  shopName: string;
+  ownerName: string;
+  countryCode: string;
+  whatsapp: string;
+  email: string | null;
+  address: string;
+  state: { id: number; name: string };
+  district: { id: number; name: string } | null;
+  status: 'PENDING' | 'APPROVED' | 'REJECTED';
+  businessId: number | null;
+  rejectReason: string | null;
+  reviewedAt: string | null;
+  createdAt: string;
+}
+
+export interface PlanDto {
+  id: number;
+  name: string;
+  description: string | null;
+  durationDays: number;
+  price: string;
+  maxBranches: number;
+  maxUsers: number;
+  modules: string[];
+  isActive: boolean;
+  activeSubscriptions: number;
+}
+
+export interface SubscriptionDto {
+  id: number;
+  planId: number;
+  planName: string;
+  startsAt: string;
+  endsAt: string;
+  status: 'ACTIVE' | 'CANCELLED';
+  maxBranches: number;
+  maxUsers: number;
+  modules: string[];
+  notes: string | null;
+  createdAt: string;
+}
+
+export interface PaymentDto {
+  id: number;
+  businessId: number;
+  businessName: string;
+  subscriptionId: number | null;
+  amount: string;
+  method: 'UPI' | 'CASH' | 'BANK' | 'GATEWAY';
+  utr: string | null;
+  status: 'PENDING' | 'CONFIRMED' | 'REJECTED';
+  paidAt: string | null;
+  createdAt: string;
+}
+
+/** Row in /platform/businesses. subscriptionState: active | expiring (≤15 days) | expired | none */
+export interface BusinessListItemDto {
+  id: number;
+  name: string;
+  ownerName: string;
+  mobile: string;
+  status: 'ACTIVE' | 'SUSPENDED';
+  subscriptionState: 'active' | 'expiring' | 'expired' | 'none';
+  planName: string | null;
+  endsAt: string | null;
+  branchCount: number;
+  userCount: number;
+  createdAt: string;
+}
+
+export interface BusinessDetailDto extends BusinessListItemDto {
+  email: string | null;
+  gstin: string | null;
+  address: string | null;
+  state: { id: number; name: string } | null;
+  district: { id: number; name: string } | null;
+  owner: { id: number; name: string; username: string; mobile: string | null; email: string | null; lastLoginAt: string | null } | null;
+  subscriptions: SubscriptionDto[];
+  payments: PaymentDto[];
+}
+
+export interface GeoDto {
+  id: number;
+  name: string;
+}

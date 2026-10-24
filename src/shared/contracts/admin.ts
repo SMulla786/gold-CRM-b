@@ -96,3 +96,47 @@ export interface SubscriptionViewDto {
   usedUsers: number;
   modules: string[];
 }
+
+export interface CounterDto {
+  id: number;
+  branchId: number;
+  branchName: string;
+  name: string;
+  isActive: boolean;
+}
+
+export interface PermissionGrantDto {
+  key: string;
+  view: boolean;
+  edit: boolean;
+  delete: boolean;
+}
+
+export interface RoleDto {
+  id: number;
+  name: string;
+  /** true = platform template (read-only; editing creates a business copy) */
+  isSystem: boolean;
+  userCount: number;
+  grants: PermissionGrantDto[];
+}
+
+export interface UserPermissionsDto {
+  /** effective result (role + overrides) */
+  effective: PermissionGrantDto[];
+  /** page keys that are per-user overrides */
+  overriddenKeys: string[];
+  roleId: number | null;
+}
+
+export interface BusinessProfileDto {
+  id: number;
+  name: string;
+  ownerName: string;
+  mobile: string;
+  email: string | null;
+  gstin: string | null;
+  address: string | null;
+  stateId: number | null;
+  districtId: number | null;
+}
