@@ -1,9 +1,9 @@
-// Baseline self-check by lead (hand-computed). tester adds justudhari fixture cases (TASK-10) alongside.
+// Baseline self-check by lead (hand-computed with the fixture-verified formulas).
 import { describe, expect, it } from 'vitest';
 import { computeBill, computeLine, metalToMoney, moneyToMetal } from './index';
 
 describe('computeLine', () => {
-  it('22K ring: net, fine, per-gram labour, stone charge, % discount', () => {
+  it('22K ring: multiplicative wastage, per-gram labour on gross, % discount on metal', () => {
     const r = computeLine({
       gross: '10.500',
       less: '0.500',
@@ -19,19 +19,19 @@ describe('computeLine', () => {
       discountUnit: 'PERCENT',
     });
     expect(r.net).toBe('10.000');
-    expect(r.fine).toBe('9.367'); // 10 × 93.67%
+    expect(r.fine).toBe('9.350'); // 10 × 0.9167 × 1.02
     expect(r.metalAmount).toBe('130000.00');
-    expect(r.labourAmount).toBe('5000.00');
-    expect(r.discountAmount).toBe('1361.00'); // 1% of 136100
-    expect(r.total).toBe('134739.00');
+    expect(r.labourAmount).toBe('5250.00'); // 500 × gross 10.5
+    expect(r.discountAmount).toBe('1300.00'); // 1% of metal
+    expect(r.total).toBe('135050.00');
   });
 
-  it('percent labour is on metal amount; FINE basis uses fine weight', () => {
+  it('percent labour is on gross × per-gram rate; FINE basis drives metal amount', () => {
     const r = computeLine({ gross: 10, tunch: 75, rate: 1000, labour: 10, labourUnit: 'PERCENT', basis: 'FINE' });
     expect(r.basisWeight).toBe('7.500');
     expect(r.metalAmount).toBe('7500.00');
-    expect(r.labourAmount).toBe('750.00');
-    expect(r.total).toBe('8250.00');
+    expect(r.labourAmount).toBe('1000.00');
+    expect(r.total).toBe('8500.00');
   });
 });
 
@@ -41,7 +41,7 @@ describe('computeBill', () => {
     expect(r.sub).toBe('15000.40');
     expect(r.cgst).toBe('225.01');
     expect(r.sgst).toBe('225.01');
-    expect(r.total).toBe('15450.42');
+    expect(r.total).toBe('15450.42'); // = taxable + displayed cgst + sgst
     expect(r.final).toBe('15450.00');
     expect(r.round).toBe('-0.42');
   });

@@ -2,9 +2,17 @@ import argon2 from 'argon2';
 import type { RequestHandler } from 'express';
 import { prisma } from '../lib/prisma';
 import { HEADERS, moduleOf } from '../shared';
-import type { PermissionAction } from '../shared';
+import type { PermissionAction, UserLevel } from '../shared';
 import type { TenantContext } from './context';
 import { HttpError } from './error';
+
+/** Restrict a route tree to specific user levels (e.g. SUPER_ADMIN for /platform, ADMIN for /admin). */
+export function requireLevel(...levels: UserLevel[]): RequestHandler {
+  return (req, _res, next) => {
+    if (!req.ctx || !levels.includes(req.ctx.level)) throw new HttpError(403, 'FORBIDDEN', 'Not allowed for your account');
+    next();
+  };
+}
 
 /** Admins/super admins pass everything; branch users are checked against their effective permission map. */
 export function hasPermission(ctx: TenantContext, pageKey: string, action: PermissionAction): boolean {

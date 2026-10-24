@@ -1,0 +1,994 @@
+{
+  "_meta": {
+    "source": "justudhari.com live app (ankita jewellers, read-only account). Outputs captured from the app's OWN JS calc functions (sell: weightchange/itemsum/billtotal; purchase: calculatetunchfine/itemsum/billtotal) driven via scripted field entry — NOT re-derived.",
+    "capturedAt": "2026-10-25",
+    "capturedBy": "tester (TASK-10)",
+    "settings": {
+      "sell_calculation_basis": "net",
+      "purchase_calculation_basis": "net",
+      "amount_based_rate": "OFF (enter rate -> calc total)",
+      "rate_units": {
+        "gold": "per 10 gram",
+        "silver": "per 1000 gram (1 kg)"
+      },
+      "caret_to_tunch_pct": {
+        "18": 75,
+        "20": 83.33,
+        "22": 91.67,
+        "24": 100
+      },
+      "silver_touch_examples": {
+        "800": 80,
+        "925": 92.5,
+        "999": 100
+      },
+      "gst_split": "intra-state -> cgst = sgst = gst/2, igst = 0 (customer_is_intra_state default true)"
+    },
+    "legend": {
+      "input": {
+        "metal": "gold|silver — sets the rate unit (gold /10gm, silver /1kg) on SELL",
+        "caret": "gold karat 24/22/20/18 — drives default tunch% when tunch omitted",
+        "tunch": "touch/purity %. Gold: overrides caret default. Silver: the purity",
+        "wstg": "wastage % added to fine",
+        "chrg": "stone charge (Rs, flat)",
+        "rate": "SELL: metal rate in the unit above (gold /10gm, silver /1kg). PURCHASE: applied per-gram (net*rate)",
+        "lbr/lbrunit": "labour; unit r=Rs flat, w=Rs per gram (x gross), p=% (gross*%*perGramRate)",
+        "disc/discunit": "line discount; r=Rs, p=% of item_cost",
+        "bill_disc/bill_disc_unit": "bill-level discount; r=Rs, p=%",
+        "gst": "GST % (user-typed). Intra-state split into cgst+sgst",
+        "bill_type": "g = GST bill, e = ROUGH/estimate"
+      },
+      "output": "net, fine, ttl (line total), sub (subtotal), cgst_val, sgst_val, igst_val, round (round-off), total (pre-round grand), final (rounded payable). Strings exactly as the app renders."
+    },
+    "notes": [
+      "SELL item_cost = net * (rate / rateUnit); rateUnit gold=10, silver=1000.",
+      "PURCHASE item_cost = net * rate (rate entered per-gram; the live purchase calc does NOT divide by a unit).",
+      "PURCHASE billtotal adds GST into total but does NOT populate the cgst/sgst/igst split fields (left empty).",
+      "GST on a bill with a line/bill discount is charged on the discounted (taxable) base.",
+      "ROUGH bills (bill_type=e) do not force a GST%; GST applies only if the user types one.",
+      "keep_balance (money<->metal via due_metal_rate) is NOT captured here — it is a payment-panel conversion (moneyToMetal/metalToMoney), separate from line/summary calc. Flagged for a follow-up capture if the engine needs it."
+    ],
+    "counts": {
+      "sell": 27,
+      "purchase": 5
+    }
+  },
+  "sell": [
+    {
+      "name": "gold-24k-base",
+      "input": {
+        "name": "gold-24k-base",
+        "item": "Chain",
+        "metal": "gold",
+        "caret": "24",
+        "pcs": 1,
+        "gross": 10,
+        "less": 0,
+        "wstg": 0,
+        "rate": 70000,
+        "bill_type": "g",
+        "gst": 3
+      },
+      "output": {
+        "net": "10.000",
+        "fine": "10.000",
+        "ttl": "70000.00",
+        "sub": "70000.00",
+        "gst": "3",
+        "cgst_val": "1050.00",
+        "sgst_val": "1050.00",
+        "igst_val": "0.00",
+        "round": "0.00",
+        "total": "72100.00",
+        "final": "72100"
+      }
+    },
+    {
+      "name": "gold-22k-base",
+      "input": {
+        "name": "gold-22k-base",
+        "item": "Ring",
+        "metal": "gold",
+        "caret": "22",
+        "pcs": 1,
+        "gross": 10,
+        "less": 0,
+        "wstg": 0,
+        "rate": 70000,
+        "bill_type": "g",
+        "gst": 3
+      },
+      "output": {
+        "net": "10.000",
+        "fine": "9.167",
+        "ttl": "70000.00",
+        "sub": "70000.00",
+        "gst": "3",
+        "cgst_val": "1050.00",
+        "sgst_val": "1050.00",
+        "igst_val": "0.00",
+        "round": "0.00",
+        "total": "72100.00",
+        "final": "72100"
+      }
+    },
+    {
+      "name": "gold-18k-base",
+      "input": {
+        "name": "gold-18k-base",
+        "item": "Pendant",
+        "metal": "gold",
+        "caret": "18",
+        "pcs": 1,
+        "gross": 10,
+        "less": 0,
+        "wstg": 0,
+        "rate": 70000,
+        "bill_type": "g",
+        "gst": 3
+      },
+      "output": {
+        "net": "10.000",
+        "fine": "7.500",
+        "ttl": "70000.00",
+        "sub": "70000.00",
+        "gst": "3",
+        "cgst_val": "1050.00",
+        "sgst_val": "1050.00",
+        "igst_val": "0.00",
+        "round": "0.00",
+        "total": "72100.00",
+        "final": "72100"
+      }
+    },
+    {
+      "name": "gold-20k-base",
+      "input": {
+        "name": "gold-20k-base",
+        "item": "Bangle",
+        "metal": "gold",
+        "caret": "20",
+        "pcs": 2,
+        "gross": 20,
+        "less": 0,
+        "wstg": 0,
+        "rate": 65000,
+        "bill_type": "g",
+        "gst": 3
+      },
+      "output": {
+        "net": "20.000",
+        "fine": "16.666",
+        "ttl": "130000.00",
+        "sub": "130000.00",
+        "gst": "3",
+        "cgst_val": "1950.00",
+        "sgst_val": "1950.00",
+        "igst_val": "0.00",
+        "round": "0.00",
+        "total": "133900.00",
+        "final": "133900"
+      }
+    },
+    {
+      "name": "gold-22k-manual-tunch75",
+      "input": {
+        "name": "gold-22k-manual-tunch75",
+        "item": "Ring",
+        "metal": "gold",
+        "caret": "22",
+        "pcs": 1,
+        "gross": 10,
+        "less": 0,
+        "tunch": 75,
+        "wstg": 0,
+        "rate": 70000,
+        "bill_type": "g",
+        "gst": 3
+      },
+      "output": {
+        "net": "10.000",
+        "fine": "7.500",
+        "ttl": "70000.00",
+        "sub": "70000.00",
+        "gst": "3",
+        "cgst_val": "1050.00",
+        "sgst_val": "1050.00",
+        "igst_val": "0.00",
+        "round": "0.00",
+        "total": "72100.00",
+        "final": "72100"
+      }
+    },
+    {
+      "name": "gold-22k-wstg8",
+      "input": {
+        "name": "gold-22k-wstg8",
+        "item": "Ring",
+        "metal": "gold",
+        "caret": "22",
+        "pcs": 1,
+        "gross": 10,
+        "less": 0,
+        "wstg": 8,
+        "rate": 70000,
+        "bill_type": "g",
+        "gst": 3
+      },
+      "output": {
+        "net": "10.000",
+        "fine": "9.900",
+        "ttl": "70000.00",
+        "sub": "70000.00",
+        "gst": "3",
+        "cgst_val": "1050.00",
+        "sgst_val": "1050.00",
+        "igst_val": "0.00",
+        "round": "0.00",
+        "total": "72100.00",
+        "final": "72100"
+      }
+    },
+    {
+      "name": "gold-24k-tunch92-wstg5",
+      "input": {
+        "name": "gold-24k-tunch92-wstg5",
+        "item": "Kada",
+        "metal": "gold",
+        "caret": "24",
+        "pcs": 1,
+        "gross": 12,
+        "less": 0,
+        "tunch": 92,
+        "wstg": 5,
+        "rate": 70000,
+        "bill_type": "g",
+        "gst": 3
+      },
+      "output": {
+        "net": "12.000",
+        "fine": "11.592",
+        "ttl": "84000.00",
+        "sub": "84000.00",
+        "gst": "3",
+        "cgst_val": "1260.00",
+        "sgst_val": "1260.00",
+        "igst_val": "0.00",
+        "round": "0.00",
+        "total": "86520.00",
+        "final": "86520"
+      }
+    },
+    {
+      "name": "gold-22k-less3",
+      "input": {
+        "name": "gold-22k-less3",
+        "item": "Set",
+        "metal": "gold",
+        "caret": "22",
+        "pcs": 1,
+        "gross": 15,
+        "less": 3,
+        "wstg": 0,
+        "rate": 70000,
+        "bill_type": "g",
+        "gst": 3
+      },
+      "output": {
+        "net": "12.000",
+        "fine": "11.000",
+        "ttl": "84000.00",
+        "sub": "84000.00",
+        "gst": "3",
+        "cgst_val": "1260.00",
+        "sgst_val": "1260.00",
+        "igst_val": "0.00",
+        "round": "0.00",
+        "total": "86520.00",
+        "final": "86520"
+      }
+    },
+    {
+      "name": "gold-22k-labour-Rs1500",
+      "input": {
+        "name": "gold-22k-labour-Rs1500",
+        "item": "Ring",
+        "metal": "gold",
+        "caret": "22",
+        "pcs": 1,
+        "gross": 10,
+        "rate": 70000,
+        "lbr": 1500,
+        "lbrunit": "r",
+        "bill_type": "g",
+        "gst": 3
+      },
+      "output": {
+        "net": "10.000",
+        "fine": "9.167",
+        "ttl": "71500.00",
+        "sub": "71500.00",
+        "gst": "3",
+        "cgst_val": "1072.50",
+        "sgst_val": "1072.50",
+        "igst_val": "0.00",
+        "round": "0.00",
+        "total": "73645.00",
+        "final": "73645"
+      }
+    },
+    {
+      "name": "gold-22k-labour-pct10",
+      "input": {
+        "name": "gold-22k-labour-pct10",
+        "item": "Ring",
+        "metal": "gold",
+        "caret": "22",
+        "pcs": 1,
+        "gross": 10,
+        "rate": 70000,
+        "lbr": 10,
+        "lbrunit": "p",
+        "bill_type": "g",
+        "gst": 3
+      },
+      "output": {
+        "net": "10.000",
+        "fine": "9.167",
+        "ttl": "77000.00",
+        "sub": "77000.00",
+        "gst": "3",
+        "cgst_val": "1155.00",
+        "sgst_val": "1155.00",
+        "igst_val": "0.00",
+        "round": "0.00",
+        "total": "79310.00",
+        "final": "79310"
+      }
+    },
+    {
+      "name": "gold-22k-labour-perGm200",
+      "input": {
+        "name": "gold-22k-labour-perGm200",
+        "item": "Ring",
+        "metal": "gold",
+        "caret": "22",
+        "pcs": 1,
+        "gross": 10,
+        "rate": 70000,
+        "lbr": 200,
+        "lbrunit": "w",
+        "bill_type": "g",
+        "gst": 3
+      },
+      "output": {
+        "net": "10.000",
+        "fine": "9.167",
+        "ttl": "72000.00",
+        "sub": "72000.00",
+        "gst": "3",
+        "cgst_val": "1080.00",
+        "sgst_val": "1080.00",
+        "igst_val": "0.00",
+        "round": "0.00",
+        "total": "74160.00",
+        "final": "74160"
+      }
+    },
+    {
+      "name": "gold-22k-disc-Rs2000",
+      "input": {
+        "name": "gold-22k-disc-Rs2000",
+        "item": "Ring",
+        "metal": "gold",
+        "caret": "22",
+        "pcs": 1,
+        "gross": 10,
+        "rate": 70000,
+        "disc": 2000,
+        "discunit": "r",
+        "bill_type": "g",
+        "gst": 3
+      },
+      "output": {
+        "net": "10.000",
+        "fine": "9.167",
+        "ttl": "68000.00",
+        "sub": "68000.00",
+        "gst": "3",
+        "cgst_val": "1020.00",
+        "sgst_val": "1020.00",
+        "igst_val": "0.00",
+        "round": "0.00",
+        "total": "70040.00",
+        "final": "70040"
+      }
+    },
+    {
+      "name": "gold-22k-disc-pct5",
+      "input": {
+        "name": "gold-22k-disc-pct5",
+        "item": "Ring",
+        "metal": "gold",
+        "caret": "22",
+        "pcs": 1,
+        "gross": 10,
+        "rate": 70000,
+        "disc": 5,
+        "discunit": "p",
+        "bill_type": "g",
+        "gst": 3
+      },
+      "output": {
+        "net": "10.000",
+        "fine": "9.167",
+        "ttl": "66500.00",
+        "sub": "66500.00",
+        "gst": "3",
+        "cgst_val": "997.50",
+        "sgst_val": "997.50",
+        "igst_val": "0.00",
+        "round": "0.00",
+        "total": "68495.00",
+        "final": "68495"
+      }
+    },
+    {
+      "name": "gold-22k-stonechg1200",
+      "input": {
+        "name": "gold-22k-stonechg1200",
+        "item": "Ring",
+        "metal": "gold",
+        "caret": "22",
+        "pcs": 1,
+        "gross": 10,
+        "rate": 70000,
+        "chrg": 1200,
+        "bill_type": "g",
+        "gst": 3
+      },
+      "output": {
+        "net": "10.000",
+        "fine": "9.167",
+        "ttl": "71200.00",
+        "sub": "71200.00",
+        "gst": "3",
+        "cgst_val": "1068.00",
+        "sgst_val": "1068.00",
+        "igst_val": "0.00",
+        "round": "0.00",
+        "total": "73336.00",
+        "final": "73336"
+      }
+    },
+    {
+      "name": "gold-22k-other800",
+      "input": {
+        "name": "gold-22k-other800",
+        "item": "Ring",
+        "metal": "gold",
+        "caret": "22",
+        "pcs": 1,
+        "gross": 10,
+        "rate": 70000,
+        "other": 800,
+        "bill_type": "g",
+        "gst": 3
+      },
+      "output": {
+        "net": "10.000",
+        "fine": "9.167",
+        "ttl": "70800.00",
+        "sub": "70800.00",
+        "gst": "3",
+        "cgst_val": "1062.00",
+        "sgst_val": "1062.00",
+        "igst_val": "0.00",
+        "round": "0.00",
+        "total": "72924.00",
+        "final": "72924"
+      }
+    },
+    {
+      "name": "gold-22k-billdisc-Rs5000",
+      "input": {
+        "name": "gold-22k-billdisc-Rs5000",
+        "item": "Ring",
+        "metal": "gold",
+        "caret": "22",
+        "pcs": 1,
+        "gross": 10,
+        "rate": 70000,
+        "bill_type": "g",
+        "bill_disc": 5000,
+        "bill_disc_unit": "r",
+        "gst": 3
+      },
+      "output": {
+        "net": "10.000",
+        "fine": "9.167",
+        "ttl": "70000.00",
+        "sub": "70000.00",
+        "gst": "3",
+        "cgst_val": "975.00",
+        "sgst_val": "975.00",
+        "igst_val": "0.00",
+        "round": "0.00",
+        "total": "66950.00",
+        "final": "66950"
+      }
+    },
+    {
+      "name": "gold-22k-billdisc-pct10",
+      "input": {
+        "name": "gold-22k-billdisc-pct10",
+        "item": "Ring",
+        "metal": "gold",
+        "caret": "22",
+        "pcs": 1,
+        "gross": 10,
+        "rate": 70000,
+        "bill_type": "g",
+        "bill_disc": 10,
+        "bill_disc_unit": "p",
+        "gst": 3
+      },
+      "output": {
+        "net": "10.000",
+        "fine": "9.167",
+        "ttl": "70000.00",
+        "sub": "70000.00",
+        "gst": "3",
+        "cgst_val": "945.00",
+        "sgst_val": "945.00",
+        "igst_val": "0.00",
+        "round": "0.00",
+        "total": "64890.00",
+        "final": "64890"
+      }
+    },
+    {
+      "name": "gold-24k-gst5",
+      "input": {
+        "name": "gold-24k-gst5",
+        "item": "Coin",
+        "metal": "gold",
+        "caret": "24",
+        "pcs": 1,
+        "gross": 10,
+        "rate": 70000,
+        "bill_type": "g",
+        "gst": 5
+      },
+      "output": {
+        "net": "10.000",
+        "fine": "10.000",
+        "ttl": "70000.00",
+        "sub": "70000.00",
+        "gst": "5",
+        "cgst_val": "1750.00",
+        "sgst_val": "1750.00",
+        "igst_val": "0.00",
+        "round": "0.00",
+        "total": "73500.00",
+        "final": "73500"
+      }
+    },
+    {
+      "name": "gold-22k-rough-no-gst",
+      "input": {
+        "name": "gold-22k-rough-no-gst",
+        "item": "Ring",
+        "metal": "gold",
+        "caret": "22",
+        "pcs": 1,
+        "gross": 10,
+        "rate": 70000,
+        "bill_type": "e",
+        "gst": 0
+      },
+      "output": {
+        "net": "10.000",
+        "fine": "9.167",
+        "ttl": "70000.00",
+        "sub": "70000.00",
+        "gst": "0",
+        "cgst_val": "0.00",
+        "sgst_val": "0.00",
+        "igst_val": "0.00",
+        "round": "0.00",
+        "total": "70000.00",
+        "final": "70000"
+      }
+    },
+    {
+      "name": "gold-22k-rough-gst3",
+      "input": {
+        "name": "gold-22k-rough-gst3",
+        "item": "Ring",
+        "metal": "gold",
+        "caret": "22",
+        "pcs": 1,
+        "gross": 10,
+        "rate": 70000,
+        "bill_type": "e",
+        "gst": 3
+      },
+      "output": {
+        "net": "10.000",
+        "fine": "9.167",
+        "ttl": "70000.00",
+        "sub": "70000.00",
+        "gst": "3",
+        "cgst_val": "1050.00",
+        "sgst_val": "1050.00",
+        "igst_val": "0.00",
+        "round": "0.00",
+        "total": "72100.00",
+        "final": "72100"
+      }
+    },
+    {
+      "name": "gold-22k-combo",
+      "input": {
+        "name": "gold-22k-combo",
+        "item": "Haar",
+        "metal": "gold",
+        "caret": "22",
+        "pcs": 2,
+        "gross": 14.5,
+        "less": 0.5,
+        "tunch": 91,
+        "wstg": 6,
+        "chrg": 500,
+        "rate": 72000,
+        "lbr": 8,
+        "lbrunit": "p",
+        "other": 300,
+        "disc": 3,
+        "discunit": "p",
+        "bill_type": "g",
+        "bill_disc": 2,
+        "bill_disc_unit": "p",
+        "gst": 3
+      },
+      "output": {
+        "net": "14.000",
+        "fine": "13.504",
+        "ttl": "106928.00",
+        "sub": "106928.00",
+        "gst": "3",
+        "cgst_val": "1571.84",
+        "sgst_val": "1571.84",
+        "igst_val": "0.00",
+        "round": "-0.12",
+        "total": "107933.12",
+        "final": "107933"
+      }
+    },
+    {
+      "name": "gold-24k-roundoff",
+      "input": {
+        "name": "gold-24k-roundoff",
+        "item": "Coin",
+        "metal": "gold",
+        "caret": "24",
+        "pcs": 1,
+        "gross": 7.77,
+        "rate": 70333,
+        "bill_type": "g",
+        "gst": 3
+      },
+      "output": {
+        "net": "7.770",
+        "fine": "7.770",
+        "ttl": "54648.74",
+        "sub": "54648.74",
+        "gst": "3",
+        "cgst_val": "819.73",
+        "sgst_val": "819.73",
+        "igst_val": "0.00",
+        "round": "-0.20",
+        "total": "56288.20",
+        "final": "56288"
+      }
+    },
+    {
+      "name": "silver-999-base",
+      "input": {
+        "name": "silver-999-base",
+        "item": "Payal",
+        "metal": "silver",
+        "tunch": 99.9,
+        "pcs": 1,
+        "gross": 100,
+        "less": 0,
+        "wstg": 0,
+        "rate": 92000,
+        "bill_type": "g",
+        "gst": 3
+      },
+      "output": {
+        "net": "100.000",
+        "fine": "99.900",
+        "ttl": "9200.00",
+        "sub": "9200.00",
+        "gst": "3",
+        "cgst_val": "138.00",
+        "sgst_val": "138.00",
+        "igst_val": "0.00",
+        "round": "0.00",
+        "total": "9476.00",
+        "final": "9476"
+      }
+    },
+    {
+      "name": "silver-925-less-glass",
+      "input": {
+        "name": "silver-925-less-glass",
+        "item": "Glass",
+        "metal": "silver",
+        "tunch": 92.5,
+        "pcs": 2,
+        "gross": 250,
+        "less": 5,
+        "wstg": 0,
+        "rate": 92000,
+        "bill_type": "g",
+        "gst": 3
+      },
+      "output": {
+        "net": "245.000",
+        "fine": "226.625",
+        "ttl": "22540.00",
+        "sub": "22540.00",
+        "gst": "3",
+        "cgst_val": "338.10",
+        "sgst_val": "338.10",
+        "igst_val": "0.00",
+        "round": "-0.20",
+        "total": "23216.20",
+        "final": "23216"
+      }
+    },
+    {
+      "name": "silver-999-wstg-labourPerGm",
+      "input": {
+        "name": "silver-999-wstg-labourPerGm",
+        "item": "Thali",
+        "metal": "silver",
+        "tunch": 99.5,
+        "pcs": 1,
+        "gross": 500,
+        "less": 0,
+        "wstg": 3,
+        "rate": 90000,
+        "lbr": 50,
+        "lbrunit": "w",
+        "bill_type": "g",
+        "gst": 3
+      },
+      "output": {
+        "net": "500.000",
+        "fine": "512.425",
+        "ttl": "70000.00",
+        "sub": "70000.00",
+        "gst": "3",
+        "cgst_val": "1050.00",
+        "sgst_val": "1050.00",
+        "igst_val": "0.00",
+        "round": "0.00",
+        "total": "72100.00",
+        "final": "72100"
+      }
+    },
+    {
+      "name": "silver-925-disc-rough",
+      "input": {
+        "name": "silver-925-disc-rough",
+        "item": "Anklet",
+        "metal": "silver",
+        "tunch": 92.5,
+        "pcs": 1,
+        "gross": 120,
+        "rate": 91000,
+        "disc": 1000,
+        "discunit": "r",
+        "bill_type": "e",
+        "gst": 0
+      },
+      "output": {
+        "net": "120.000",
+        "fine": "111.000",
+        "ttl": "9920.00",
+        "sub": "9920.00",
+        "gst": "0",
+        "cgst_val": "0.00",
+        "sgst_val": "0.00",
+        "igst_val": "0.00",
+        "round": "0.00",
+        "total": "9920.00",
+        "final": "9920"
+      }
+    },
+    {
+      "name": "silver-999-billdisc-gst3",
+      "input": {
+        "name": "silver-999-billdisc-gst3",
+        "item": "Coin",
+        "metal": "silver",
+        "tunch": 99.9,
+        "pcs": 5,
+        "gross": 50,
+        "rate": 93000,
+        "bill_type": "g",
+        "bill_disc": 3,
+        "bill_disc_unit": "p",
+        "gst": 3
+      },
+      "output": {
+        "net": "50.000",
+        "fine": "49.950",
+        "ttl": "4650.00",
+        "sub": "4650.00",
+        "gst": "3",
+        "cgst_val": "67.66",
+        "sgst_val": "67.66",
+        "igst_val": "0.00",
+        "round": "0.19",
+        "total": "4645.81",
+        "final": "4646"
+      }
+    }
+  ],
+  "purchase": [
+    {
+      "name": "purchase-gold-22k-base",
+      "input": {
+        "name": "purchase-gold-22k-base",
+        "item": "Old Gold",
+        "metal": "gold",
+        "caret": "22",
+        "pcs": 1,
+        "gross": 20,
+        "less": 0,
+        "rate": 6800,
+        "bill_type": "g",
+        "gst": 3
+      },
+      "output": {
+        "net": "20.000",
+        "fine": "18.334",
+        "ttl": "136000.00",
+        "sub": "136000.00",
+        "gst": "3",
+        "cgst_val": "",
+        "sgst_val": "",
+        "igst_val": "",
+        "round": "0.00",
+        "total": "140080.00",
+        "final": "140080"
+      }
+    },
+    {
+      "name": "purchase-gold-24k-tunch-wstg",
+      "input": {
+        "name": "purchase-gold-24k-tunch-wstg",
+        "item": "Gold Bar",
+        "metal": "gold",
+        "caret": "24",
+        "pcs": 1,
+        "gross": 50,
+        "less": 0,
+        "tunch": 99.5,
+        "wstg": 0,
+        "rate": 7030,
+        "bill_type": "g",
+        "gst": 3
+      },
+      "output": {
+        "net": "50.000",
+        "fine": "49.750",
+        "ttl": "351500.00",
+        "sub": "351500.00",
+        "gst": "3",
+        "cgst_val": "",
+        "sgst_val": "",
+        "igst_val": "",
+        "round": "0.00",
+        "total": "362045.00",
+        "final": "362045"
+      }
+    },
+    {
+      "name": "purchase-silver-less-labour",
+      "input": {
+        "name": "purchase-silver-less-labour",
+        "item": "Old Silver",
+        "metal": "silver",
+        "tunch": 92,
+        "pcs": 1,
+        "gross": 500,
+        "less": 10,
+        "rate": 88,
+        "lbr": 2,
+        "lbrunit": "w",
+        "bill_type": "g",
+        "gst": 3
+      },
+      "output": {
+        "net": "490.000",
+        "fine": "450.800",
+        "ttl": "44120.00",
+        "sub": "44120.00",
+        "gst": "3",
+        "cgst_val": "",
+        "sgst_val": "",
+        "igst_val": "",
+        "round": "0.40",
+        "total": "45443.60",
+        "final": "45444"
+      }
+    },
+    {
+      "name": "purchase-gold-disc-rough",
+      "input": {
+        "name": "purchase-gold-disc-rough",
+        "item": "Scrap Gold",
+        "metal": "gold",
+        "caret": "22",
+        "pcs": 1,
+        "gross": 15.5,
+        "less": 0.5,
+        "rate": 6750,
+        "disc": 500,
+        "discunit": "r",
+        "bill_type": "e",
+        "gst": 0
+      },
+      "output": {
+        "net": "15.000",
+        "fine": "13.750",
+        "ttl": "100750.00",
+        "sub": "100750.00",
+        "gst": "0",
+        "cgst_val": "",
+        "sgst_val": "",
+        "igst_val": "",
+        "round": "0.00",
+        "total": "100750.00",
+        "final": "100750"
+      }
+    },
+    {
+      "name": "purchase-gold-billdisc",
+      "input": {
+        "name": "purchase-gold-billdisc",
+        "item": "Old Gold",
+        "metal": "gold",
+        "caret": "18",
+        "pcs": 2,
+        "gross": 30,
+        "rate": 6700,
+        "chrg": 0,
+        "bill_type": "g",
+        "bill_disc": 2000,
+        "bill_disc_unit": "r",
+        "gst": 3
+      },
+      "output": {
+        "net": "30.000",
+        "fine": "22.500",
+        "ttl": "201000.00",
+        "sub": "201000.00",
+        "gst": "3",
+        "cgst_val": "",
+        "sgst_val": "",
+        "igst_val": "",
+        "round": "0.00",
+        "total": "204970.00",
+        "final": "204970"
+      }
+    }
+  ]
+}

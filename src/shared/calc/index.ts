@@ -1,6 +1,13 @@
 /**
  * Weight / value engine shared by web (live totals) and API (authoritative recompute).
- * Formulas from docs/domain-glossary.md — marked inferred until TASK-10 fixtures confirm them.
+ * Verified against justudhari's own calc functions (32 cases in __fixtures__/justudhari-cases.json):
+ *   fine     = net × tunch/100 × (1 + wastage/100)        (wastage is multiplicative, not added to tunch)
+ *   metal    = basisWeight × rate / rateUnitGrams          (sell: gold /10 g, silver /1000 g; purchase: /1 g)
+ *   labour   = PER_GRAM: gross × lbr | PERCENT: gross × (rate/unit) × lbr% | FIXED: lbr
+ *   discount = PERCENT: metal × d% | FIXED: d
+ *   line     = metal + stoneCharge + labour + other − discount
+ *   bill     = (Σ lines − billDiscount) + GST on that discounted base; final rounded to the rupee.
+ * Exact decimal math: justudhari's float rounding can differ by ₹0.01 on intermediate totals (e.g. 4645.815).
  * All inputs/outputs are decimal strings (or numbers) — never rely on JS float math.
  */
 import Decimal from 'decimal.js';
@@ -20,18 +27,20 @@ export interface LineInput {
   less?: Num;
   /** purity % (e.g. 91.67 for 22K) */
   tunch?: Num;
-  /** wastage % added to tunch */
+  /** wastage % applied on top of the fine (fine × (1 + wastage/100)) */
   wastage?: Num;
   stoneCharge?: Num;
-  /** rate per `rateUnitGrams` grams (sell bill: gold per 10 g, silver per 1000 g) */
+  /** rate per `rateUnitGrams` grams (sell bill: gold per 10 g, silver per 1000 g; purchase bill: per 1 g) */
   rate?: Num;
   rateUnitGrams?: Num;
+  /** labour is always computed on gross weight */
   labour?: Num;
   labourUnit?: LabourUnit;
   other?: Num;
+  /** line discount; PERCENT is of the metal amount */
   discount?: Num;
   discountUnit?: DiscountUnit;
-  /** weight used for metal value + per-gram labour (shop setting) */
+  /** weight used for the metal amount (shop setting "calculation basis") */
   basis?: CalcBasis;
 }
 
@@ -49,9 +58,9 @@ export function netWeight(gross: Num, less?: Num): Decimal {
   return Decimal.max(D(gross).minus(D(less)), 0);
 }
 
-/** fine = net × (tunch + wastage) / 100 */
+/** fine = net × tunch/100 × (1 + wastage/100) */
 export function fineWeight(net: Num, tunch?: Num, wastage?: Num): Decimal {
-  return D(net).times(D(tunch).plus(D(wastage))).div(100);
+  return D(net).times(D(tunch)).div(100).times(D(wastage).div(100).plus(1));
 }
 
 export function computeLine(i: LineInput): LineResult {
@@ -60,12 +69,18 @@ export function computeLine(i: LineInput): LineResult {
   const basis = i.basis ?? 'NET';
   const basisWt = basis === 'GROSS' ? D(i.gross) : basis === 'FINE' ? fine : net;
   const unit = D(i.rateUnitGrams ?? 1);
-  const metal = unit.isZero() ? new Decimal(0) : basisWt.times(D(i.rate)).div(unit);
+  const perGram = unit.isZero() ? new Decimal(0) : D(i.rate).div(unit);
+  const gross = D(i.gross);
+  const metal = basisWt.times(perGram);
   const lu = i.labourUnit ?? 'PER_GRAM';
   const labour =
-    lu === 'PER_GRAM' ? basisWt.times(D(i.labour)) : lu === 'PERCENT' ? metal.times(D(i.labour)).div(100) : D(i.labour);
+    lu === 'PER_GRAM'
+      ? gross.times(D(i.labour))
+      : lu === 'PERCENT'
+        ? gross.times(perGram).times(D(i.labour)).div(100)
+        : D(i.labour);
   const beforeDisc = metal.plus(D(i.stoneCharge)).plus(labour).plus(D(i.other));
-  const disc = (i.discountUnit ?? 'FIXED') === 'PERCENT' ? beforeDisc.times(D(i.discount)).div(100) : D(i.discount);
+  const disc = (i.discountUnit ?? 'FIXED') === 'PERCENT' ? metal.times(D(i.discount)).div(100) : D(i.discount);
   return {
     net: W(net),
     fine: W(fine),
