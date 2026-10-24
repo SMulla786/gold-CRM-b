@@ -591,3 +591,209 @@ model RateLimit {
 
   @@id([businessId, metal, rateUnit])
 }
+
+// ═════════════ Phase 2 — inventory + ledger core (spec: docs/modules/04-inventory.md, 09-accounts-ledgers.md) ═════════════
+
+enum StockClass {
+  GOLD
+  SILVER
+  STONE
+  ARTIFICIAL
+  FRANCHISE
+}
+
+/// How an item name is stocked: LOOSE lots (weights reduce as sold), TAG pieces (one row per tagged piece), or BOTH allowed.
+enum EntryMethod {
+  LOOSE
+  TAG
+  BOTH
+}
+
+enum StockStatus {
+  AVAILABLE
+  SOLD
+  RESERVED
+  ISSUED
+  TRANSFERRED
+  DELETED
+}
+
+enum ChargeUnit {
+  PER_GRAM
+  PERCENT
+  FIXED
+}
+
+enum LedgerAsset {
+  MONEY
+  GOLD
+  SILVER
+  STONE
+  ARTIFICIAL
+  FRANCHISE
+}
+
+enum Direction {
+  IN
+  OUT
+}
+
+/// Metal flavour on metal ledger rows (justudhari: Usual / Bullion, plus kacha = old/unrefined).
+enum MetalForm {
+  USUAL
+  BULLION
+  KACHA
+}
+
+/// Jewellery type / collection (Chains, Rings, …). businessId null = global list (Super Admin), else business custom.
+model JewelleryType {
+  id         Int         @id @default(autoincrement())
+  businessId Int?
+  stockClass StockClass?
+  name       String
+  isActive   Boolean     @default(true)
+  groups     ItemGroup[]
+
+  @@unique([businessId, name])
+}
+
+model ItemGroup {
+  id              Int            @id @default(autoincrement())
+  businessId      Int
+  stockClass      StockClass
+  jewelleryTypeId Int?
+  name            String
+  hsnId           Int?
+  gstRate         Decimal        @default(3) @db.Decimal(5, 2)
+  minWeight       Decimal?       @db.Decimal(14, 3)
+  maxWeight       Decimal?       @db.Decimal(14, 3)
+  minPcs          Int?
+  maxPcs          Int?
+  isActive        Boolean        @default(true)
+  createdAt       DateTime       @default(now())
+  jewelleryType   JewelleryType? @relation(fields: [jewelleryTypeId], references: [id])
+  items           ItemName[]
+  stock           StockItem[]
+
+  @@unique([businessId, stockClass, name])
+}
+
+model ItemName {
+  id            Int         @id @default(autoincrement())
+  businessId    Int
+  groupId       Int
+  name          String
+  hsnId         Int?
+  taxValue      Decimal?    @db.Decimal(8, 2)
+  /// PERCENT or FIXED (Rs) — overrides group GST when set
+  taxUnit       ChargeUnit?
+  method        EntryMethod @default(BOTH)
+  tagPrefix     String?
+  tagDigits     Int?
+  minWeight     Decimal?    @db.Decimal(14, 3)
+  maxWeight     Decimal?    @db.Decimal(14, 3)
+  minPcs        Int?
+  maxPcs        Int?
+  /// "Default sale value" pre-filled on billing
+  defKaratCode  String?
+  defTunch      Decimal?    @db.Decimal(6, 3)
+  defWastage    Decimal?    @db.Decimal(6, 3)
+  defLabour     Decimal?    @db.Decimal(12, 2)
+  defLabourUnit ChargeUnit?
+  isActive      Boolean     @default(true)
+  createdAt     DateTime    @default(now())
+  group         ItemGroup   @relation(fields: [groupId], references: [id])
+  stock         StockItem[]
+
+  @@unique([businessId, groupId, name])
+}
+
+/// Atomic tag numbering per (business, prefix): increment with UPDATE … RETURNING inside the stock-entry tx.
+model TagSequence {
+  businessId Int
+  prefix     String
+  next       Int    @default(1)
+
+  @@id([businessId, prefix])
+}
+
+/// One row = one tagged piece (TAG) or one loose lot (LOOSE, quantities decrease as it is sold/issued).
+model StockItem {
+  id           Int         @id @default(autoincrement())
+  businessId   Int
+  branchId     Int
+  stockClass   StockClass
+  groupId      Int
+  itemNameId   Int
+  method       EntryMethod
+  tagNo        String?
+  huid         String?
+  karatCode    String?
+  pcs          Int         @default(0)
+  gross        Decimal     @default(0) @db.Decimal(14, 3)
+  less         Decimal     @default(0) @db.Decimal(14, 3)
+  net          Decimal     @default(0) @db.Decimal(14, 3)
+  tunch        Decimal     @default(0) @db.Decimal(6, 3)
+  wastage      Decimal     @default(0) @db.Decimal(6, 3)
+  fine         Decimal     @default(0) @db.Decimal(14, 3)
+  stoneCharge  Decimal     @default(0) @db.Decimal(14, 2)
+  labour       Decimal     @default(0) @db.Decimal(12, 2)
+  labourUnit   ChargeUnit  @default(PER_GRAM)
+  other        Decimal     @default(0) @db.Decimal(14, 2)
+  /// sale rate override (else today's rate); purchase cost for valuation/margin
+  rate         Decimal?    @db.Decimal(14, 2)
+  purchaseCost Decimal?    @db.Decimal(14, 2)
+  status       StockStatus @default(AVAILABLE)
+  /// LedgerSource that created it (PURCHASE_BILL, IMPORT, STOCK_INSERT, ORDER_RECEIVE, STOCK_TRANSFER) + document id
+  source       String
+  sourceId     String?
+  /// groups rows saved together in one "New Stock" entry
+  entryNo      Int?
+  photoUrl     String?
+  remarks      String?
+  soldAt       DateTime?
+  createdById  Int?
+  createdAt    DateTime    @default(now())
+  updatedAt    DateTime    @updatedAt
+  group        ItemGroup   @relation(fields: [groupId], references: [id])
+  itemName     ItemName    @relation(fields: [itemNameId], references: [id])
+
+  @@unique([businessId, tagNo])
+  @@index([businessId, branchId, stockClass, status])
+  @@index([businessId, huid])
+}
+
+/// Every money / stock movement in every module. Day-Book, asset ledgers, balances and dashboards read from here.
+/// Never update or delete rows: corrections are new rows with reversalOfId set.
+model LedgerEntry {
+  id            BigInt      @id @default(autoincrement())
+  businessId    Int
+  branchId      Int
+  /// business date of the transaction (Day-Book date), not insert time
+  txnDate       DateTime    @db.Date
+  asset         LedgerAsset
+  direction     Direction
+  /// MONEY: null = shop cash, else BankAccount.id
+  bankAccountId Int?
+  metalForm     MetalForm?
+  karatCode     String?
+  pcs           Int?
+  gross         Decimal?    @db.Decimal(14, 3)
+  net           Decimal?    @db.Decimal(14, 3)
+  fine          Decimal?    @db.Decimal(14, 3)
+  /// MONEY amount, or value of the stock movement
+  amount        Decimal?    @db.Decimal(14, 2)
+  /// LedgerSource enum value from src/shared/enums.ts
+  source        String
+  sourceId      String
+  partyId       Int?
+  stockItemId   Int?
+  narration     String?
+  reversalOfId  BigInt?
+  createdById   Int?
+  createdAt     DateTime    @default(now())
+
+  @@index([businessId, branchId, asset, txnDate])
+  @@index([businessId, source, sourceId])
+  @@index([businessId, partyId])
+}
