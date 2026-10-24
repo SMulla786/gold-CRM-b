@@ -1,0 +1,391 @@
+// Schema v1 — tenancy, branch tree, users, RBAC, plans/subscriptions, audit.
+// Owner: lead. Ask in chat.txt before changing.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum UserLevel {
+  SUPER_ADMIN
+  ADMIN
+  BRANCH_USER
+}
+
+enum UserStatus {
+  ACTIVE
+  BLOCKED
+  DELETED
+}
+
+enum BusinessStatus {
+  ACTIVE
+  SUSPENDED
+}
+
+enum SubscriptionStatus {
+  ACTIVE
+  CANCELLED
+}
+
+enum SignupStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+enum PaymentStatus {
+  PENDING
+  CONFIRMED
+  REJECTED
+}
+
+enum ActivityAction {
+  CREATED
+  EDITED
+  DELETED
+  REVERSED
+}
+
+enum OtpPurpose {
+  PASSWORD_RESET
+  MPIN_RESET
+  LOGIN
+}
+
+// ───────────── Geography (global masters) ─────────────
+
+/// id = GST state code
+model State {
+  id        Int        @id
+  name      String     @unique
+  districts District[]
+}
+
+model District {
+  id      Int    @id @default(autoincrement())
+  stateId Int
+  name    String
+  state   State  @relation(fields: [stateId], references: [id])
+
+  @@unique([stateId, name])
+}
+
+// ───────────── Platform: plans, tenants, subscriptions ─────────────
+
+model Plan {
+  id            Int            @id @default(autoincrement())
+  name          String         @unique
+  description   String?
+  durationDays  Int
+  price         Decimal        @db.Decimal(12, 2)
+  maxBranches   Int
+  maxUsers      Int
+  /// module keys from @ju/shared MODULES (core modules are always on)
+  modules       String[]
+  isActive      Boolean        @default(true)
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+  subscriptions Subscription[]
+}
+
+/// Tenant = one jewellery business (customer of the platform).
+model Business {
+  id            Int                   @id @default(autoincrement())
+  name          String
+  ownerName     String
+  countryCode   String                @default("+91")
+  mobile        String
+  email         String?
+  gstin         String?
+  address       String?
+  stateId       Int?
+  districtId    Int?
+  status        BusinessStatus        @default(ACTIVE)
+  createdAt     DateTime              @default(now())
+  updatedAt     DateTime              @updatedAt
+  branches      Branch[]
+  users         User[]
+  roles         Role[]
+  subscriptions Subscription[]
+  payments      SubscriptionPayment[]
+  signupRequest SignupRequest?
+}
+
+/// Subscription snapshots plan limits/modules so later plan edits don't change running subscriptions.
+/// Effective access = latest ACTIVE subscription whose endsAt >= now; otherwise business is read-only.
+model Subscription {
+  id          Int                   @id @default(autoincrement())
+  businessId  Int
+  planId      Int
+  startsAt    DateTime
+  endsAt      DateTime
+  status      SubscriptionStatus    @default(ACTIVE)
+  maxBranches Int
+  maxUsers    Int
+  modules     String[]
+  notes       String?
+  createdById Int?
+  createdAt   DateTime              @default(now())
+  business    Business              @relation(fields: [businessId], references: [id])
+  plan        Plan                  @relation(fields: [planId], references: [id])
+  payments    SubscriptionPayment[]
+
+  @@index([businessId, endsAt])
+}
+
+model SubscriptionPayment {
+  id             Int           @id @default(autoincrement())
+  businessId     Int
+  subscriptionId Int?
+  amount         Decimal       @db.Decimal(12, 2)
+  /// UPI | CASH | BANK | GATEWAY
+  method         String
+  utr            String?
+  screenshotUrl  String?
+  status         PaymentStatus @default(PENDING)
+  paidAt         DateTime?
+  recordedById   Int?
+  createdAt      DateTime      @default(now())
+  business       Business      @relation(fields: [businessId], references: [id])
+  subscription   Subscription? @relation(fields: [subscriptionId], references: [id])
+
+  @@index([businessId])
+}
+
+/// Public "Create Account" form; Super Admin approves → Business + root Branch + owner User.
+model SignupRequest {
+  id           Int          @id @default(autoincrement())
+  shopName     String
+  ownerName    String
+  countryCode  String       @default("+91")
+  whatsapp     String
+  email        String?
+  address      String
+  stateId      Int
+  districtId   Int?
+  status       SignupStatus @default(PENDING)
+  businessId   Int?         @unique
+  reviewedById Int?
+  reviewedAt   DateTime?
+  rejectReason String?
+  createdAt    DateTime     @default(now())
+  business     Business?    @relation(fields: [businessId], references: [id])
+
+  @@index([status])
+}
+
+// ───────────── Tenant structure ─────────────
+
+/// Branch tree. Root branch (parentId = null) is created with the business and owned by the owner admin.
+/// path = ancestor ids incl. self, e.g. "/1/4/9/"; subtree of X = path startsWith X.path.
+model Branch {
+  id           Int       @id @default(autoincrement())
+  businessId   Int
+  parentId     Int?
+  path         String
+  depth        Int       @default(0)
+  /// Branch-admin node: an ADMIN user attached here manages this subtree.
+  isAdminNode  Boolean   @default(false)
+  name         String
+  code         String?
+  inchargeName String?
+  countryCode  String    @default("+91")
+  mobile       String?
+  gstin        String?
+  stateId      Int?
+  districtId   Int?
+  address      String?
+  disclaimer   String?
+  isActive     Boolean   @default(true)
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+  business     Business  @relation(fields: [businessId], references: [id])
+  parent       Branch?   @relation("BranchTree", fields: [parentId], references: [id])
+  children     Branch[]  @relation("BranchTree")
+  counters     Counter[]
+  users        User[]
+  extraUsers   UserBranchAccess[]
+
+  @@index([businessId])
+  @@index([path])
+}
+
+model Counter {
+  id         Int      @id @default(autoincrement())
+  businessId Int
+  branchId   Int
+  name       String
+  isActive   Boolean  @default(true)
+  createdAt  DateTime @default(now())
+  branch     Branch   @relation(fields: [branchId], references: [id])
+
+  @@unique([branchId, name])
+  @@index([businessId])
+}
+
+// ───────────── Users & RBAC ─────────────
+
+/// SUPER_ADMIN: businessId/branchId null.
+/// ADMIN: businessId + branchId = node they administer (owner → root branch, isOwner = true).
+/// BRANCH_USER: businessId + branchId (+ optional extra branches via UserBranchAccess); permissions via role + overrides.
+model User {
+  id            Int                @id @default(autoincrement())
+  level         UserLevel
+  businessId    Int?
+  branchId      Int?
+  isOwner       Boolean            @default(false)
+  roleId        Int?
+  name          String
+  username      String             @unique
+  email         String?            @unique
+  mobile        String?
+  passwordHash  String
+  mpinHash      String?
+  status        UserStatus         @default(ACTIVE)
+  /// null = unlimited history; otherwise days of past records visible
+  viewDaysLimit Int?
+  lastLoginAt   DateTime?
+  createdById   Int?
+  createdAt     DateTime           @default(now())
+  updatedAt     DateTime           @updatedAt
+  business      Business?          @relation(fields: [businessId], references: [id])
+  branch        Branch?            @relation(fields: [branchId], references: [id])
+  role          Role?              @relation(fields: [roleId], references: [id])
+  permissions   UserPermission[]
+  extraBranches UserBranchAccess[]
+  sessions      Session[]
+  otps          OtpCode[]
+
+  @@index([businessId])
+  @@index([branchId])
+}
+
+model UserBranchAccess {
+  userId   Int
+  branchId Int
+  user     User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  branch   Branch @relation(fields: [branchId], references: [id], onDelete: Cascade)
+
+  @@id([userId, branchId])
+}
+
+/// Permission catalog seeded from @ju/shared MODULES. key = module key ("billing") or page key ("billing.sell_bill").
+model Permission {
+  id         Int              @id @default(autoincrement())
+  key        String           @unique
+  module     String
+  label      String
+  isModule   Boolean          @default(false)
+  hasActions Boolean          @default(true)
+  sort       Int
+  roles      RolePermission[]
+  users      UserPermission[]
+}
+
+/// Designation. businessId null = system template role (copied defaults for every business).
+model Role {
+  id          Int              @id @default(autoincrement())
+  businessId  Int?
+  name        String
+  isSystem    Boolean          @default(false)
+  createdAt   DateTime         @default(now())
+  business    Business?        @relation(fields: [businessId], references: [id])
+  permissions RolePermission[]
+  users       User[]
+
+  @@unique([businessId, name])
+}
+
+model RolePermission {
+  roleId       Int
+  permissionId Int
+  canView      Boolean    @default(true)
+  canEdit      Boolean    @default(false)
+  canDelete    Boolean    @default(false)
+  role         Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission   Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@id([roleId, permissionId])
+}
+
+/// Per-user override of the role's permission (row present = replaces role value for that permission).
+model UserPermission {
+  userId       Int
+  permissionId Int
+  canView      Boolean    @default(true)
+  canEdit      Boolean    @default(false)
+  canDelete    Boolean    @default(false)
+  user         User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  permission   Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@id([userId, permissionId])
+}
+
+// ───────────── Auth ─────────────
+
+/// One row per refresh token (rotated on every refresh). impersonatorId set when a super admin "logs in as".
+model Session {
+  id               String    @id @default(uuid())
+  userId           Int
+  refreshTokenHash String    @unique
+  expiresAt        DateTime
+  revokedAt        DateTime?
+  impersonatorId   Int?
+  userAgent        String?
+  ip               String?
+  createdAt        DateTime  @default(now())
+  user             User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model OtpCode {
+  id         Int        @id @default(autoincrement())
+  userId     Int
+  purpose    OtpPurpose
+  codeHash   String
+  expiresAt  DateTime
+  consumedAt DateTime?
+  createdAt  DateTime   @default(now())
+  user       User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, purpose])
+}
+
+// ───────────── Audit ─────────────
+
+model ActivityLog {
+  id         BigInt         @id @default(autoincrement())
+  businessId Int?
+  branchId   Int?
+  userId     Int?
+  module     String
+  action     ActivityAction
+  entity     String
+  entityId   String
+  summary    String
+  partyName  String?
+  meta       Json?
+  createdAt  DateTime       @default(now())
+
+  @@index([businessId, createdAt])
+  @@index([branchId, createdAt])
+}
+
+model ImpersonationLog {
+  id           Int       @id @default(autoincrement())
+  superAdminId Int
+  businessId   Int
+  targetUserId Int
+  reason       String?
+  ip           String?
+  startedAt    DateTime  @default(now())
+  endedAt      DateTime?
+
+  @@index([businessId])
+}
