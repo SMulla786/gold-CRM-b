@@ -5,7 +5,13 @@ import helmet from 'helmet';
 import { env } from './config/env';
 import { prisma } from './lib/prisma';
 import { errorHandler } from './middleware/error';
+import { requireAuth } from './middleware/auth';
+import { loadContext } from './middleware/context';
+import { requireLevel } from './middleware/guards';
 import { authRouter } from './modules/auth/routes';
+import { publicRouter } from './modules/public/routes';
+import { platformRouter } from './modules/platform/routes';
+import { adminRouter } from './modules/admin/routes';
 
 /** App factory (no listen) so supertest can mount it. Module routers get registered here. */
 export function createApp() {
@@ -21,6 +27,9 @@ export function createApp() {
   });
 
   app.use('/api/auth', authRouter);
+  app.use('/api/public', publicRouter);
+  app.use('/api/platform', requireAuth, loadContext, requireLevel('SUPER_ADMIN'), platformRouter);
+  app.use('/api/admin', requireAuth, loadContext, requireLevel('ADMIN'), adminRouter);
 
   app.use(errorHandler);
   return app;
