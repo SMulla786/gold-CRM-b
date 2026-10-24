@@ -91,7 +91,7 @@ describe('(a) cross-tenant / cross-branch access by id -> 404', () => {
 });
 
 describe('(b) admin consolidation & branch-admin subtree', () => {
-  it.todo('T-b1 admin consolidated totals = sum of branches (needs a consolidated totals endpoint — later phase)');
+  it.todo('T-b1 admin consolidated totals = sum of branches (Phase 6: dashboard/consolidated-totals endpoints)');
 
   it('T-b2 owner admin sees the whole branch tree', async () => {
     const a = await buildBusinessA();
@@ -179,7 +179,7 @@ describe('(c) subscription read-only guard', () => {
     expect([200, 201]).toContain(res.status);
   });
 
-  it.todo('T-c4 module not in plan -> 403 MODULE_DISABLED (needs a module-gated /app route — later phase)');
+  it.todo('T-c4 module not in plan -> 403 MODULE_DISABLED (wire when TASK-14 lands: any /api/app route of a module absent from the plan)');
 });
 
 describe('(d) plan-limit guards', () => {

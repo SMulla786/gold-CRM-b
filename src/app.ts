@@ -12,6 +12,8 @@ import { authRouter } from './modules/auth/routes';
 import { publicRouter } from './modules/public/routes';
 import { platformRouter } from './modules/platform/routes';
 import { adminRouter } from './modules/admin/routes';
+import { appRouter } from './modules/app/routes';
+import { requireWrite } from './middleware/guards';
 
 /** App factory (no listen) so supertest can mount it. Module routers get registered here. */
 export function createApp() {
@@ -30,6 +32,7 @@ export function createApp() {
   app.use('/api/public', publicRouter);
   app.use('/api/platform', requireAuth, loadContext, requireLevel('SUPER_ADMIN'), platformRouter);
   app.use('/api/admin', requireAuth, loadContext, requireLevel('ADMIN'), adminRouter);
+  app.use('/api/app', requireAuth, loadContext, requireLevel('ADMIN', 'BRANCH_USER'), requireWrite, appRouter);
 
   app.use(errorHandler);
   return app;

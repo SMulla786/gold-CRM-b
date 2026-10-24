@@ -4,6 +4,7 @@ import { prisma } from '../../lib/prisma';
 import { signAccessToken } from '../../middleware/auth';
 import { HttpError } from '../../middleware/error';
 import { buildMe } from '../auth/service';
+import { DEFAULT_KARATS } from '../../shared';
 import type {
   BusinessDetailDto,
   BusinessListItemDto,
@@ -450,6 +451,16 @@ async function provisionBusiness(
   const now = new Date();
   await tx.subscription.create({
     data: { businessId: business.id, planId: plan.id, startsAt: now, endsAt: new Date(now.getTime() + plan.durationDays * DAY), maxBranches: plan.maxBranches, maxUsers: plan.maxUsers, modules: plan.modules, createdById: data.createdById },
+  });
+  // Creation hook (docs/api-phase1.md): seed default karat mappings + rate limits.
+  await tx.karatMapping.createMany({ data: DEFAULT_KARATS.map((k, i) => ({ businessId: business.id, metal: k.metal, code: k.code, title: k.title, touch: k.touch, isSystem: true, sort: i })) });
+  await tx.rateLimit.createMany({
+    data: [
+      { businessId: business.id, metal: 'GOLD', rateUnit: 'GRAM_1', minRate: 14000, maxRate: 18000 },
+      { businessId: business.id, metal: 'GOLD', rateUnit: 'GRAM_10', minRate: 145000, maxRate: 200000 },
+      { businessId: business.id, metal: 'GOLD', rateUnit: 'TOLA', minRate: 169000, maxRate: 202000 },
+      { businessId: business.id, metal: 'SILVER', rateUnit: 'KG_1', minRate: 240000, maxRate: 300000 },
+    ],
   });
   if (data.signupId) {
     await tx.signupRequest.update({ where: { id: data.signupId }, data: { status: 'APPROVED', businessId: business.id, reviewedById: data.reviewedById ?? null, reviewedAt: now } });

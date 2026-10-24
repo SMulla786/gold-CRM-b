@@ -41,12 +41,16 @@ export function assertWithinLimit(used: number, max: number | null | undefined, 
   if (max != null && used >= max) throw new HttpError(403, 'PLAN_LIMIT', `Plan limit reached (${what})`);
 }
 
-/** Requires a valid X-MPIN header matching the user's MPIN. For sensitive actions (deletes, settings, set stock). */
-export const requireMpin: RequestHandler = async (req, _res, next) => {
-  const mpin = req.header(HEADERS.MPIN);
-  const user = await prisma.user.findUnique({ where: { id: req.ctx!.userId }, select: { mpinHash: true } });
+/** Verifies the given MPIN against the user's stored MPIN; throws 403 MPIN_REQUIRED if missing/invalid. */
+export async function assertMpin(userId: number, mpin: string | undefined): Promise<void> {
+  const user = await prisma.user.findUnique({ where: { id: userId }, select: { mpinHash: true } });
   if (!mpin || !user?.mpinHash || !(await argon2.verify(user.mpinHash, mpin).catch(() => false))) {
     throw new HttpError(403, 'MPIN_REQUIRED', 'Valid MPIN required');
   }
+}
+
+/** Requires a valid X-MPIN header. For sensitive actions (deletes, settings, set stock). */
+export const requireMpin: RequestHandler = async (req, _res, next) => {
+  await assertMpin(req.ctx!.userId, req.header(HEADERS.MPIN));
   next();
 };
