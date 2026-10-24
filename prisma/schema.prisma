@@ -61,16 +61,24 @@ enum OtpPurpose {
 
 /// id = GST state code
 model State {
-  id        Int        @id
-  name      String     @unique
-  districts District[]
+  id             Int             @id
+  name           String          @unique
+  districts      District[]
+  businesses     Business[]
+  signupRequests SignupRequest[]
+  branches       Branch[]
+  parties        Party[]
 }
 
 model District {
-  id      Int    @id @default(autoincrement())
-  stateId Int
-  name    String
-  state   State  @relation(fields: [stateId], references: [id])
+  id             Int             @id @default(autoincrement())
+  stateId        Int
+  name           String
+  state          State           @relation(fields: [stateId], references: [id])
+  businesses     Business[]
+  signupRequests SignupRequest[]
+  branches       Branch[]
+  parties        Party[]
 
   @@unique([stateId, name])
 }
@@ -121,6 +129,8 @@ model Business {
   karats        KaratMapping[]
   metalRates    MetalRate[]
   rateLimits    RateLimit[]
+  state         State?                @relation(fields: [stateId], references: [id])
+  district      District?             @relation(fields: [districtId], references: [id])
 }
 
 /// Subscription snapshots plan limits/modules so later plan edits don't change running subscriptions.
@@ -182,6 +192,8 @@ model SignupRequest {
   rejectReason String?
   createdAt    DateTime     @default(now())
   business     Business?    @relation(fields: [businessId], references: [id])
+  state        State        @relation(fields: [stateId], references: [id])
+  district     District?    @relation(fields: [districtId], references: [id])
 
   @@index([status])
 }
@@ -217,6 +229,8 @@ model Branch {
   counters     Counter[]
   users        User[]
   extraUsers   UserBranchAccess[]
+  state        State?             @relation(fields: [stateId], references: [id])
+  district     District?          @relation(fields: [districtId], references: [id])
 
   @@index([businessId])
   @@index([path])
@@ -474,6 +488,8 @@ model Party {
   business        Business  @relation(fields: [businessId], references: [id])
   parent          Party?    @relation("PartyFamily", fields: [parentId], references: [id])
   members         Party[]   @relation("PartyFamily")
+  state           State?    @relation(fields: [stateId], references: [id])
+  district        District? @relation(fields: [districtId], references: [id])
 
   @@index([businessId, type, name])
   @@index([businessId, mobile])

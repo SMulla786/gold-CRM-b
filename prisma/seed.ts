@@ -43,6 +43,35 @@ const SYSTEM_ROLES: Record<string, (pageKey: string) => Grant | null> = {
         : null,
 };
 
+/** HSN master as offered by justudhari (docs/raw crawl). shortcut: only 19 of its 75 product-level rows captured; add the rest when the full list is captured. */
+const HSN_BASE: Array<[string, "GOLD" | "SILVER" | "ARTIFICIAL" | "STONE" | "FRANCHISE" | "FINDINGS", string, number]> = [
+  ["7113", "GOLD", "Gold Jewellery", 3],
+  ["7114", "SILVER", "Silver Jewellery", 3],
+  ["7108", "GOLD", "Bullion", 3],
+  ["7106", "SILVER", "Bullion", 3],
+  ["7102", "STONE", "Loose Stones", 0.25],
+  ["7103", "STONE", "Loose Stones", 0.25],
+  ["7117", "ARTIFICIAL", "Imitation", 3],
+  ["7115", "FINDINGS", "Findings", 3],
+  ["711590", "FINDINGS", "Findings", 3],
+  ["71159010", "FINDINGS", "Findings", 3],
+];
+const GOLD_PRODUCTS = ["Ring","Chain","Necklace","Mangalsutra","Pendant","Locket","Bangle","Kada","Bracelet","Anklet","Toe Ring","Earrings","Tops","Jhumka","Ear Cuff","Nose Pin","Nath","Maang Tikka","Matha Patti"];
+
+async function seedHsn() {
+  const rows = [
+    ...HSN_BASE.map(([code, category, productType, gstRate]) => ({ code, category, productType, gstRate })),
+    ...GOLD_PRODUCTS.map((p) => ({ code: "7113", category: "GOLD" as const, productType: `Gold Jewellery - ${p}`, gstRate: 3 })),
+  ];
+  for (const r of rows) {
+    await prisma.hsnCode.upsert({
+      where: { code_category_productType: { code: r.code, category: r.category, productType: r.productType } },
+      update: { gstRate: r.gstRate },
+      create: r,
+    });
+  }
+}
+
 async function seedStates() {
   for (const s of INDIAN_STATES) {
     await prisma.state.upsert({ where: { id: s.code }, update: { name: s.name }, create: { id: s.code, name: s.name } });
@@ -185,6 +214,7 @@ async function main() {
   await seedPermissions();
   await seedSystemRoles();
   await seedPlans();
+  await seedHsn();
   await seedSuperAdmin(passwordHash);
   if (process.env.SEED_DEMO === 'true') await seedDemo(passwordHash);
   console.log('Seed complete');
