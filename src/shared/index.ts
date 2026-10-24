@@ -5,4 +5,5 @@ export * from './contracts/common';
 export * from './contracts/auth';
 export * from './contracts/platform';
 export * from './contracts/admin';
+export * from './contracts/masters';
 export * from './calc';
