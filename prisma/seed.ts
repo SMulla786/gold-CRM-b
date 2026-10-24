@@ -5,6 +5,7 @@
 import { PrismaClient, type Prisma } from '@prisma/client';
 import argon2 from 'argon2';
 import { INDIAN_STATES, MODULES, MODULE_KEYS } from '../src/shared';
+import { ensureBusinessDefaults } from '../src/modules/platform/service';
 
 const prisma = new PrismaClient();
 const env = (k: string, d?: string) => {
@@ -217,6 +218,8 @@ async function main() {
   await seedHsn();
   await seedSuperAdmin(passwordHash);
   if (process.env.SEED_DEMO === 'true') await seedDemo(passwordHash);
+  // backfill defaults (karats, rate limits) for businesses created before the creation hook existed
+  for (const b of await prisma.business.findMany({ select: { id: true } })) await ensureBusinessDefaults(prisma, b.id);
   console.log('Seed complete');
 }
 

@@ -18,6 +18,35 @@ import type {
 } from '../../shared';
 
 const DAY = 86_400_000;
+
+const DEFAULT_RATE_LIMITS = [
+  { metal: 'GOLD', rateUnit: 'GRAM_1', minRate: 14000, maxRate: 18000 },
+  { metal: 'GOLD', rateUnit: 'GRAM_10', minRate: 145000, maxRate: 200000 },
+  { metal: 'GOLD', rateUnit: 'TOLA', minRate: 169000, maxRate: 202000 },
+  { metal: 'SILVER', rateUnit: 'KG_1', minRate: 240000, maxRate: 300000 },
+] as const;
+
+/**
+ * Idempotent, CREATE-ONLY per-business defaults (karat mappings + rate limits). Called by provisionBusiness and the
+ * seed backfill. `update: {}` on purpose — re-running must never reset a shop's customised touch/limits.
+ */
+export async function ensureBusinessDefaults(tx: Prisma.TransactionClient, businessId: number): Promise<void> {
+  for (let i = 0; i < DEFAULT_KARATS.length; i++) {
+    const k = DEFAULT_KARATS[i]!;
+    await tx.karatMapping.upsert({
+      where: { businessId_metal_code: { businessId, metal: k.metal, code: k.code } },
+      update: {},
+      create: { businessId, metal: k.metal, code: k.code, title: k.title, touch: k.touch, isSystem: true, sort: i },
+    });
+  }
+  for (const l of DEFAULT_RATE_LIMITS) {
+    await tx.rateLimit.upsert({
+      where: { businessId_metal_rateUnit: { businessId, metal: l.metal, rateUnit: l.rateUnit } },
+      update: {},
+      create: { businessId, metal: l.metal, rateUnit: l.rateUnit, minRate: l.minRate, maxRate: l.maxRate },
+    });
+  }
+}
 /* eslint-disable @typescript-eslint/no-explicit-any */
 const planDto = (p: any): PlanDto => ({
   id: p.id,
@@ -453,15 +482,7 @@ async function provisionBusiness(
     data: { businessId: business.id, planId: plan.id, startsAt: now, endsAt: new Date(now.getTime() + plan.durationDays * DAY), maxBranches: plan.maxBranches, maxUsers: plan.maxUsers, modules: plan.modules, createdById: data.createdById },
   });
   // Creation hook (docs/api-phase1.md): seed default karat mappings + rate limits.
-  await tx.karatMapping.createMany({ data: DEFAULT_KARATS.map((k, i) => ({ businessId: business.id, metal: k.metal, code: k.code, title: k.title, touch: k.touch, isSystem: true, sort: i })) });
-  await tx.rateLimit.createMany({
-    data: [
-      { businessId: business.id, metal: 'GOLD', rateUnit: 'GRAM_1', minRate: 14000, maxRate: 18000 },
-      { businessId: business.id, metal: 'GOLD', rateUnit: 'GRAM_10', minRate: 145000, maxRate: 200000 },
-      { businessId: business.id, metal: 'GOLD', rateUnit: 'TOLA', minRate: 169000, maxRate: 202000 },
-      { businessId: business.id, metal: 'SILVER', rateUnit: 'KG_1', minRate: 240000, maxRate: 300000 },
-    ],
-  });
+  await ensureBusinessDefaults(tx, business.id);
   if (data.signupId) {
     await tx.signupRequest.update({ where: { id: data.signupId }, data: { status: 'APPROVED', businessId: business.id, reviewedById: data.reviewedById ?? null, reviewedAt: now } });
   }
