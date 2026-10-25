@@ -37,6 +37,7 @@ import { girviRouter } from './girvi/routes';
 import { ordersRouter } from './orders/routes';
 import { repairRouter } from './repair/routes';
 import { tradeRouter } from './trade/routes';
+import { schemesRouter } from './schemes/routes';
 
 export const appRouter = Router();
 appRouter.use(inventoryRouter);
@@ -52,6 +53,7 @@ appRouter.use(girviRouter);
 appRouter.use(ordersRouter);
 appRouter.use(repairRouter);
 appRouter.use(tradeRouter);
+appRouter.use(schemesRouter);
 
 const PARTIES = 'settings.parties';
 const MISC = 'settings.misc';

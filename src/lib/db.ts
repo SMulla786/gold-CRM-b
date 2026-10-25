@@ -63,6 +63,9 @@ const TENANT_MODELS: Record<string, Scope> = {
   Order: 'branch',
   KarigarIssue: 'branch',
   RepairTicket: 'branch',
+  // Phase 11 schemes (groups/payments through the scoped parent):
+  Scheme: 'branch',
+  SchemeEnrollment: 'branch',
   ActivityLog: 'branch',
   // BillItem/BillPayment have no businessId — always reached through a scoped Bill (handled in services).
   // JewelleryType omitted (nullable businessId: global + custom) — scoped in its service like Role.
