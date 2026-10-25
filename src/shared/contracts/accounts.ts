@@ -25,11 +25,27 @@ export const incomeExpenseBody = z
   .refine((b) => b.cash + b.online + b.gold + b.silver > 0, { message: 'Enter an amount or metal weight' })
   .refine((b) => b.online === 0 || b.bankAccountId != null, { message: 'Select a bank account for online amount', path: ['bankAccountId'] });
 
+/** TASK-81: surface manual (DIRECT) income/expense rows alongside auto-entries from other modules. */
+export const IE_SOURCE_TYPES = ['DIRECT', 'SELL_BILL', 'PURCHASE_BILL', 'GIRVI', 'UDHAR'] as const;
+
 export const incomeExpenseListQuery = pageQuery.extend({
   type: z.enum(['INCOME', 'EXPENSE']).optional(),
+  sourceType: z.enum(IE_SOURCE_TYPES).optional(),
   from: dateOnly.optional(),
   to: dateOnly.optional(),
 });
+
+/** TASK-81: per-day roll-up for the "Old list" summary view. Decimals as strings. */
+export interface IncomeExpenseDailySummaryDto {
+  date: string;
+  cashIn: string;
+  cashOut: string;
+  /** (cash + online) IN − OUT for the day */
+  profit: string;
+  /** fine grams IN − OUT */
+  goldNet: string;
+  silverNet: string;
+}
 
 export interface IncomeExpenseDto {
   id: number;
