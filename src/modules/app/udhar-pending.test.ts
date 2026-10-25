@@ -40,6 +40,21 @@ describe('TASK-44b pendingBills (scoped raw id filter)', () => {
     expect(paged.items).toHaveLength(1);
   });
 
+  it('TASK-83: itemsSummary groups line items by description (pcs summed)', async () => {
+    const { business, root } = await createBusiness({ name: 'A' });
+    const cust = await db.party.create({ data: { businessId: business.id, type: 'CUSTOMER', name: 'Cust', mobile: '9000000009', countryCode: '+91' } });
+    const ctx = ctxFor(business.id, root.id);
+    const bill = await db.bill.create({ data: { businessId: business.id, branchId: root.id, kind: 'SELL', billType: 'ROUGH', billNo: 'B9', seq: 9, partyId: cust.id, billDate: new Date(), sub: 100, taxable: 100, total: 100, final: 100, paid: 0, status: 'ACTIVE' } });
+    const item = (description: string) => db.billItem.create({ data: { billId: bill.id, stockClass: 'GOLD', description, pcs: 1, gross: 1, net: 1, fine: 1, metalAmount: 1, labourAmount: 0, total: 1 } });
+    await item('Ring');
+    await item('Ring');
+    await item('Chain');
+
+    const b = (await udhar.pendingBills(ctx, { page: 1, pageSize: 20 })).items.find((x) => x.id === bill.id)!;
+    expect(b.itemsSummary).toBe('2× Ring, 1× Chain');
+    expect(b.itemCount).toBe(3);
+  });
+
   it('excludes bills of another business (scope)', async () => {
     const a = await createBusiness({ name: 'A' });
     const b = await createBusiness({ name: 'B' });

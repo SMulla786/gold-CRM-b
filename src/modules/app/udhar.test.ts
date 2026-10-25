@@ -2,7 +2,7 @@ import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { db, truncateAll } from '../../../test/helpers/db';
 import { createBusiness } from '../../../test/helpers/factory';
 import type { TenantContext } from '../../middleware/context';
-import { createUdharTxn, deleteUdharTxn, partyBalance } from './udhar';
+import { createUdharTxn, deleteUdharTxn, listLedger, partyBalance } from './udhar';
 
 const ctxFor = (businessId: number, branchIds: number[], activeBranchId: number): TenantContext => ({
   userId: 1,
@@ -44,6 +44,24 @@ describe('udhar txn posting', () => {
     const ctx = ctxFor(business.id, [root.id], root.id);
     const p = await makeParty(business.id);
     await expect(createUdharTxn(ctx, { partyId: p.id, cashOut: 0, onlineOut: 1000, outBankId: 999999, cashIn: 0, onlineIn: 0, goldOut: 0, goldIn: 0, silverOut: 0, silverIn: 0 } as never)).rejects.toMatchObject({ status: 404 });
+  });
+
+  it('TASK-83 ledger list: Old/In/Out/Final per unit over a period (current balance stays all-time)', async () => {
+    const { business, root } = await createBusiness({ name: 'A' });
+    const ctx = ctxFor(business.id, [root.id], root.id);
+    const p = await makeParty(business.id);
+    const num = { onlineOut: 0, cashIn: 0, onlineIn: 0, goldOut: 0, goldIn: 0, silverOut: 0, silverIn: 0 };
+    await createUdharTxn(ctx, { partyId: p.id, cashOut: 1000, ...num, txnDate: new Date('2026-05-01') } as never); // before the period → old
+    await createUdharTxn(ctx, { partyId: p.id, cashOut: 500, ...num, txnDate: new Date('2026-06-10') } as never); // in period, given → in
+    await createUdharTxn(ctx, { partyId: p.id, cashOut: 0, ...num, cashIn: 200, txnDate: new Date('2026-06-20') } as never); // in period, received → out
+
+    const list = await listLedger(ctx, { page: 1, pageSize: 20, nonZero: 'true', from: new Date('2026-06-01'), to: new Date('2026-06-30') });
+    const row = list.items.find((r) => r.party.id === p.id)!;
+    expect(row.old!.amount).toBe('1000.00');
+    expect(row.in!.amount).toBe('500.00');
+    expect(row.out!.amount).toBe('200.00');
+    expect(row.final!.amount).toBe('1300.00'); // old + in − out
+    expect(row.amount).toBe('1300.00'); // inherited current balance = all-time net
   });
 
   it('gold given/received → GOLD ledger rows and a gold balance', async () => {

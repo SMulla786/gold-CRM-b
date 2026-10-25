@@ -277,7 +277,7 @@ export async function listEntries(ctx: TenantContext, q: { page: number; pageSiz
 }
 
 /** Udhar Ledger: party-wise balances (SQL groupBy). */
-export async function listLedger(ctx: TenantContext, q: { page: number; pageSize: number; type?: PartyType; nonZero: 'true' | 'false'; q?: string }): Promise<Paged<PartyBalanceRowDto>> {
+export async function listLedger(ctx: TenantContext, q: { page: number; pageSize: number; type?: PartyType; nonZero: 'true' | 'false'; q?: string; from?: Date; to?: Date }): Promise<Paged<PartyBalanceRowDto>> {
   const sdb = scopedDb(ctx);
   const grouped = await sdb.udharEntry.groupBy({ by: ['partyId'], _sum: { amount: true, gold: true, silver: true }, _max: { txnDate: true } });
   // shortcut: party-name/type filter + pagination done in app over the grouped parties (hundreds per shop); move to a raw joined query if a shop's party count grows into the thousands.
@@ -300,8 +300,44 @@ export async function listLedger(ctx: TenantContext, q: { page: number; pageSize
   rows.sort((a, b) => (b.lastTxnDate?.getTime() ?? 0) - (a.lastTxnDate?.getTime() ?? 0));
   const total = rows.length;
   const page = rows.slice((q.page - 1) * q.pageSize, (q.page - 1) * q.pageSize + q.pageSize);
-  const items: PartyBalanceRowDto[] = page.map((r) => ({ party: r.party, ...bal(r.amount, r.gold, r.silver), lastTxnDate: r.lastTxnDate ? dateOnly(r.lastTxnDate) : null }));
+  const from = q.from ? ledger.businessDate(q.from) : null;
+  const to = q.to ? ledger.businessDate(q.to) : null;
+  const period = await periodBreakdown(ctx, page.map((r) => r.party.id), from, to);
+  const items: PartyBalanceRowDto[] = page.map((r) => ({ party: r.party, ...bal(r.amount, r.gold, r.silver), lastTxnDate: r.lastTxnDate ? dateOnly(r.lastTxnDate) : null, ...period.get(r.party.id) }));
   return { items, total, page: q.page, pageSize: q.pageSize };
+}
+
+/** TASK-83: per-party Old/In/Out/Final per unit over [from,to] — scoped raw SQL, only the page's parties.
+ *  old = Σ before `from` (0 when no `from`); in = Σ positive, out = Σ |negative| in range; final = old + in − out. */
+async function periodBreakdown(ctx: TenantContext, partyIds: number[], from: Date | null, to: Date | null): Promise<Map<number, { old: BalanceDto; in: BalanceDto; out: BalanceDto; final: BalanceDto }>> {
+  if (partyIds.length === 0) return new Map();
+  const before = from ? Prisma.sql`"txnDate" < ${from}` : Prisma.sql`FALSE`;
+  const inRange = Prisma.sql`(${from ? Prisma.sql`"txnDate" >= ${from}` : Prisma.sql`TRUE`}) AND (${to ? Prisma.sql`"txnDate" <= ${to}` : Prisma.sql`TRUE`})`;
+  const rows = await prisma.$queryRaw<Array<Record<'partyId' | `${'old' | 'in' | 'out'}_${'amount' | 'gold' | 'silver'}`, number | string>>>(Prisma.sql`
+    SELECT "partyId",
+      COALESCE(SUM(CASE WHEN ${before} THEN amount ELSE 0 END), 0) AS old_amount,
+      COALESCE(SUM(CASE WHEN ${before} THEN gold ELSE 0 END), 0) AS old_gold,
+      COALESCE(SUM(CASE WHEN ${before} THEN silver ELSE 0 END), 0) AS old_silver,
+      COALESCE(SUM(CASE WHEN ${inRange} AND amount > 0 THEN amount ELSE 0 END), 0) AS in_amount,
+      COALESCE(SUM(CASE WHEN ${inRange} AND gold > 0 THEN gold ELSE 0 END), 0) AS in_gold,
+      COALESCE(SUM(CASE WHEN ${inRange} AND silver > 0 THEN silver ELSE 0 END), 0) AS in_silver,
+      COALESCE(SUM(CASE WHEN ${inRange} AND amount < 0 THEN -amount ELSE 0 END), 0) AS out_amount,
+      COALESCE(SUM(CASE WHEN ${inRange} AND gold < 0 THEN -gold ELSE 0 END), 0) AS out_gold,
+      COALESCE(SUM(CASE WHEN ${inRange} AND silver < 0 THEN -silver ELSE 0 END), 0) AS out_silver
+    FROM "UdharEntry"
+    WHERE "businessId" = ${ctx.businessId!} AND "branchId" IN (${Prisma.join(ctx.branchIds)}) AND "partyId" IN (${Prisma.join(partyIds)})
+    GROUP BY "partyId"`);
+  return new Map(
+    rows.map((r) => [
+      Number(r.partyId),
+      {
+        old: bal(D(r.old_amount), D(r.old_gold), D(r.old_silver)),
+        in: bal(D(r.in_amount), D(r.in_gold), D(r.in_silver)),
+        out: bal(D(r.out_amount), D(r.out_gold), D(r.out_silver)),
+        final: bal(D(r.old_amount).plus(D(r.in_amount)).minus(D(r.out_amount)), D(r.old_gold).plus(D(r.in_gold)).minus(D(r.out_gold)), D(r.old_silver).plus(D(r.in_silver)).minus(D(r.out_silver))),
+      },
+    ]),
+  );
 }
 
 export async function partyBalance(ctx: TenantContext, partyId: number): Promise<BalanceDto> {
@@ -351,6 +387,14 @@ export async function statement(ctx: TenantContext, partyId: number, q: { from?:
   return { party, opening, rows: statementRows, closing: bal(runAmount, runGold, runSilver) };
 }
 
+/** TASK-83: compact line summary for the pending-bills list, e.g. "2× Ring, 1× Chain" (pcs per description, top 4). */
+function summarizeItems(items: { description: string; pcs: number }[]): string {
+  const counts = new Map<string, number>();
+  for (const it of items) counts.set(it.description, (counts.get(it.description) ?? 0) + (it.pcs || 1));
+  const parts = [...counts.entries()].map(([name, n]) => `${n}× ${name}`);
+  return parts.slice(0, 4).join(', ') + (parts.length > 4 ? `, +${parts.length - 4} more` : '');
+}
+
 /** Pending bills (balance ≠ 0), both kinds. Reads Bill (empty until billing lands). */
 export async function pendingBills(ctx: TenantContext, q: { page: number; pageSize: number; partyId?: number; type?: PartyType }): Promise<Paged<BillListItemDto>> {
   const sdb = scopedDb(ctx);
@@ -371,7 +415,7 @@ export async function pendingBills(ctx: TenantContext, q: { page: number; pageSi
 
   const bills = await sdb.bill.findMany({
     where: { id: { in: ids } },
-    include: { _count: { select: { items: true } } },
+    include: { _count: { select: { items: true } }, items: { select: { description: true, pcs: true } } },
     orderBy: [{ billDate: 'desc' }, { id: 'desc' }],
     skip: (q.page - 1) * q.pageSize,
     take: q.pageSize,
@@ -388,6 +432,7 @@ export async function pendingBills(ctx: TenantContext, q: { page: number; pageSi
     party: partyMap.get(b.partyId)!,
     branch: { id: b.branchId, name: branchMap.get(b.branchId) ?? '' },
     itemCount: b._count.items,
+    itemsSummary: summarizeItems(b.items),
     final: money(D(b.final)),
     paid: money(D(b.paid)),
     balance: money(D(b.final).minus(b.paid)),
