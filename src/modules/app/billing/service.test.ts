@@ -309,6 +309,30 @@ describe('bill from an approved draft (TASK-56 hook)', () => {
   });
 });
 
+describe('bill from a READY order (TASK-62 hook)', () => {
+  it('sells the order\'s RESERVED finished piece and marks the order + items DELIVERED; a second bill → 409', async () => {
+    const s = await setup();
+    const order = await db.order.create({ data: { businessId: s.business.id, branchId: s.root.id, orderNo: 1, partyId: s.party.id, orderDate: new Date(), status: 'READY' } });
+    const piece = await db.stockItem.create({ data: { businessId: s.business.id, branchId: s.root.id, stockClass: 'GOLD', groupId: s.group.id, itemNameId: s.itemName.id, method: 'TAG', tagNo: 'OR0001', karatCode: '22K', pcs: 1, gross: 10, less: 0, net: 10, tunch: 91.67, wastage: 0, fine: 9.167, status: 'RESERVED', source: 'ORDER_RECEIVE', sourceId: String(order.id), createdById: 1 } });
+    await db.orderItem.create({ data: { orderId: order.id, itemNameId: s.itemName.id, metal: 'GOLD', touch: 91.67, gross: 10, net: 10, fine: 9.167, status: 'RECEIVED', stockItemId: piece.id } });
+
+    const bill = await billing.createBill(s.ctx, parse({ kind: 'SELL', billType: 'ROUGH', partyId: s.party.id, orderId: order.id, items: [{ stockItemId: piece.id, gross: 10, rate: 60000 }] }));
+    expect((await db.stockItem.findUniqueOrThrow({ where: { id: piece.id } })).status).toBe('SOLD');
+    const o = await db.order.findUniqueOrThrow({ where: { id: order.id } });
+    expect(o.status).toBe('DELIVERED');
+    expect(o.billId).toBe(bill.id);
+    expect((await db.orderItem.findFirstOrThrow({ where: { orderId: order.id } })).status).toBe('DELIVERED');
+    await expect(billing.createBill(s.ctx, parse({ kind: 'SELL', billType: 'ROUGH', partyId: s.party.id, orderId: order.id, items: [{ stockItemId: piece.id, gross: 10, rate: 60000 }] }))).rejects.toMatchObject({ status: 409 });
+  });
+
+  it('rejects an order that is not READY (409)', async () => {
+    const s = await setup();
+    const order = await db.order.create({ data: { businessId: s.business.id, branchId: s.root.id, orderNo: 2, partyId: s.party.id, orderDate: new Date(), status: 'IN_PROCESS' } });
+    const itemId = await newTagItem(s.ctx, s.itemName.id);
+    await expect(billing.createBill(s.ctx, parse({ kind: 'SELL', billType: 'ROUGH', partyId: s.party.id, orderId: order.id, items: [{ stockItemId: itemId, gross: 10, rate: 60000 }] }))).rejects.toMatchObject({ status: 409 });
+  });
+});
+
 describe('add bill payments', () => {
   it('increments paid atomically and drops the balance + party udhar', async () => {
     const s = await setup();
