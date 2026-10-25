@@ -30,6 +30,27 @@ export function requirePermission(pageKey: string, action: PermissionAction = 'v
   };
 }
 
+/** Passes if ANY of the keys grants the action (module enabled + permission). Same MODULE_DISABLED/FORBIDDEN
+ * semantics as requirePermission: MODULE_DISABLED only when none of the keys' modules are in the plan. */
+export function assertAnyPermission(ctx: TenantContext, keys: string[], action: PermissionAction = 'view'): void {
+  let moduleEnabledSomewhere = false;
+  for (const key of keys) {
+    const moduleOk = ctx.level === 'SUPER_ADMIN' || ctx.modules.includes(moduleOf(key));
+    if (moduleOk) moduleEnabledSomewhere = true;
+    if (moduleOk && hasPermission(ctx, key, action)) return;
+  }
+  if (!moduleEnabledSomewhere) throw new HttpError(403, 'MODULE_DISABLED', 'Module not enabled in your plan');
+  throw new HttpError(403, 'FORBIDDEN', 'You do not have permission for this action');
+}
+
+/** Middleware form of assertAnyPermission (static key list). */
+export function requireAnyPermission(keys: string[], action: PermissionAction = 'view'): RequestHandler {
+  return (req, _res, next) => {
+    assertAnyPermission(req.ctx!, keys, action);
+    next();
+  };
+}
+
 /** Blocks writes (any non-GET) when the subscription is read-only. Mount on tenant/admin routers, not on /auth or owner subscription routes. */
 export const requireWrite: RequestHandler = (req, _res, next) => {
   if (req.method !== 'GET' && req.ctx?.readOnly) throw new HttpError(403, 'READ_ONLY', 'Subscription inactive — read-only mode');

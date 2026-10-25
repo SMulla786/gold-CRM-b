@@ -29,6 +29,7 @@ import { accountsRouter } from './accounts.routes';
 import { udharRouter } from './udhar.routes';
 import { billingRouter } from './billing/routes';
 import { reportsRouter } from './reports.routes';
+import { businessProfileRouter } from './business-profile.routes';
 
 export const appRouter = Router();
 appRouter.use(inventoryRouter);
@@ -36,6 +37,7 @@ appRouter.use(accountsRouter);
 appRouter.use(udharRouter);
 appRouter.use(billingRouter);
 appRouter.use(reportsRouter);
+appRouter.use(businessProfileRouter);
 
 const PARTIES = 'settings.parties';
 const MISC = 'settings.misc';
