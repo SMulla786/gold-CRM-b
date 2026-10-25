@@ -796,6 +796,7 @@ model LedgerEntry {
   @@index([businessId, branchId, asset, txnDate])
   @@index([businessId, source, sourceId])
   @@index([businessId, partyId])
+  @@index([businessId, stockItemId])
 }
 
 // ═════════════ Phase 3 — accounts (spec: docs/modules/09-accounts-ledgers.md) ═════════════
