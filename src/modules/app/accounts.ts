@@ -2,6 +2,7 @@ import { Prisma } from '@prisma/client';
 import { prisma } from '../../lib/prisma';
 import { scopedDb } from '../../lib/db';
 import * as ledger from '../../lib/ledger';
+import { logActivity } from '../../lib/activity';
 import { HttpError } from '../../middleware/error';
 import type { TenantContext } from '../../middleware/context';
 import { LEDGER_ASSETS } from '../../shared';
@@ -81,6 +82,7 @@ export async function createIncomeExpense(ctx: TenantContext, body: IeBody): Pro
       data: { businessId: ctx.businessId!, branchId, txnDate, type: body.type, reason: body.reason, cash: body.cash, online: body.online, bankAccountId: body.online > 0 ? body.bankAccountId! : null, gold: body.gold, silver: body.silver, remark: body.remark ?? null, createdById: ctx.userId },
     });
     await ledger.post(tx, lctx, ieLedgerRows(branchId, txnDate, body, String(h.id)));
+    await logActivity(tx, ctx, { module: 'INCOME_EXPENSE', action: 'CREATED', entity: 'IncomeExpense', entityId: String(h.id), summary: `${body.type}: ${body.reason}` });
     return h;
   });
   return (await decorateIE(ctx, [header]))[0]!;
@@ -110,6 +112,7 @@ export async function updateIncomeExpense(ctx: TenantContext, id: number, body: 
     await tx.incomeExpense.update({ where: { id }, data: { type: body.type, reason: body.reason, cash: body.cash, online: body.online, bankAccountId: body.online > 0 ? body.bankAccountId! : null, gold: body.gold, silver: body.silver, remark: body.remark ?? null } });
     await ledger.reverse(tx, lctx, { source: 'INCOME_EXPENSE', sourceId: String(id) });
     await ledger.post(tx, lctx, ieLedgerRows(h.branchId, txnDate, body, String(id)));
+    await logActivity(tx, ctx, { module: 'INCOME_EXPENSE', action: 'EDITED', entity: 'IncomeExpense', entityId: String(id), summary: `${body.type}: ${body.reason}` });
   });
   return (await decorateIE(ctx, [await sdb.incomeExpense.findUniqueOrThrow({ where: { id } })]))[0]!;
 }
@@ -122,6 +125,7 @@ export async function deleteIncomeExpense(ctx: TenantContext, id: number): Promi
   await prisma.$transaction(async (tx) => {
     await tx.incomeExpense.update({ where: { id }, data: { isDeleted: true } });
     await ledger.reverse(tx, lctx, { source: 'INCOME_EXPENSE', sourceId: String(id) });
+    await logActivity(tx, ctx, { module: 'INCOME_EXPENSE', action: 'DELETED', entity: 'IncomeExpense', entityId: String(id), summary: `${h.type}: ${h.reason}` });
   });
 }
 

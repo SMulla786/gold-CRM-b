@@ -2,6 +2,7 @@ import type { Prisma } from '@prisma/client';
 import { prisma } from '../../lib/prisma';
 import { scopedDb } from '../../lib/db';
 import * as ledger from '../../lib/ledger';
+import { logActivity } from '../../lib/activity';
 import { HttpError } from '../../middleware/error';
 import type { TenantContext } from '../../middleware/context';
 import { computeLine, stockRowInput } from '../../shared';
@@ -287,6 +288,7 @@ export async function createStockEntry(ctx: TenantContext, body: { stockClass: S
       }]);
       ids.push(item.id);
     }
+    await logActivity(tx, ctx, { module: 'STOCK', action: 'CREATED', entity: 'StockEntry', entityId: String(entryNo), summary: `Stock entry #${entryNo} (${ids.length} item(s))` });
     return ids;
   });
 
@@ -387,6 +389,7 @@ async function editStock(ctx: TenantContext, uniq: number[], patch: any): Promis
   await prisma.$transaction(async (tx) => {
     await lockAvailable(tx, uniq);
     for (const item of items) await applyStockEdit(tx, lctx, item, patch, touchByCode);
+    await logActivity(tx, ctx, { module: 'STOCK', action: 'EDITED', entity: 'StockItem', entityId: uniq.join(','), summary: `Edited ${items.length} stock item(s)` });
   });
   return items.length;
 }
@@ -401,6 +404,7 @@ async function deleteStockItems(ctx: TenantContext, uniq: number[]): Promise<num
     const locked = await tx.stockItem.updateMany({ where: { id: { in: uniq }, status: 'AVAILABLE' }, data: { status: 'DELETED' } });
     if (locked.count !== uniq.length) throw new HttpError(409, 'CONFLICT', 'A stock item is not AVAILABLE or changed concurrently');
     for (const id of uniq) await ledger.reverseForItem(tx, lctx, id);
+    await logActivity(tx, ctx, { module: 'STOCK', action: 'DELETED', entity: 'StockItem', entityId: uniq.join(','), summary: `Deleted ${uniq.length} stock item(s)` });
   });
   return uniq.length;
 }
@@ -460,6 +464,7 @@ export async function createStockTransfer(ctx: TenantContext, body: { fromBranch
         { ...common, branchId: body.toBranchId, direction: 'IN', txnDate, narration: `Transfer #${transferNo} in` },
       ]);
     }
+    await logActivity(tx, ctx, { module: 'STOCK_TRANSFER', action: 'CREATED', entity: 'StockTransfer', entityId: String(h.id), summary: `Transfer #${transferNo} (${items.length} item(s))` });
     return h;
   });
   return getStockTransfer(ctx, header.id);
