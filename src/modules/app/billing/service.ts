@@ -207,19 +207,21 @@ async function prepareBill(ctx: TenantContext, body: BillBody, branchId: number,
 }
 
 /** The line/stock/ledger/payment/udhar writes applied onto an existing Bill row (no numbering) — shared by create and edit. Carries the TASK-30b in-tx concurrency guards. */
-async function writeBillContents(tx: Prisma.TransactionClient, ctx: TenantContext, bill: { id: number; branchId: number; billNo: string; billDate: Date }, body: BillBody, prep: Prepared, lctx: ledger.LedgerContext): Promise<void> {
+async function writeBillContents(tx: Prisma.TransactionClient, ctx: TenantContext, bill: { id: number; branchId: number; billNo: string; billDate: Date }, body: BillBody, prep: Prepared, lctx: ledger.LedgerContext, reservedIds: Set<number> = new Set()): Promise<void> {
   const { id: billId, branchId, billNo, billDate } = bill;
   if (body.pan && !prep.party.pan) await tx.party.update({ where: { id: prep.party.id }, data: { pan: body.pan } });
+  // An order's finished pieces are RESERVED-for-this-order; the claim accepts RESERVED only for those ids, everything else AVAILABLE only.
+  const sellable = (itemId: number) => (reservedIds.has(itemId) ? (['AVAILABLE', 'RESERVED'] as const) : (['AVAILABLE'] as const));
 
   const stockLedger: ledger.LedgerEntryInput[] = [];
   for (const r of prep.lines) {
     let stockItemId: number | null = null;
     if (r.action === 'SELL_TAG') {
-      const sold = await tx.stockItem.updateMany({ where: { id: r.stockItem.id, status: 'AVAILABLE', branchId }, data: { status: 'SOLD' } });
+      const sold = await tx.stockItem.updateMany({ where: { id: r.stockItem.id, status: { in: [...sellable(r.stockItem.id)] }, branchId }, data: { status: 'SOLD' } });
       if (sold.count !== 1) throw new HttpError(409, 'CONFLICT', `Stock item ${r.stockItem.id} is no longer AVAILABLE`);
       stockItemId = r.stockItem.id;
     } else if (r.action === 'SELL_LOOSE') {
-      const taken = await tx.stockItem.updateMany({ where: { id: r.stockItem.id, status: 'AVAILABLE', gross: { gte: r.gross }, less: { gte: r.less }, pcs: { gte: r.pcs } }, data: { gross: { decrement: r.gross }, less: { decrement: r.less }, pcs: { decrement: r.pcs } } });
+      const taken = await tx.stockItem.updateMany({ where: { id: r.stockItem.id, status: { in: [...sellable(r.stockItem.id)] }, gross: { gte: r.gross }, less: { gte: r.less }, pcs: { gte: r.pcs } }, data: { gross: { decrement: r.gross }, less: { decrement: r.less }, pcs: { decrement: r.pcs } } });
       if (taken.count !== 1) throw new HttpError(409, 'CONFLICT', `Stock item ${r.stockItem.id} does not hold that much`);
       const it = await tx.stockItem.findUniqueOrThrow({ where: { id: r.stockItem.id } });
       const net = Prisma.Decimal.max(D(it.gross).minus(it.less), 0);
@@ -300,8 +302,17 @@ export async function createBill(ctx: TenantContext, body: BillBody): Promise<Bi
   const branchId = activeBranch(ctx);
   const s = await getSettings(ctx);
   const numbering = s[body.kind === 'SELL' ? 'invoice.sale' : 'invoice.purchase'];
-  const prep = await prepareBill(ctx, body, branchId, s);
   const lctx = lctxOf(ctx);
+
+  // Phase 8: billing an order — its READY order's finished (RESERVED) pieces become sellable on this bill; validate up-front, flip in the tx.
+  let reservedIds = new Set<number>();
+  if (body.orderId != null) {
+    if (body.kind !== 'SELL') throw new HttpError(400, 'VALIDATION', 'An order can only be billed as a sell bill');
+    const order = await scopedDb(ctx).order.findFirst({ where: { id: body.orderId }, include: { items: { select: { stockItemId: true } } } });
+    if (!order || order.partyId !== body.partyId || order.status !== 'READY') throw new HttpError(409, 'CONFLICT', 'Order is not READY for this party');
+    reservedIds = new Set(order.items.map((i) => i.stockItemId).filter((x): x is number => x != null));
+  }
+  const prep = await prepareBill(ctx, body, branchId, s, reservedIds);
 
   // Phase 7: billing from an approved showroom draft — validate up-front (friendly 409), flip it atomically in the tx.
   if (body.draftId != null) {
@@ -328,10 +339,15 @@ export async function createBill(ctx: TenantContext, body: BillBody): Promise<Bi
         keepRate: body.keepBalanceAs !== 'MONEY' ? (body.keepRate ?? null) : null, keepWeight: prep.keepWeight, remark: body.remark ?? null, status: 'ACTIVE', createdById: ctx.userId,
       },
     });
-    await writeBillContents(tx, ctx, bill, body, prep, lctx);
+    await writeBillContents(tx, ctx, bill, body, prep, lctx, reservedIds);
     if (body.draftId != null) {
       const flip = await tx.salesDraft.updateMany({ where: { id: body.draftId, status: 'APPROVED' }, data: { status: 'BILLED', billId: bill.id } });
       if (flip.count !== 1) throw new HttpError(409, 'CONFLICT', 'Draft has already been billed');
+    }
+    if (body.orderId != null) {
+      const flip = await tx.order.updateMany({ where: { id: body.orderId, status: 'READY' }, data: { status: 'DELIVERED', billId: bill.id } });
+      if (flip.count !== 1) throw new HttpError(409, 'CONFLICT', 'Order has already been billed');
+      await tx.orderItem.updateMany({ where: { orderId: body.orderId }, data: { status: 'DELIVERED' } });
     }
     await logActivity(tx, ctx, { module: body.kind, action: 'CREATED', entity: 'BILL', entityId: String(bill.id), summary: `${body.kind === 'SELL' ? 'Sell' : 'Purchase'} bill ${billNo} ₹${prep.billCalc.final}`, partyName: prep.party.name });
     return bill.id;

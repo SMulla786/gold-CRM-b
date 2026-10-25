@@ -33,6 +33,9 @@ import { businessProfileRouter } from './business-profile.routes';
 import { openingRouter } from './opening.routes';
 import { draftsRouter } from './drafts/routes';
 import { justBillRouter } from './justbill/routes';
+import { girviRouter } from './girvi/routes';
+import { ordersRouter } from './orders/routes';
+import { repairRouter } from './repair/routes';
 
 export const appRouter = Router();
 appRouter.use(inventoryRouter);
@@ -44,6 +47,9 @@ appRouter.use(businessProfileRouter);
 appRouter.use(openingRouter);
 appRouter.use(draftsRouter);
 appRouter.use(justBillRouter);
+appRouter.use(girviRouter);
+appRouter.use(ordersRouter);
+appRouter.use(repairRouter);
 
 const PARTIES = 'settings.parties';
 const MISC = 'settings.misc';
