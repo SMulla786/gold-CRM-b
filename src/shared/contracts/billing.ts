@@ -95,7 +95,10 @@ export const billBody = z
   .refine((b) => b.keepBalanceAs === 'MONEY' || (b.keepRate ?? 0) > 0, { message: 'Enter the rate to keep the balance in metal', path: ['keepRate'] });
 export type BillBody = z.infer<typeof billBody>;
 
-export const addBillPaymentsBody = z.object({ payments: z.array(billPaymentInput).min(1).max(20), txnDate: z.coerce.date().optional() });
+/** PATCH /app/bills/:id — edit a bill dated TODAY (X-MPIN). Same body as create; kind + billType must not change (number series). */
+export const editBillBody = billBody;
+
+export const addBillPaymentsBody =z.object({ payments: z.array(billPaymentInput).min(1).max(20), txnDate: z.coerce.date().optional() });
 /** DELETE /app/bills/:id?returnStock=true → items back to stock; false → record only */
 export const deleteBillQuery = z.object({ returnStock: z.enum(['true', 'false']).default('true') });
 
