@@ -352,63 +352,73 @@ export async function stockGroups(ctx: TenantContext, query: any): Promise<Group
 const touchMap = async (sdb: any): Promise<Map<string, number>> => new Map((await sdb.karatMapping.findMany({ select: { code: true, touch: true } })).map((k: any) => [k.code, Number(k.touch)]));
 const lctxOf = (ctx: TenantContext) => ({ businessId: ctx.businessId!, branchIds: ctx.branchIds, userId: ctx.userId });
 
-/** Recompute + reverse/repost one AVAILABLE item inside a tx. Shared by single PATCH and bulk edit. */
+/** Recompute one item, reverse ALL its ledger rows (any source, so a transferred item nets to 0 at both branches), repost the fresh IN at its current branch. */
 async function applyStockEdit(tx: Prisma.TransactionClient, lctx: ledger.LedgerContext, item: any, body: any, touchByCode: Map<string, number>): Promise<void> {
   const merged = { pcs: item.pcs, gross: numN(item.gross), less: numN(item.less), tunch: numN(item.tunch), wastage: numN(item.wastage), stoneCharge: numN(item.stoneCharge), labour: numN(item.labour), labourUnit: item.labourUnit, other: numN(item.other), rate: item.rate != null ? numN(item.rate) : undefined, purchaseCost: item.purchaseCost != null ? numN(item.purchaseCost) : undefined, karatCode: item.karatCode ?? undefined, huid: item.huid ?? undefined, remarks: item.remarks ?? undefined, ...body };
   const r = resolveRow(merged, item.itemName, touchByCode);
   await tx.stockItem.update({ where: { id: item.id }, data: { pcs: merged.pcs, gross: merged.gross, less: merged.less, tunch: r.tunch, wastage: merged.wastage, net: r.net, fine: r.fine, stoneCharge: merged.stoneCharge, labour: merged.labour, labourUnit: merged.labourUnit, other: merged.other, rate: merged.rate ?? null, purchaseCost: r.purchaseCost, karatCode: r.karatCode, huid: merged.huid ?? null, remarks: merged.remarks ?? null } });
-  await ledger.reverse(tx, lctx, { source: 'STOCK_INSERT', sourceId: String(item.id) });
+  await ledger.reverseForItem(tx, lctx, item.id);
   await ledger.post(tx, lctx, [{ branchId: item.branchId, asset: ledger.assetForStockClass(item.stockClass), direction: 'IN', karatCode: r.karatCode, pcs: merged.pcs, gross: merged.gross, net: r.net, fine: r.fine, amount: r.purchaseCost, source: 'STOCK_INSERT', sourceId: String(item.id), stockItemId: item.id, narration: `Edit stock item #${item.id}` }]);
 }
 
-/** Soft-delete one item + reverse its ledger inside a tx. Shared by single DELETE and bulk delete. */
-async function applyStockDelete(tx: Prisma.TransactionClient, lctx: ledger.LedgerContext, item: any): Promise<void> {
-  await tx.stockItem.update({ where: { id: item.id }, data: { status: 'DELETED' } });
-  await ledger.reverse(tx, lctx, { source: 'STOCK_INSERT', sourceId: String(item.id) });
+/** A sold item (any active SELL_BILL ledger row) can't be edited or deleted — it must be corrected from the bill. */
+async function assertNotSold(ctx: TenantContext, ids: number[]): Promise<void> {
+  const sold = await prisma.ledgerEntry.findFirst({ where: { businessId: ctx.businessId!, stockItemId: { in: ids }, source: 'SELL_BILL', reversalOfId: null }, select: { stockItemId: true } });
+  if (sold) throw new HttpError(409, 'CONFLICT', `Item #${sold.stockItemId} is on a sell bill — correct it from the bill`);
+}
+
+/** Lock the ids inside the tx and confirm all are still AVAILABLE (count must equal n), else 409 — closes the edit-vs-transfer/delete race. */
+async function lockAvailable(tx: Prisma.TransactionClient, ids: number[]): Promise<void> {
+  const locked = await tx.stockItem.updateMany({ where: { id: { in: ids }, status: 'AVAILABLE' }, data: { status: 'AVAILABLE' } });
+  if (locked.count !== ids.length) throw new HttpError(409, 'CONFLICT', 'A stock item is not AVAILABLE or changed concurrently');
+}
+
+async function editStock(ctx: TenantContext, uniq: number[], patch: any): Promise<number> {
+  const sdb = scopedDb(ctx);
+  const items = await sdb.stockItem.findMany({ where: { id: { in: uniq } }, include: { itemName: true } });
+  if (items.length !== uniq.length) throw new HttpError(404, 'NOT_FOUND', 'One or more stock items not found');
+  for (const it of items) if (it.status !== 'AVAILABLE') throw new HttpError(409, 'CONFLICT', `Item #${it.id} is not AVAILABLE`);
+  await assertNotSold(ctx, uniq);
+  const touchByCode = await touchMap(sdb);
+  const lctx = lctxOf(ctx);
+  await prisma.$transaction(async (tx) => {
+    await lockAvailable(tx, uniq);
+    for (const item of items) await applyStockEdit(tx, lctx, item, patch, touchByCode);
+  });
+  return items.length;
+}
+
+async function deleteStockItems(ctx: TenantContext, uniq: number[]): Promise<number> {
+  const sdb = scopedDb(ctx);
+  const items = await sdb.stockItem.findMany({ where: { id: { in: uniq } } });
+  if (items.length !== uniq.length) throw new HttpError(404, 'NOT_FOUND', 'One or more stock items not found');
+  await assertNotSold(ctx, uniq);
+  const lctx = lctxOf(ctx);
+  await prisma.$transaction(async (tx) => {
+    const locked = await tx.stockItem.updateMany({ where: { id: { in: uniq }, status: 'AVAILABLE' }, data: { status: 'DELETED' } });
+    if (locked.count !== uniq.length) throw new HttpError(409, 'CONFLICT', 'A stock item is not AVAILABLE or changed concurrently');
+    for (const id of uniq) await ledger.reverseForItem(tx, lctx, id);
+  });
+  return uniq.length;
 }
 
 export async function updateStock(ctx: TenantContext, id: number, body: any): Promise<StockItemDto> {
-  const sdb = scopedDb(ctx);
-  const item = await sdb.stockItem.findUnique({ where: { id }, include: { itemName: true } });
-  if (!item) throw new HttpError(404, 'NOT_FOUND', 'Stock item not found');
-  if (item.status !== 'AVAILABLE') throw new HttpError(409, 'CONFLICT', 'Only AVAILABLE items can be edited');
-  const touchByCode = await touchMap(sdb);
-  await prisma.$transaction((tx) => applyStockEdit(tx, lctxOf(ctx), item, body, touchByCode));
+  await editStock(ctx, [id], body);
   return getStock(ctx, id);
 }
 
 export async function deleteStock(ctx: TenantContext, id: number): Promise<void> {
-  const item = await scopedDb(ctx).stockItem.findUnique({ where: { id } });
-  if (!item) throw new HttpError(404, 'NOT_FOUND', 'Stock item not found');
-  await prisma.$transaction((tx) => applyStockDelete(tx, lctxOf(ctx), item));
+  await deleteStockItems(ctx, [id]);
 }
 
-// ───────────── Bulk edit / delete (one tx, reuse the single-item cores) ─────────────
+// ───────────── Bulk edit / delete (one tx, reuse the single-item path) ─────────────
 
 export async function bulkEditStock(ctx: TenantContext, ids: number[], patch: any): Promise<BulkResultDto> {
-  const sdb = scopedDb(ctx);
-  const uniq = [...new Set(ids)];
-  const items = await sdb.stockItem.findMany({ where: { id: { in: uniq } }, include: { itemName: true } });
-  if (items.length !== uniq.length) throw new HttpError(404, 'NOT_FOUND', 'One or more stock items not found');
-  for (const it of items) if (it.status !== 'AVAILABLE') throw new HttpError(409, 'CONFLICT', `Item #${it.id} is not AVAILABLE`);
-  const touchByCode = await touchMap(sdb);
-  const lctx = lctxOf(ctx);
-  await prisma.$transaction(async (tx) => {
-    for (const item of items) await applyStockEdit(tx, lctx, item, patch, touchByCode);
-  });
-  return { updated: items.length };
+  return { updated: await editStock(ctx, [...new Set(ids)], patch) };
 }
 
 export async function bulkDeleteStock(ctx: TenantContext, ids: number[]): Promise<BulkResultDto> {
-  const sdb = scopedDb(ctx);
-  const uniq = [...new Set(ids)];
-  const items = await sdb.stockItem.findMany({ where: { id: { in: uniq } } });
-  if (items.length !== uniq.length) throw new HttpError(404, 'NOT_FOUND', 'One or more stock items not found');
-  const lctx = lctxOf(ctx);
-  await prisma.$transaction(async (tx) => {
-    for (const item of items) await applyStockDelete(tx, lctx, item);
-  });
-  return { updated: items.length };
+  return { updated: await deleteStockItems(ctx, [...new Set(ids)]) };
 }
 
 // ───────────── Stock transfer (inter-branch move; both branches in subtree) ─────────────
@@ -437,8 +447,10 @@ export async function createStockTransfer(ctx: TenantContext, body: { fromBranch
   const header = await prisma.$transaction(async (tx) => {
     const transferNo = await nextTransferNo(tx, ctx.businessId!);
     const h = await tx.stockTransfer.create({ data: { businessId: ctx.businessId!, transferNo, fromBranchId: body.fromBranchId, toBranchId: body.toBranchId, txnDate, itemCount: items.length, remarks: body.remarks ?? null, createdById: ctx.userId } });
+    // Move + race-guard in one write: only still-AVAILABLE items in the source branch move (stays AVAILABLE); count must match.
+    const moved = await tx.stockItem.updateMany({ where: { id: { in: uniq }, branchId: body.fromBranchId, status: 'AVAILABLE' }, data: { branchId: body.toBranchId } });
+    if (moved.count !== uniq.length) throw new HttpError(409, 'CONFLICT', 'A stock item is no longer AVAILABLE in the source branch');
     for (const it of items) {
-      await tx.stockItem.update({ where: { id: it.id }, data: { branchId: body.toBranchId } }); // stays AVAILABLE
       const common = { asset: ledger.assetForStockClass(it.stockClass), karatCode: it.karatCode, pcs: it.pcs, gross: it.gross, net: it.net, fine: it.fine, amount: it.purchaseCost, source: 'STOCK_TRANSFER' as const, sourceId: String(h.id), stockItemId: it.id };
       await ledger.post(tx, lctx, [
         { ...common, branchId: body.fromBranchId, direction: 'OUT', txnDate, narration: `Transfer #${transferNo} out` },
@@ -478,7 +490,8 @@ const transferDto = (t: any, sums: { gross: unknown; fine: unknown } | undefined
 /** Σ gross/fine of the moved items per transfer, from the IN ledger rows. */
 async function transferSums(ctx: TenantContext, ids: number[]): Promise<Map<string, { gross: unknown; fine: unknown }>> {
   if (!ids.length) return new Map();
-  const agg = await prisma.ledgerEntry.groupBy({ by: ['sourceId'], where: { businessId: ctx.businessId!, source: 'STOCK_TRANSFER', direction: 'IN', sourceId: { in: ids.map(String) } }, _sum: { gross: true, fine: true } });
+  // reversalOfId: null — exclude reversal rows (a reversed OUT@from is itself an IN row and would double-count the moved weight).
+  const agg = await prisma.ledgerEntry.groupBy({ by: ['sourceId'], where: { businessId: ctx.businessId!, source: 'STOCK_TRANSFER', direction: 'IN', reversalOfId: null, sourceId: { in: ids.map(String) } }, _sum: { gross: true, fine: true } });
   return new Map(agg.map((a) => [a.sourceId, { gross: a._sum.gross, fine: a._sum.fine }]));
 }
 
@@ -500,7 +513,7 @@ export async function getStockTransfer(ctx: TenantContext, id: number): Promise<
   const t = await scopedDb(ctx).stockTransfer.findFirst({ where: { id } });
   if (!t) throw new HttpError(404, 'NOT_FOUND', 'Transfer not found');
   const [names, sums] = await Promise.all([transferNames(ctx, [t]), transferSums(ctx, [t.id])]);
-  const led = await prisma.ledgerEntry.findMany({ where: { businessId: ctx.businessId!, source: 'STOCK_TRANSFER', sourceId: String(id), direction: 'IN' }, select: { stockItemId: true } });
+  const led = await prisma.ledgerEntry.findMany({ where: { businessId: ctx.businessId!, source: 'STOCK_TRANSFER', sourceId: String(id), direction: 'IN', reversalOfId: null }, select: { stockItemId: true } });
   const stockIds = [...new Set(led.map((r) => r.stockItemId).filter((x): x is number => x != null))];
   // Raw prisma: moved items now sit at toBranch, which may be outside the viewer's subtree when they only cover fromBranch.
   const items = stockIds.length ? await prisma.stockItem.findMany({ where: { id: { in: stockIds }, businessId: ctx.businessId! }, include: { group: true, itemName: true } }) : [];

@@ -1,4 +1,4 @@
-import type { Prisma } from '@prisma/client';
+import type { LedgerEntry, Prisma } from '@prisma/client';
 import { LEDGER_SOURCES } from '../shared';
 import type { LedgerAsset, LedgerSource, StockClass } from '../shared';
 import { HttpError } from '../middleware/error';
@@ -85,9 +85,8 @@ export async function post(tx: Prisma.TransactionClient, ctx: LedgerContext, ent
   if (data.length) await tx.ledgerEntry.createMany({ data });
 }
 
-/** Writes mirror rows (direction flipped, dated today, reversalOfId set) for every not-yet-reversed row of a document. */
-export async function reverse(tx: Prisma.TransactionClient, ctx: LedgerContext, ref: { source: LedgerSource; sourceId: string }): Promise<void> {
-  const rows = await tx.ledgerEntry.findMany({ where: { businessId: ctx.businessId, source: ref.source, sourceId: ref.sourceId, reversalOfId: null } });
+/** Writes mirror rows (direction flipped, dated today, reversalOfId set) for the given active rows, skipping any already reversed. */
+async function writeReversals(tx: Prisma.TransactionClient, ctx: LedgerContext, rows: LedgerEntry[]): Promise<void> {
   if (rows.length === 0) return;
   const alreadyReversed = new Set(
     (await tx.ledgerEntry.findMany({ where: { businessId: ctx.businessId, reversalOfId: { in: rows.map((r) => r.id) } }, select: { reversalOfId: true } })).map((r) => r.reversalOfId),
@@ -118,4 +117,14 @@ export async function reverse(tx: Prisma.TransactionClient, ctx: LedgerContext, 
       createdById: ctx.userId,
     }));
   if (data.length) await tx.ledgerEntry.createMany({ data });
+}
+
+/** Reverse every not-yet-reversed row of a document (by source + sourceId). */
+export async function reverse(tx: Prisma.TransactionClient, ctx: LedgerContext, ref: { source: LedgerSource; sourceId: string }): Promise<void> {
+  await writeReversals(tx, ctx, await tx.ledgerEntry.findMany({ where: { businessId: ctx.businessId, source: ref.source, sourceId: ref.sourceId, reversalOfId: null } }));
+}
+
+/** Reverse every active row touching a stock item, whatever its source (insert, transfer OUT/IN). Used by stock edit/delete so a transferred item nets to zero across both branches. */
+export async function reverseForItem(tx: Prisma.TransactionClient, ctx: LedgerContext, stockItemId: number): Promise<void> {
+  await writeReversals(tx, ctx, await tx.ledgerEntry.findMany({ where: { businessId: ctx.businessId, stockItemId, reversalOfId: null } }));
 }

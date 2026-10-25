@@ -138,6 +138,7 @@ interface LedgerQ {
   bankAccountId?: number;
   metalForm?: 'USUAL' | 'BULLION' | 'KACHA';
   partyId?: number;
+  stockItemId?: number;
 }
 
 interface RawRow {
@@ -175,6 +176,7 @@ function ledgerConds(ctx: TenantContext, q: LedgerQ, branches: number[]): Prisma
   if (q.direction) c.push(Prisma.sql`direction::text = ${q.direction}`);
   if (q.metalForm) c.push(Prisma.sql`"metalForm"::text = ${q.metalForm}`);
   if (q.partyId) c.push(Prisma.sql`"partyId" = ${q.partyId}`);
+  if (q.stockItemId) c.push(Prisma.sql`"stockItemId" = ${q.stockItemId}`);
   if (q.bankAccountId != null) c.push(q.bankAccountId === 0 ? Prisma.sql`"bankAccountId" IS NULL` : Prisma.sql`"bankAccountId" = ${q.bankAccountId}`);
   return c;
 }

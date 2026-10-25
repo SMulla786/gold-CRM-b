@@ -2,6 +2,7 @@ import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { db, truncateAll } from '../../../test/helpers/db';
 import { createBranch, createBusiness } from '../../../test/helpers/factory';
 import * as inv from './inventory';
+import * as acc from './accounts';
 import type { TenantContext } from '../../middleware/context';
 
 const ctxFor = (businessId: number, branchId: number): TenantContext => ({
@@ -162,5 +163,67 @@ describe('TASK-25 Phase 2b — bulk + transfer', () => {
 
     // the item now lives at b -> re-transfer from root is 409 (not in source)
     await expect(inv.createStockTransfer(owner, { fromBranchId: s.root.id, toBranchId: b.id, stockItemIds: [itemId] })).rejects.toMatchObject({ status: 409 });
+  });
+});
+
+describe('TASK-25b — transferred-item edit/delete nets to zero; sold-item guard', () => {
+  async function netFineByBranch(stockItemId: number): Promise<Map<number, number>> {
+    const rows = await db.ledgerEntry.findMany({ where: { stockItemId }, select: { branchId: true, direction: true, fine: true } });
+    const m = new Map<number, number>();
+    for (const r of rows) m.set(r.branchId, (m.get(r.branchId) ?? 0) + (r.direction === 'IN' ? 1 : -1) * Number(r.fine));
+    return m;
+  }
+  async function transferred() {
+    const s = await setup();
+    const b = await createBranch({ businessId: s.business.id, parentId: s.root.id, name: 'B' });
+    const owner = { ...ctxFor(s.business.id, s.root.id), branchIds: [s.root.id, b.id] };
+    const entry = await inv.createStockEntry(owner, { stockClass: 'GOLD', method: 'TAG', rows: [row({ itemNameId: s.itemName.id, karatCode: '22K' })] });
+    const itemId = entry.items[0]!.id;
+    const t = await inv.createStockTransfer(owner, { fromBranchId: s.root.id, toBranchId: b.id, stockItemIds: [itemId] });
+    return { s, b, owner, itemId, t };
+  }
+
+  it('delete after a transfer reverses every branch leg -> A=0, B=0', async () => {
+    const { s, b, owner, itemId } = await transferred();
+    await inv.deleteStock(owner, itemId);
+    const net = await netFineByBranch(itemId);
+    expect(net.get(s.root.id) ?? 0).toBeCloseTo(0, 3);
+    expect(net.get(b.id) ?? 0).toBeCloseTo(0, 3);
+  });
+
+  it('edit after a transfer leaves source=0 and reposts the new weight at the destination', async () => {
+    const { s, b, owner, itemId } = await transferred();
+    await inv.updateStock(owner, itemId, { gross: 20 });
+    const net = await netFineByBranch(itemId);
+    expect(net.get(s.root.id) ?? 0).toBeCloseTo(0, 3);
+    expect(net.get(b.id) ?? 0).toBeCloseTo(18.334, 3); // 20 g × 91.67%
+  });
+
+  it('transfer list gross is unchanged after the item is deleted (reversal rows excluded)', async () => {
+    const { owner, itemId } = await transferred();
+    const before = (await inv.listStockTransfers(owner, { page: 1, pageSize: 20 })).items[0]!.gross;
+    expect(Number(before)).toBeCloseTo(10, 3);
+    await inv.deleteStock(owner, itemId);
+    expect((await inv.listStockTransfers(owner, { page: 1, pageSize: 20 })).items[0]!.gross).toBe(before);
+  });
+
+  it('an item on a sell bill cannot be edited or deleted (409)', async () => {
+    const s = await setup();
+    const entry = await inv.createStockEntry(s.ctx, { stockClass: 'GOLD', method: 'TAG', rows: [row({ itemNameId: s.itemName.id, karatCode: '22K' })] });
+    const itemId = entry.items[0]!.id;
+    await db.ledgerEntry.create({ data: { businessId: s.business.id, branchId: s.root.id, txnDate: new Date(), asset: 'GOLD', direction: 'OUT', net: 10, fine: 9.167, source: 'SELL_BILL', sourceId: '1', stockItemId: itemId } });
+    await expect(inv.updateStock(s.ctx, itemId, { gross: 20 })).rejects.toMatchObject({ status: 409 });
+    await expect(inv.deleteStock(s.ctx, itemId)).rejects.toMatchObject({ status: 409 });
+  });
+});
+
+describe('TASK-29 — /ledgers stockItemId filter', () => {
+  it('returns only the movement rows of one stock item', async () => {
+    const s = await setup();
+    const e = await inv.createStockEntry(s.ctx, { stockClass: 'GOLD', method: 'TAG', rows: [row({ itemNameId: s.itemName.id, karatCode: '22K' }), row({ itemNameId: s.itemName.id, karatCode: '22K', gross: 5 })] });
+    const target = e.items[0]!;
+    const page = await acc.getLedgerPage(s.ctx, { page: 1, pageSize: 20, asset: 'GOLD', stockItemId: target.id });
+    expect(page.total).toBe(1);
+    expect(page.items[0]!.item?.id).toBe(target.id);
   });
 });
