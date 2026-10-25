@@ -83,7 +83,7 @@ describe('GSTR-1 classification', () => {
     await mkBill(s, { partyId: s.unregIntra.id, billDate: priorMonth, status: 'DELETED', deletedAt: now, taxable: 2000, cgst: 30, sgst: 30 });
     const r = await svc.gstr1(s.ctx, q);
     expect(r.cdnr).toHaveLength(1);
-    expect(r.cdnr[0]!.noteDate).toBe(now.toISOString().slice(0, 10));
+    expect(r.cdnr[0]!.noteDate).toBe(new Date(now.getTime() + 330 * 60000).toISOString().slice(0, 10)); // IST day of deletedAt (matches reports.ts +330min), not the UTC day
     const neg = r.b2cs.find((x) => Number(x.taxable) < 0)!;
     expect(Number(neg.taxable)).toBe(-2000);
   });
