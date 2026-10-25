@@ -57,6 +57,8 @@ export const ledgerQuery = pageQuery.extend({
   bankAccountId: z.coerce.number().int().min(0).optional(),
   metalForm: z.enum(['USUAL', 'BULLION', 'KACHA']).optional(),
   partyId: id.optional(),
+  /** one stock item's movement history (insert, edits, transfers, sale later) */
+  stockItemId: id.optional(),
 });
 
 export interface LedgerRowDto {
