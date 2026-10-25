@@ -16,18 +16,25 @@ export const openingEntryInput = z.discriminatedUnion('kind', [
   /** fine bullion / kacha metal the shop holds outside tagged stock */
   z.object({ kind: z.literal('METAL'), metal: z.enum(METALS), metalForm: z.enum(['BULLION', 'KACHA']), fine: decimalInput.positive() }),
   /** party udhar carried over: + = party owes the shop, − = shop owes the party (same sign convention as udhari) */
-  z
-    .object({ kind: z.literal('PARTY'), partyId: id, amount: signed.default(0), gold: signed.default(0), silver: signed.default(0) })
-    .refine((p) => p.amount !== 0 || p.gold !== 0 || p.silver !== 0, { message: 'Enter an amount, gold or silver' }),
+  z.object({ kind: z.literal('PARTY'), partyId: id, amount: signed.default(0), gold: signed.default(0), silver: signed.default(0) }),
 ]);
 export type OpeningEntryInput = z.infer<typeof openingEntryInput>;
 
-export const openingBalanceBody = z.object({
-  /** business date the balances are "as of"; default today */
-  txnDate: z.coerce.date().optional(),
-  entries: z.array(openingEntryInput).min(1).max(500),
-  remark: z.string().trim().max(200).optional(),
-});
+export const openingBalanceBody = z
+  .object({
+    /** business date the balances are "as of"; default today */
+    txnDate: z.coerce.date().optional(),
+    entries: z.array(openingEntryInput).min(1).max(500),
+    remark: z.string().trim().max(200).optional(),
+  })
+  // discriminatedUnion members can't carry refinements, so the PARTY non-zero rule lives here
+  .superRefine((b, ctx) =>
+    b.entries.forEach((e, i) => {
+      if (e.kind === 'PARTY' && e.amount === 0 && e.gold === 0 && e.silver === 0) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Enter an amount, gold or silver', path: ['entries', i] });
+      }
+    }),
+  );
 
 export interface OpeningBatchDto {
   /** shared sourceId of every row in this save — DELETE /app/opening-balances/:sourceId reverses it */
