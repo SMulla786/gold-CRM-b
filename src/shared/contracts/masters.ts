@@ -307,3 +307,15 @@ export const putSettingBody = z.object({
   branchId: id.optional(),
   value: z.unknown(),
 });
+
+// ── TASK-89: upcoming customer occasions (birthday / anniversary) ─────────────────────────
+/** GET /app/parties/occasions?days=7 — occasions falling in the next `days` IST days (today included). */
+export const occasionsQuery = z.object({ days: z.coerce.number().int().min(1).max(60).default(7) });
+export interface OccasionDto {
+  party: PartyRefDto;
+  kind: 'BIRTHDAY' | 'ANNIVERSARY';
+  /** this year's (or next year's) occurrence, 'YYYY-MM-DD' */
+  date: string;
+  /** 0 = today */
+  daysAway: number;
+}

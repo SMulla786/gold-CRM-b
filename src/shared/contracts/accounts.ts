@@ -140,3 +140,19 @@ export interface DayBookDto {
   totals: AssetTotalsDto[];
   bySource: Array<{ source: (typeof LEDGER_SOURCES)[number]; asset: (typeof LEDGER_ASSETS)[number]; in: string; out: string }>;
 }
+
+/** TASK-90: Day-Book "All-in-One" — one row per source document with every asset's IN/OUT side by side. */
+export const dayBookAllInOneQuery = pageQuery.extend({
+  from: dateOnly.optional(),
+  to: dateOnly.optional(),
+  source: z.enum(LEDGER_SOURCES).optional(),
+});
+export interface DayBookAllInOneRowDto {
+  txnDate: string;
+  source: (typeof LEDGER_SOURCES)[number];
+  sourceId: string;
+  party: { id: number; name: string } | null;
+  narration: string | null;
+  /** per asset, main unit as in LedgerRowDto.balance; assets with no movement are "0" */
+  assets: Record<(typeof LEDGER_ASSETS)[number], { in: string; out: string }>;
+}
