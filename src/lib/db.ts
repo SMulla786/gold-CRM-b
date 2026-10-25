@@ -45,6 +45,11 @@ const TENANT_MODELS: Record<string, Scope> = {
   LedgerEntry: 'branch',
   IncomeExpense: 'branch',
   StockTransfer: 'transfer',
+  // Phase 4/5 billing + udhari:
+  Bill: 'branch',
+  UdharEntry: 'branch',
+  UdharTxn: 'branch',
+  // BillItem/BillPayment have no businessId — always reached through a scoped Bill (handled in services).
   // JewelleryType omitted (nullable businessId: global + custom) — scoped in its service like Role.
   // TagSequence omitted — incremented via a raw locked UPDATE inside the stock-entry tx with explicit businessId.
 };
