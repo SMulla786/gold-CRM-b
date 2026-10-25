@@ -79,3 +79,75 @@ export interface GstSummaryRowDto {
   netPayable: string;
 }
 export const gstSummaryQuery = z.object({ ...range, groupBy: z.enum(['MONTH', 'QUARTER', 'YEAR']).default('MONTH') });
+
+// ───────────── Phase 12: GSTR-1 / GSTR-3B (docs/api-phase12.md) ─────────────
+
+/** Unregistered inter-state invoices above this go to B2CL. shortcut: constant, make it a setting if the rule changes again. */
+export const B2CL_LIMIT = 100000;
+/** one return period (UI sends a month) */
+export const gstFilingQuery = z.object({ from: z.coerce.date(), to: z.coerce.date() });
+
+interface TaxCols {
+  taxable: string;
+  cgst: string;
+  sgst: string;
+  igst: string;
+}
+export interface Gstr1InvoiceRow extends TaxCols {
+  billId: number;
+  invNo: string;
+  invDate: string;
+  invValue: string;
+  /** 2-digit state code */
+  pos: string;
+  rate: string;
+}
+export interface Gstr1B2bRow extends Gstr1InvoiceRow {
+  gstin: string;
+  party: string;
+}
+export interface Gstr1B2csRow extends TaxCols {
+  pos: string;
+  rate: string;
+  supplyType: 'INTRA' | 'INTER';
+}
+export interface Gstr1HsnRow extends TaxCols {
+  hsnCode: string;
+  uqc: 'GMS' | 'PCS';
+  qty: string;
+  rate: string;
+  total: string;
+}
+/** GST sell bill issued before the period and deleted inside it, registered party */
+export interface Gstr1CdnrRow extends Gstr1B2bRow {
+  noteDate: string;
+}
+export interface Gstr1Dto {
+  from: string;
+  to: string;
+  /** shop GSTIN (branch → business); null → UI warns "set your GSTIN to file" */
+  gstin: string | null;
+  b2b: Gstr1B2bRow[];
+  b2cl: Gstr1InvoiceRow[];
+  /** aggregated by POS + rate; includes negative rows for unregistered credit notes */
+  b2cs: Gstr1B2csRow[];
+  hsnB2b: Gstr1HsnRow[];
+  hsnB2c: Gstr1HsnRow[];
+  cdnr: Gstr1CdnrRow[];
+  /** one row per invoice series; cancelled = deleted with billDate in the period */
+  docIssue: Array<{ series: string; from: string; to: string; total: number; cancelled: number }>;
+  totals: TaxCols & { invoices: number };
+}
+export interface Gstr3bDto {
+  from: string;
+  to: string;
+  gstin: string | null;
+  /** 3.1(a) outward taxable supplies (ACTIVE GST sell bills) */
+  outward: TaxCols;
+  /** informational: ROUGH sell bills' final */
+  nonGst: string;
+  /** 4 ITC: ACTIVE GST purchase bills from parties with a GSTIN */
+  itc: { cgst: string; sgst: string; igst: string };
+  /** Σ output tax − Σ ITC, floored at 0 — the portal does the per-head set-off */
+  netPayableIndicative: string;
+}
