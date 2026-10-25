@@ -36,6 +36,7 @@ import { justBillRouter } from './justbill/routes';
 import { girviRouter } from './girvi/routes';
 import { ordersRouter } from './orders/routes';
 import { repairRouter } from './repair/routes';
+import { tradeRouter } from './trade/routes';
 
 export const appRouter = Router();
 appRouter.use(inventoryRouter);
@@ -50,6 +51,7 @@ appRouter.use(justBillRouter);
 appRouter.use(girviRouter);
 appRouter.use(ordersRouter);
 appRouter.use(repairRouter);
+appRouter.use(tradeRouter);
 
 const PARTIES = 'settings.parties';
 const MISC = 'settings.misc';
