@@ -116,6 +116,23 @@ describe('schemes', () => {
     expect(Number(closed.redeemValue)).toBeCloseTo(paidSum, 2); // credit == what is actually on the books
   });
 
+  it('a reversal racing a redeem never leaves a reversed payment counted in the credit (TASK-77)', async () => {
+    const s = await setup();
+    const scheme = await cashScheme(s.ctx, { tenureMonths: 1 });
+    const e = await schemes.enroll(s.ctx, { schemeId: scheme.id, partyId: s.party.id, assignId: 'A1', displayName: 'C', tokenAmount: 0 } as any);
+    const p1 = await schemes.addPayment(s.ctx, { enrollmentId: e.id, emiNo: 1, amount: 2000, medium: 'CASH' } as any);
+    const payId = p1.payments.find((p) => p.emiNo === 1)!.id;
+    const results = await Promise.allSettled([
+      schemes.reversePayment(s.ctx, payId),
+      schemes.redeem(s.ctx, e.id, { early: true } as any),
+    ]);
+    // redeem succeeds (early); the reversal either wins first (payment excluded) or is blocked after the close (409)
+    if (results[0].status === 'rejected') expect((results[0] as PromiseRejectedResult).reason).toMatchObject({ status: 409 });
+    const paidSum = (await db.schemePayment.findMany({ where: { enrollmentId: e.id, isReversed: false } })).reduce((a, p) => a + Number(p.amount), 0);
+    const closed = await db.schemeEnrollment.findUniqueOrThrow({ where: { id: e.id } });
+    expect(Number(closed.redeemValue)).toBeCloseTo(paidSum, 2); // credit never counts a reversed payment
+  });
+
   it('group over its member limit → 409', async () => {
     const s = await setup();
     const scheme = await cashScheme(s.ctx);

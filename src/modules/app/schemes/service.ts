@@ -205,6 +205,9 @@ export async function reversePayment(ctx: TenantContext, paymentId: number): Pro
   if (!pay) throw new HttpError(404, 'NOT_FOUND', 'Payment not found');
   if (pay.enrollment.status !== 'ACTIVE' && pay.enrollment.status !== 'WON') throw new HttpError(409, 'CONFLICT', 'Enrollment is closed');
   await prisma.$transaction(async (tx) => {
+    // lock first so a redeem in flight can't count this payment and then have it reversed out from under the credit (BUG-13 class)
+    const status = await lockEnrollment(tx, pay.enrollmentId);
+    if (status !== 'ACTIVE' && status !== 'WON') throw new HttpError(409, 'CONFLICT', 'Enrollment is closed');
     const r = await tx.schemePayment.updateMany({ where: { id: paymentId, isReversed: false }, data: { isReversed: true, emiNo: null } });
     if (r.count !== 1) throw new HttpError(409, 'CONFLICT', 'Payment already reversed');
     if (pay.medium === 'CASH' || pay.medium === 'ONLINE' || pay.medium === 'TOKEN') await ledger.reverse(tx, lctxOf(ctx), { source: 'SCHEME', sourceId: `${pay.enrollmentId}-${pay.id}` });
