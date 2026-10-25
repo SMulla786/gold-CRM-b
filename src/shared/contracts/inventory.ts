@@ -282,3 +282,41 @@ export interface ShortageRowDto {
   /** SHORTAGE: below min; WARNING: within 20% above min; OK otherwise */
   status: 'SHORTAGE' | 'WARNING' | 'OK';
 }
+
+// ───────────── Phase 2b: bulk actions, stock transfer ─────────────
+
+/** Bulk edit on checked rows (All Stock list): same fields as single edit, applied to every id (only AVAILABLE). */
+export const bulkStockEditBody = z.object({ ids: z.array(id).min(1).max(500), patch: updateStockItemBody });
+/** Bulk delete (X-MPIN): status DELETED + ledger reverse per item, one transaction. */
+export const bulkStockDeleteBody = z.object({ ids: z.array(id).min(1).max(500) });
+export interface BulkResultDto {
+  updated: number;
+}
+
+/** Inter-branch transfer of whole AVAILABLE items. Both branches must be in the user's subtree. */
+export const stockTransferBody = z
+  .object({
+    fromBranchId: id,
+    toBranchId: id,
+    stockItemIds: z.array(id).min(1).max(500),
+    remarks: z.string().trim().max(300).optional(),
+  })
+  .refine((b) => b.fromBranchId !== b.toBranchId, { message: 'Choose a different branch', path: ['toBranchId'] });
+export const stockTransferListQuery = pageQuery.extend({ branchId: id.optional(), from: z.coerce.date().optional(), to: z.coerce.date().optional() });
+export interface StockTransferDto {
+  id: number;
+  transferNo: number;
+  txnDate: string;
+  fromBranch: { id: number; name: string };
+  toBranch: { id: number; name: string };
+  itemCount: number;
+  /** Σ of moved items, main units */
+  gross: string;
+  fine: string;
+  remarks: string | null;
+  createdBy: string | null;
+  createdAt: string;
+}
+export interface StockTransferDetailDto extends StockTransferDto {
+  items: StockItemDto[];
+}

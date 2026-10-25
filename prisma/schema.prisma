@@ -828,3 +828,22 @@ model IncomeExpense {
 
   @@index([businessId, branchId, txnDate])
 }
+
+/// Inter-branch stock transfer (Phase 2b; not in justudhari). Whole items move: StockItem.branchId changes,
+/// ledger posts OUT at fromBranch + IN at toBranch (source STOCK_TRANSFER, sourceId = id). Both branches must be in the user's subtree.
+model StockTransfer {
+  id           Int      @id @default(autoincrement())
+  businessId   Int
+  transferNo   Int
+  fromBranchId Int
+  toBranchId   Int
+  txnDate      DateTime @db.Date
+  itemCount    Int
+  remarks      String?
+  createdById  Int?
+  createdAt    DateTime @default(now())
+
+  @@unique([businessId, transferNo])
+  @@index([businessId, fromBranchId])
+  @@index([businessId, toBranchId])
+}
