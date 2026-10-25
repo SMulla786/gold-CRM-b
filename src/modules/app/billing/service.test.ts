@@ -223,6 +223,22 @@ describe('delete bill', () => {
   });
 });
 
+describe('list bills', () => {
+  it('pending filter returns only non-zero-balance bills; q matches party name', async () => {
+    const s = await setup();
+    const paidItem = await newTagItem(s.ctx, s.itemName.id);
+    const pendItem = await newTagItem(s.ctx, s.itemName.id);
+    const paid = await billing.createBill(s.ctx, parse({ kind: 'SELL', billType: 'ROUGH', partyId: s.party.id, items: [{ stockItemId: paidItem, gross: 10, rate: 60000 }], payments: [{ mode: 'CASH', amount: 60000 }] }));
+    expect(Number(paid.balance)).toBe(0);
+    const pend = await billing.createBill(s.ctx, parse({ kind: 'SELL', billType: 'ROUGH', partyId: s.party.id, items: [{ stockItemId: pendItem, gross: 10, rate: 60000 }], payments: [{ mode: 'CASH', amount: 20000 }] }));
+    expect(Number(pend.balance)).toBeGreaterThan(0);
+
+    expect((await billing.listBills(s.ctx, { page: 1, pageSize: 20, kind: 'SELL', status: 'ACTIVE', pending: 'true' })).items.map((b) => b.id)).toEqual([pend.id]);
+    expect((await billing.listBills(s.ctx, { page: 1, pageSize: 20, kind: 'SELL', status: 'ACTIVE', pending: 'false' })).items.map((b) => b.id)).toEqual([paid.id]);
+    expect((await billing.listBills(s.ctx, { page: 1, pageSize: 20, kind: 'SELL', status: 'ACTIVE', q: 'Cust' })).total).toBe(2);
+  });
+});
+
 describe('add bill payments', () => {
   it('increments paid atomically and drops the balance + party udhar', async () => {
     const s = await setup();

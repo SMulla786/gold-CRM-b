@@ -418,8 +418,12 @@ export async function listBills(ctx: TenantContext, query: any): Promise<Paged<B
   const where: any = { kind: query.kind, status: query.status, ...(query.billType ? { billType: query.billType } : {}), ...(query.partyId ? { partyId: query.partyId } : {}) };
   if (query.from || query.to) where.billDate = { ...(query.from ? { gte: ledger.businessDate(query.from) } : {}), ...(query.to ? { lte: ledger.businessDate(query.to) } : {}) };
   if (query.minTotal != null || query.maxTotal != null) where.final = { ...(query.minTotal != null ? { gte: query.minTotal } : {}), ...(query.maxTotal != null ? { lte: query.maxTotal } : {}) };
-  if (query.pending === 'true') where.final = { ...(where.final ?? {}), not: prisma.bill.fields.paid };
-  else if (query.pending === 'false') where.paid = prisma.bill.fields.final;
+  // pending (final ≠ paid) is a column-to-column comparison; Prisma field references break through the scoped client ("_ref"),
+  // so resolve the ids with a scoped raw query and filter by them. shortcut: fine at shop scale; revisit at 100k+ bills.
+  if (query.pending === 'true' || query.pending === 'false') {
+    const ids = ctx.branchIds.length === 0 ? [] : (await prisma.$queryRaw<{ id: number }[]>(Prisma.sql`SELECT id FROM "Bill" WHERE "businessId" = ${ctx.businessId!} AND "branchId" IN (${Prisma.join(ctx.branchIds)}) AND "final" ${query.pending === 'true' ? Prisma.raw('<>') : Prisma.raw('=')} "paid"`)).map((r) => r.id);
+    where.id = { in: ids };
+  }
   if (query.q) {
     const parties = await sdb.party.findMany({ where: { OR: [{ name: { contains: query.q, mode: 'insensitive' } }, { mobile: { contains: query.q } }] }, select: { id: true } });
     where.OR = [{ billNo: { contains: query.q, mode: 'insensitive' } }, { partyId: { in: parties.map((p) => p.id) } }];
