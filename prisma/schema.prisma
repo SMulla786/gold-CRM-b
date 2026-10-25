@@ -1075,3 +1075,147 @@ model UdharTxn {
   @@unique([businessId, branchId, txnNo])
   @@index([businessId, partyId])
 }
+
+// ───────────── Phase 7: Just Bill + showroom drafts ─────────────
+
+enum QtyUnit {
+  GRAM
+  PCS
+}
+
+/// Quick calculator bill not tied to stock (docs/modules/02 §2.3). Payments move shop cash/metal; balance goes to the party udhar when a party is linked.
+model JustBill {
+  id             Int               @id @default(autoincrement())
+  businessId     Int
+  branchId       Int
+  billNo         String
+  seq            Int
+  /// optional link; walk-in customers use customerName/mobile only
+  partyId        Int?
+  customerName   String
+  mobile         String?
+  billDate       DateTime          @db.Date
+  interState     Boolean           @default(false)
+  sub            Decimal           @db.Decimal(14, 2)
+  discount       Decimal           @default(0) @db.Decimal(14, 2)
+  discountUnit   DiscountUnit      @default(FIXED)
+  discountAmount Decimal           @default(0) @db.Decimal(14, 2)
+  gstPercent     Decimal           @default(0) @db.Decimal(5, 2)
+  taxable        Decimal           @db.Decimal(14, 2)
+  cgst           Decimal           @default(0) @db.Decimal(14, 2)
+  sgst           Decimal           @default(0) @db.Decimal(14, 2)
+  igst           Decimal           @default(0) @db.Decimal(14, 2)
+  total          Decimal           @db.Decimal(14, 2)
+  round          Decimal           @default(0) @db.Decimal(8, 2)
+  final          Decimal           @db.Decimal(14, 2)
+  paid           Decimal           @default(0) @db.Decimal(14, 2)
+  remark         String?
+  status         BillStatus        @default(ACTIVE)
+  deletedAt      DateTime?
+  createdById    Int?
+  createdAt      DateTime          @default(now())
+  updatedAt      DateTime          @updatedAt
+  items          JustBillItem[]
+  payments       JustBillPayment[]
+
+  @@unique([businessId, branchId, billNo])
+  @@index([businessId, branchId, billDate])
+  @@index([businessId, partyId])
+}
+
+model JustBillItem {
+  id         Int        @id @default(autoincrement())
+  justBillId Int
+  name       String
+  /// display label: 24K / 22K / Custom text
+  karat      String?
+  /// purity % (tunch)
+  purity     Decimal?   @db.Decimal(6, 3)
+  quantity   Decimal    @db.Decimal(14, 3)
+  unit       QtyUnit    @default(GRAM)
+  /// per gram (GRAM) or per piece (PCS)
+  rate       Decimal    @default(0) @db.Decimal(14, 2)
+  making     Decimal    @default(0) @db.Decimal(12, 2)
+  makingUnit ChargeUnit @default(PER_GRAM)
+  other      Decimal    @default(0) @db.Decimal(14, 2)
+  total      Decimal    @db.Decimal(14, 2)
+  justBill   JustBill   @relation(fields: [justBillId], references: [id], onDelete: Cascade)
+
+  @@index([justBillId])
+}
+
+model JustBillPayment {
+  id            Int             @id @default(autoincrement())
+  justBillId    Int
+  mode          BillPaymentMode
+  bankAccountId Int?
+  metal         MetalKind?
+  /// BULLION = metal received, KACHA = old gold/silver
+  metalForm     MetalForm?
+  gross         Decimal?        @db.Decimal(14, 3)
+  net           Decimal?        @db.Decimal(14, 3)
+  tunch         Decimal?        @db.Decimal(6, 3)
+  fine          Decimal?        @db.Decimal(14, 3)
+  rate          Decimal?        @db.Decimal(14, 2)
+  amount        Decimal         @db.Decimal(14, 2)
+  remark        String?
+  txnDate       DateTime        @db.Date
+  isActive      Boolean         @default(true)
+  createdById   Int?
+  createdAt     DateTime        @default(now())
+  justBill      JustBill        @relation(fields: [justBillId], references: [id], onDelete: Cascade)
+
+  @@index([justBillId])
+}
+
+enum DraftStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  BILLED
+  EXPIRED
+  CANCELLED
+}
+
+/// Showroom cart → manager discount approval → cashier bills it (docs/modules/02 §2.7). Items are NOT reserved; billing re-checks availability.
+model SalesDraft {
+  id                    Int              @id @default(autoincrement())
+  businessId            Int
+  branchId              Int
+  draftNo               Int
+  /// salesperson = creator
+  createdById           Int
+  partyId               Int?
+  customerName          String
+  mobile                String?
+  /// estimate at draft time (current rates), display only — the bill recomputes
+  estTotal              Decimal          @db.Decimal(14, 2)
+  requestedDiscount     Decimal          @default(0) @db.Decimal(14, 2)
+  requestedDiscountUnit DiscountUnit     @default(FIXED)
+  note                  String?
+  status                DraftStatus      @default(PENDING)
+  approvedDiscount      Decimal?         @db.Decimal(14, 2)
+  approvedDiscountUnit  DiscountUnit?
+  rejectionReason       String?
+  decidedById           Int?
+  decidedAt             DateTime?
+  /// set when billed
+  billId                Int?
+  /// end of the business day it was created; PENDING/APPROVED past this → EXPIRED (computed on read)
+  expiresAt             DateTime
+  createdAt             DateTime         @default(now())
+  updatedAt             DateTime         @updatedAt
+  items                 SalesDraftItem[]
+
+  @@unique([businessId, branchId, draftNo])
+  @@index([businessId, branchId, status])
+}
+
+model SalesDraftItem {
+  id          Int        @id @default(autoincrement())
+  draftId     Int
+  stockItemId Int
+  draft       SalesDraft @relation(fields: [draftId], references: [id], onDelete: Cascade)
+
+  @@index([draftId])
+}

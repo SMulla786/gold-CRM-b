@@ -90,6 +90,8 @@ export const billBody = z
       .regex(/^[A-Z]{5}[0-9]{4}[A-Z]$/, 'Invalid PAN')
       .optional(),
     remark: z.string().trim().max(300).optional(),
+    /** SELL from an APPROVED showroom draft (Phase 7): draft → BILLED in the same tx */
+    draftId: id.optional(),
   })
   .refine((b) => b.items.every((r) => r.less <= r.gross), { message: 'less cannot exceed gross', path: ['items'] })
   .refine((b) => b.keepBalanceAs === 'MONEY' || (b.keepRate ?? 0) > 0, { message: 'Enter the rate to keep the balance in metal', path: ['keepRate'] });

@@ -9,7 +9,7 @@ export type StockClass = (typeof STOCK_CLASSES)[number];
 export const LEDGER_ASSETS = ['MONEY', ...STOCK_CLASSES] as const;
 export type LedgerAsset = (typeof LEDGER_ASSETS)[number];
 
-/** Source of a ledger movement — the 25 sources in justudhari's Day-Book filter + our inter-branch STOCK_TRANSFER + OPENING_BALANCE. */
+/** Source of a ledger movement — the 25 sources in justudhari's Day-Book filter + our inter-branch STOCK_TRANSFER + OPENING_BALANCE + JUST_BILL. */
 export const LEDGER_SOURCES = [
   'SELL_BILL',
   'PURCHASE_BILL',
@@ -38,6 +38,7 @@ export const LEDGER_SOURCES = [
   'REPAIR',
   'STOCK_TRANSFER',
   'OPENING_BALANCE',
+  'JUST_BILL',
 ] as const;
 export type LedgerSource = (typeof LEDGER_SOURCES)[number];
 
