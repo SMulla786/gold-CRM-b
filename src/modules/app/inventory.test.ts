@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { db, truncateAll } from '../../../test/helpers/db';
-import { createBusiness } from '../../../test/helpers/factory';
+import { createBranch, createBusiness } from '../../../test/helpers/factory';
 import * as inv from './inventory';
 import type { TenantContext } from '../../middleware/context';
 
@@ -107,5 +107,60 @@ describe('TASK-16b additions', () => {
     const res = await inv.importStock(s.ctx, csv, { stockClass: 'GOLD', method: 'TAG', groupId: s.group.id, dryRun: true });
     expect(res.imported).toBe(0);
     expect(res.errors.some((e) => e.row === 2 && e.field === 'gross')).toBe(true);
+  });
+});
+
+describe('TASK-25 Phase 2b — bulk + transfer', () => {
+  it('bulk edit recomputes fine + reverses/reposts ledger for every id; a non-AVAILABLE id -> 409', async () => {
+    const s = await setup();
+    const entry = await inv.createStockEntry(s.ctx, { stockClass: 'GOLD', method: 'TAG', rows: [row({ itemNameId: s.itemName.id, karatCode: '22K' }), row({ itemNameId: s.itemName.id, karatCode: '22K' })] });
+    const ids = entry.items.map((i) => i.id);
+    const res = await inv.bulkEditStock(s.ctx, ids, { gross: 20 });
+    expect(res.updated).toBe(2);
+    for (const id of ids) {
+      expect(Number((await db.stockItem.findUniqueOrThrow({ where: { id } })).fine)).toBeCloseTo(18.334, 3); // 20 g × 91.67%
+      expect(await db.ledgerEntry.count({ where: { source: 'STOCK_INSERT', sourceId: String(id) } })).toBe(3); // IN, reversal OUT, new IN
+    }
+    await inv.deleteStock(s.ctx, ids[0]!);
+    await expect(inv.bulkEditStock(s.ctx, ids, { gross: 30 })).rejects.toMatchObject({ status: 409 });
+  });
+
+  it('bulk delete soft-deletes + reverses every id; a missing id -> 404', async () => {
+    const s = await setup();
+    const entry = await inv.createStockEntry(s.ctx, { stockClass: 'GOLD', method: 'TAG', rows: [row({ itemNameId: s.itemName.id, karatCode: '22K' })] });
+    const id = entry.items[0]!.id;
+    await expect(inv.bulkDeleteStock(s.ctx, [id, 999999])).rejects.toMatchObject({ status: 404 });
+    expect((await inv.bulkDeleteStock(s.ctx, [id])).updated).toBe(1);
+    expect((await db.stockItem.findUniqueOrThrow({ where: { id } })).status).toBe('DELETED');
+    const led = await db.ledgerEntry.findMany({ where: { source: 'STOCK_INSERT', sourceId: String(id) } });
+    expect(led.some((r) => r.reversalOfId != null && r.direction === 'OUT')).toBe(true);
+  });
+
+  it('stock transfer moves the item + posts OUT/IN, is visible from the destination, and guards both branches', async () => {
+    const s = await setup();
+    const b = await createBranch({ businessId: s.business.id, parentId: s.root.id, name: 'B' });
+    const c = await createBranch({ businessId: s.business.id, parentId: s.root.id, name: 'C' });
+    const owner = { ...ctxFor(s.business.id, s.root.id), branchIds: [s.root.id, b.id] };
+    const entry = await inv.createStockEntry(owner, { stockClass: 'GOLD', method: 'TAG', rows: [row({ itemNameId: s.itemName.id, karatCode: '22K' })] });
+    const itemId = entry.items[0]!.id;
+
+    // c is outside owner's subtree -> 404
+    await expect(inv.createStockTransfer(owner, { fromBranchId: s.root.id, toBranchId: c.id, stockItemIds: [itemId] })).rejects.toMatchObject({ status: 404 });
+
+    const t = await inv.createStockTransfer(owner, { fromBranchId: s.root.id, toBranchId: b.id, stockItemIds: [itemId] });
+    expect(t.transferNo).toBe(1);
+    expect(t.items[0]!.branch.id).toBe(b.id);
+    expect((await db.stockItem.findUniqueOrThrow({ where: { id: itemId } })).branchId).toBe(b.id);
+    const led = await db.ledgerEntry.findMany({ where: { source: 'STOCK_TRANSFER', sourceId: String(t.id) } });
+    expect(led.filter((r) => r.direction === 'OUT' && r.branchId === s.root.id)).toHaveLength(1);
+    expect(led.filter((r) => r.direction === 'IN' && r.branchId === b.id)).toHaveLength(1);
+
+    // a user who only covers the destination branch still sees the transfer (OR scope)
+    const bUser = ctxFor(s.business.id, b.id);
+    expect((await inv.getStockTransfer(bUser, t.id)).transferNo).toBe(1);
+    expect((await inv.listStockTransfers(bUser, { page: 1, pageSize: 20 })).total).toBe(1);
+
+    // the item now lives at b -> re-transfer from root is 409 (not in source)
+    await expect(inv.createStockTransfer(owner, { fromBranchId: s.root.id, toBranchId: b.id, stockItemIds: [itemId] })).rejects.toMatchObject({ status: 409 });
   });
 });

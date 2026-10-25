@@ -6,6 +6,7 @@ import { HttpError } from '../../middleware/error';
 import type { TenantContext } from '../../middleware/context';
 import { computeLine, stockRowInput } from '../../shared';
 import type {
+  BulkResultDto,
   GroupStockDto,
   ItemGroupDto,
   ItemNameDto,
@@ -17,6 +18,8 @@ import type {
   StockImportResultDto,
   StockItemDto,
   StockSummaryDto,
+  StockTransferDetailDto,
+  StockTransferDto,
 } from '../../shared';
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -346,32 +349,162 @@ export async function stockGroups(ctx: TenantContext, query: any): Promise<Group
 
 // ───────────── Stock edit / delete (with ledger reversal) ─────────────
 
+const touchMap = async (sdb: any): Promise<Map<string, number>> => new Map((await sdb.karatMapping.findMany({ select: { code: true, touch: true } })).map((k: any) => [k.code, Number(k.touch)]));
+const lctxOf = (ctx: TenantContext) => ({ businessId: ctx.businessId!, branchIds: ctx.branchIds, userId: ctx.userId });
+
+/** Recompute + reverse/repost one AVAILABLE item inside a tx. Shared by single PATCH and bulk edit. */
+async function applyStockEdit(tx: Prisma.TransactionClient, lctx: ledger.LedgerContext, item: any, body: any, touchByCode: Map<string, number>): Promise<void> {
+  const merged = { pcs: item.pcs, gross: numN(item.gross), less: numN(item.less), tunch: numN(item.tunch), wastage: numN(item.wastage), stoneCharge: numN(item.stoneCharge), labour: numN(item.labour), labourUnit: item.labourUnit, other: numN(item.other), rate: item.rate != null ? numN(item.rate) : undefined, purchaseCost: item.purchaseCost != null ? numN(item.purchaseCost) : undefined, karatCode: item.karatCode ?? undefined, huid: item.huid ?? undefined, remarks: item.remarks ?? undefined, ...body };
+  const r = resolveRow(merged, item.itemName, touchByCode);
+  await tx.stockItem.update({ where: { id: item.id }, data: { pcs: merged.pcs, gross: merged.gross, less: merged.less, tunch: r.tunch, wastage: merged.wastage, net: r.net, fine: r.fine, stoneCharge: merged.stoneCharge, labour: merged.labour, labourUnit: merged.labourUnit, other: merged.other, rate: merged.rate ?? null, purchaseCost: r.purchaseCost, karatCode: r.karatCode, huid: merged.huid ?? null, remarks: merged.remarks ?? null } });
+  await ledger.reverse(tx, lctx, { source: 'STOCK_INSERT', sourceId: String(item.id) });
+  await ledger.post(tx, lctx, [{ branchId: item.branchId, asset: ledger.assetForStockClass(item.stockClass), direction: 'IN', karatCode: r.karatCode, pcs: merged.pcs, gross: merged.gross, net: r.net, fine: r.fine, amount: r.purchaseCost, source: 'STOCK_INSERT', sourceId: String(item.id), stockItemId: item.id, narration: `Edit stock item #${item.id}` }]);
+}
+
+/** Soft-delete one item + reverse its ledger inside a tx. Shared by single DELETE and bulk delete. */
+async function applyStockDelete(tx: Prisma.TransactionClient, lctx: ledger.LedgerContext, item: any): Promise<void> {
+  await tx.stockItem.update({ where: { id: item.id }, data: { status: 'DELETED' } });
+  await ledger.reverse(tx, lctx, { source: 'STOCK_INSERT', sourceId: String(item.id) });
+}
+
 export async function updateStock(ctx: TenantContext, id: number, body: any): Promise<StockItemDto> {
   const sdb = scopedDb(ctx);
   const item = await sdb.stockItem.findUnique({ where: { id }, include: { itemName: true } });
   if (!item) throw new HttpError(404, 'NOT_FOUND', 'Stock item not found');
   if (item.status !== 'AVAILABLE') throw new HttpError(409, 'CONFLICT', 'Only AVAILABLE items can be edited');
-  const touchByCode = new Map((await sdb.karatMapping.findMany({ select: { code: true, touch: true } })).map((k) => [k.code, Number(k.touch)]));
-  const merged = { pcs: item.pcs, gross: numN(item.gross), less: numN(item.less), tunch: numN(item.tunch), wastage: numN(item.wastage), stoneCharge: numN(item.stoneCharge), labour: numN(item.labour), labourUnit: item.labourUnit, other: numN(item.other), rate: item.rate != null ? numN(item.rate) : undefined, purchaseCost: item.purchaseCost != null ? numN(item.purchaseCost) : undefined, karatCode: item.karatCode ?? undefined, huid: item.huid ?? undefined, remarks: item.remarks ?? undefined, ...body };
-  const r = resolveRow(merged, item.itemName, touchByCode);
-  const lctx = { businessId: ctx.businessId!, branchIds: ctx.branchIds, userId: ctx.userId };
-
-  await prisma.$transaction(async (tx) => {
-    await tx.stockItem.update({ where: { id }, data: { pcs: merged.pcs, gross: merged.gross, less: merged.less, tunch: r.tunch, wastage: merged.wastage, net: r.net, fine: r.fine, stoneCharge: merged.stoneCharge, labour: merged.labour, labourUnit: merged.labourUnit, other: merged.other, rate: merged.rate ?? null, purchaseCost: r.purchaseCost, karatCode: r.karatCode, huid: merged.huid ?? null, remarks: merged.remarks ?? null } });
-    await ledger.reverse(tx, lctx, { source: 'STOCK_INSERT', sourceId: String(id) });
-    await ledger.post(tx, lctx, [{ branchId: item.branchId, asset: ledger.assetForStockClass(item.stockClass), direction: 'IN', karatCode: r.karatCode, pcs: merged.pcs, gross: merged.gross, net: r.net, fine: r.fine, amount: r.purchaseCost, source: 'STOCK_INSERT', sourceId: String(id), stockItemId: id, narration: `Edit stock item #${id}` }]);
-  });
+  const touchByCode = await touchMap(sdb);
+  await prisma.$transaction((tx) => applyStockEdit(tx, lctxOf(ctx), item, body, touchByCode));
   return getStock(ctx, id);
 }
 
 export async function deleteStock(ctx: TenantContext, id: number): Promise<void> {
   const item = await scopedDb(ctx).stockItem.findUnique({ where: { id } });
   if (!item) throw new HttpError(404, 'NOT_FOUND', 'Stock item not found');
-  const lctx = { businessId: ctx.businessId!, branchIds: ctx.branchIds, userId: ctx.userId };
+  await prisma.$transaction((tx) => applyStockDelete(tx, lctxOf(ctx), item));
+}
+
+// ───────────── Bulk edit / delete (one tx, reuse the single-item cores) ─────────────
+
+export async function bulkEditStock(ctx: TenantContext, ids: number[], patch: any): Promise<BulkResultDto> {
+  const sdb = scopedDb(ctx);
+  const uniq = [...new Set(ids)];
+  const items = await sdb.stockItem.findMany({ where: { id: { in: uniq } }, include: { itemName: true } });
+  if (items.length !== uniq.length) throw new HttpError(404, 'NOT_FOUND', 'One or more stock items not found');
+  for (const it of items) if (it.status !== 'AVAILABLE') throw new HttpError(409, 'CONFLICT', `Item #${it.id} is not AVAILABLE`);
+  const touchByCode = await touchMap(sdb);
+  const lctx = lctxOf(ctx);
   await prisma.$transaction(async (tx) => {
-    await tx.stockItem.update({ where: { id }, data: { status: 'DELETED' } });
-    await ledger.reverse(tx, lctx, { source: 'STOCK_INSERT', sourceId: String(id) });
+    for (const item of items) await applyStockEdit(tx, lctx, item, patch, touchByCode);
   });
+  return { updated: items.length };
+}
+
+export async function bulkDeleteStock(ctx: TenantContext, ids: number[]): Promise<BulkResultDto> {
+  const sdb = scopedDb(ctx);
+  const uniq = [...new Set(ids)];
+  const items = await sdb.stockItem.findMany({ where: { id: { in: uniq } } });
+  if (items.length !== uniq.length) throw new HttpError(404, 'NOT_FOUND', 'One or more stock items not found');
+  const lctx = lctxOf(ctx);
+  await prisma.$transaction(async (tx) => {
+    for (const item of items) await applyStockDelete(tx, lctx, item);
+  });
+  return { updated: items.length };
+}
+
+// ───────────── Stock transfer (inter-branch move; both branches in subtree) ─────────────
+
+/** Race-free per-business transfer number via the atomic TagSequence upsert (reserved prefix '#TRANSFER'). */
+async function nextTransferNo(tx: Prisma.TransactionClient, businessId: number): Promise<number> {
+  const r = await tx.$queryRaw<{ next: number }[]>`
+    INSERT INTO "TagSequence" ("businessId", "prefix", "next") VALUES (${businessId}, '#TRANSFER', 2)
+    ON CONFLICT ("businessId", "prefix") DO UPDATE SET "next" = "TagSequence"."next" + 1
+    RETURNING "next"`;
+  return Number(r[0]!.next) - 1;
+}
+
+export async function createStockTransfer(ctx: TenantContext, body: { fromBranchId: number; toBranchId: number; stockItemIds: number[]; remarks?: string }): Promise<StockTransferDetailDto> {
+  if (!ctx.branchIds.includes(body.fromBranchId) || !ctx.branchIds.includes(body.toBranchId)) throw new HttpError(404, 'NOT_FOUND', 'Branch not found');
+  const sdb = scopedDb(ctx);
+  const uniq = [...new Set(body.stockItemIds)];
+  const items = await sdb.stockItem.findMany({ where: { id: { in: uniq } } });
+  if (items.length !== uniq.length) throw new HttpError(404, 'NOT_FOUND', 'One or more stock items not found');
+  for (const it of items) {
+    if (it.branchId !== body.fromBranchId) throw new HttpError(409, 'CONFLICT', `Item #${it.id} is not in the source branch`);
+    if (it.status !== 'AVAILABLE') throw new HttpError(409, 'CONFLICT', `Item #${it.id} is not AVAILABLE`);
+  }
+  const txnDate = ledger.businessDate();
+  const lctx = lctxOf(ctx);
+  const header = await prisma.$transaction(async (tx) => {
+    const transferNo = await nextTransferNo(tx, ctx.businessId!);
+    const h = await tx.stockTransfer.create({ data: { businessId: ctx.businessId!, transferNo, fromBranchId: body.fromBranchId, toBranchId: body.toBranchId, txnDate, itemCount: items.length, remarks: body.remarks ?? null, createdById: ctx.userId } });
+    for (const it of items) {
+      await tx.stockItem.update({ where: { id: it.id }, data: { branchId: body.toBranchId } }); // stays AVAILABLE
+      const common = { asset: ledger.assetForStockClass(it.stockClass), karatCode: it.karatCode, pcs: it.pcs, gross: it.gross, net: it.net, fine: it.fine, amount: it.purchaseCost, source: 'STOCK_TRANSFER' as const, sourceId: String(h.id), stockItemId: it.id };
+      await ledger.post(tx, lctx, [
+        { ...common, branchId: body.fromBranchId, direction: 'OUT', txnDate, narration: `Transfer #${transferNo} out` },
+        { ...common, branchId: body.toBranchId, direction: 'IN', txnDate, narration: `Transfer #${transferNo} in` },
+      ]);
+    }
+    return h;
+  });
+  return getStockTransfer(ctx, header.id);
+}
+
+/** Branch + creator display names within the business (a transfer's far end may sit outside the active subtree). */
+async function transferNames(ctx: TenantContext, transfers: any[]): Promise<{ branch: Map<number, string>; user: Map<number, string> }> {
+  const brIds = [...new Set(transfers.flatMap((t) => [t.fromBranchId, t.toBranchId]))];
+  const uIds = [...new Set(transfers.map((t) => t.createdById).filter((x): x is number => x != null))];
+  const [branches, users] = await Promise.all([
+    brIds.length ? prisma.branch.findMany({ where: { id: { in: brIds }, businessId: ctx.businessId! }, select: { id: true, name: true } }) : [],
+    uIds.length ? prisma.user.findMany({ where: { id: { in: uIds }, businessId: ctx.businessId! }, select: { id: true, name: true } }) : [],
+  ]);
+  return { branch: new Map(branches.map((b) => [b.id, b.name])), user: new Map(users.map((u) => [u.id, u.name])) };
+}
+
+const transferDto = (t: any, sums: { gross: unknown; fine: unknown } | undefined, names: { branch: Map<number, string>; user: Map<number, string> }): StockTransferDto => ({
+  id: t.id,
+  transferNo: t.transferNo,
+  txnDate: t.txnDate.toISOString().slice(0, 10),
+  fromBranch: { id: t.fromBranchId, name: names.branch.get(t.fromBranchId) ?? '' },
+  toBranch: { id: t.toBranchId, name: names.branch.get(t.toBranchId) ?? '' },
+  itemCount: t.itemCount,
+  gross: num(sums?.gross ?? 0),
+  fine: num(sums?.fine ?? 0),
+  remarks: t.remarks,
+  createdBy: t.createdById != null ? (names.user.get(t.createdById) ?? null) : null,
+  createdAt: t.createdAt.toISOString(),
+});
+
+/** Σ gross/fine of the moved items per transfer, from the IN ledger rows. */
+async function transferSums(ctx: TenantContext, ids: number[]): Promise<Map<string, { gross: unknown; fine: unknown }>> {
+  if (!ids.length) return new Map();
+  const agg = await prisma.ledgerEntry.groupBy({ by: ['sourceId'], where: { businessId: ctx.businessId!, source: 'STOCK_TRANSFER', direction: 'IN', sourceId: { in: ids.map(String) } }, _sum: { gross: true, fine: true } });
+  return new Map(agg.map((a) => [a.sourceId, { gross: a._sum.gross, fine: a._sum.fine }]));
+}
+
+export async function listStockTransfers(ctx: TenantContext, query: { page: number; pageSize: number; branchId?: number; from?: Date; to?: Date }): Promise<Paged<StockTransferDto>> {
+  const sdb = scopedDb(ctx);
+  const where: any = {
+    ...(query.branchId ? { OR: [{ fromBranchId: query.branchId }, { toBranchId: query.branchId }] } : {}),
+    ...(query.from || query.to ? { txnDate: { ...(query.from ? { gte: ledger.businessDate(query.from) } : {}), ...(query.to ? { lte: ledger.businessDate(query.to) } : {}) } } : {}),
+  };
+  const [rows, total] = await Promise.all([
+    sdb.stockTransfer.findMany({ where, orderBy: { id: 'desc' }, skip: (query.page - 1) * query.pageSize, take: query.pageSize }),
+    sdb.stockTransfer.count({ where }),
+  ]);
+  const [names, sums] = await Promise.all([transferNames(ctx, rows), transferSums(ctx, rows.map((r) => r.id))]);
+  return { items: rows.map((t) => transferDto(t, sums.get(String(t.id)), names)), total, page: query.page, pageSize: query.pageSize };
+}
+
+export async function getStockTransfer(ctx: TenantContext, id: number): Promise<StockTransferDetailDto> {
+  const t = await scopedDb(ctx).stockTransfer.findFirst({ where: { id } });
+  if (!t) throw new HttpError(404, 'NOT_FOUND', 'Transfer not found');
+  const [names, sums] = await Promise.all([transferNames(ctx, [t]), transferSums(ctx, [t.id])]);
+  const led = await prisma.ledgerEntry.findMany({ where: { businessId: ctx.businessId!, source: 'STOCK_TRANSFER', sourceId: String(id), direction: 'IN' }, select: { stockItemId: true } });
+  const stockIds = [...new Set(led.map((r) => r.stockItemId).filter((x): x is number => x != null))];
+  // Raw prisma: moved items now sit at toBranch, which may be outside the viewer's subtree when they only cover fromBranch.
+  const items = stockIds.length ? await prisma.stockItem.findMany({ where: { id: { in: stockIds }, businessId: ctx.businessId! }, include: { group: true, itemName: true } }) : [];
+  return { ...transferDto(t, sums.get(String(t.id)), names), items: await decorateStock(ctx, items) };
 }
 
 // ───────────── Shortage ─────────────

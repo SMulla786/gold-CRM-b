@@ -3,6 +3,8 @@ import multer from 'multer';
 import { requireMpin, requirePermission } from '../../middleware/guards';
 import { HttpError } from '../../middleware/error';
 import {
+  bulkStockDeleteBody,
+  bulkStockEditBody,
   id as idSchema,
   itemGroupBody,
   itemGroupListQuery,
@@ -13,6 +15,8 @@ import {
   stockEntryBody,
   stockImportFields,
   stockListQuery,
+  stockTransferBody,
+  stockTransferListQuery,
   updateItemGroupBody,
   updateItemNameBody,
   updateStockItemBody,
@@ -46,6 +50,15 @@ inventoryRouter.post('/stock/import', requirePermission('inventory.import_stock'
   const fields = stockImportFields.parse(req.body);
   res.json(await inv.importStock(req.ctx!, req.file.buffer.toString('utf8'), { stockClass: fields.stockClass, method: fields.method, groupId: fields.groupId, dryRun: fields.dryRun === 'true' }));
 });
+// Phase 2b bulk + transfers — all before /stock/:id so the literal segments aren't captured as an id.
+inventoryRouter.patch('/stock/bulk', requirePermission('inventory.all_stock', 'edit'), async (req, res) => {
+  const b = bulkStockEditBody.parse(req.body);
+  res.json(await inv.bulkEditStock(req.ctx!, b.ids, b.patch));
+});
+inventoryRouter.post('/stock/bulk-delete', requirePermission('inventory.all_stock', 'delete'), requireMpin, async (req, res) => res.json(await inv.bulkDeleteStock(req.ctx!, bulkStockDeleteBody.parse(req.body).ids)));
+inventoryRouter.post('/stock/transfers', requirePermission('inventory.stock_transfer', 'edit'), async (req, res) => res.status(201).json(await inv.createStockTransfer(req.ctx!, stockTransferBody.parse(req.body))));
+inventoryRouter.get('/stock/transfers', requirePermission('inventory.stock_transfer', 'view'), async (req, res) => res.json(await inv.listStockTransfers(req.ctx!, stockTransferListQuery.parse(req.query))));
+inventoryRouter.get('/stock/transfers/:id', requirePermission('inventory.stock_transfer', 'view'), async (req, res) => res.json(await inv.getStockTransfer(req.ctx!, idSchema.parse(req.params.id))));
 inventoryRouter.get('/stock/by-tag/:tagNo', requirePermission('inventory.all_stock', 'view'), async (req, res) => res.json(await inv.getStockByTag(req.ctx!, String(req.params.tagNo))));
 inventoryRouter.get('/stock', requirePermission('inventory.all_stock', 'view'), async (req, res) => res.json(await inv.listStock(req.ctx!, stockListQuery.parse(req.query))));
 inventoryRouter.get('/stock/:id', requirePermission('inventory.all_stock', 'view'), async (req, res) => res.json(await inv.getStock(req.ctx!, idSchema.parse(req.params.id))));
