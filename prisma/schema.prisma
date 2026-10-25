@@ -1539,3 +1539,290 @@ model GirviTxn {
 
   @@index([batchId])
 }
+
+// ───────────── Phase 10: exchange / kacha processing, buy-sell, bhav booking (docs/api-phase10.md) ─────────────
+// Old metal is a ledger balance (LedgerEntry.metalForm KACHA → BULLION), never StockItem rows.
+
+/// BUY = party → shop (shop receives metal, pays). SELL = shop → party.
+enum TradeSide {
+  BUY
+  SELL
+}
+
+enum KachaProcessType {
+  MELT
+  REFINE
+}
+
+enum BhavStatus {
+  PENDING
+  PARTIAL
+  DELIVERED
+  CANCELLED
+}
+
+model Exchange {
+  id            Int            @id @default(autoincrement())
+  businessId    Int
+  branchId      Int
+  exchangeNo    Int
+  side          TradeSide
+  partyId       Int
+  metal         MetalKind
+  txnDate       DateTime       @db.Date
+  /// Σ line fine
+  totalFine     Decimal        @db.Decimal(14, 3)
+  /// signed ± adjustment
+  diffFine      Decimal        @default(0) @db.Decimal(14, 3)
+  /// totalFine + diffFine — the kacha fine that moves
+  afterFine     Decimal        @db.Decimal(14, 3)
+  /// settings units (gold /10 g, silver /1 kg); 0 = settled as metal credit
+  rate          Decimal        @default(0) @db.Decimal(14, 2)
+  charges       Decimal        @default(0) @db.Decimal(14, 2)
+  discount      Decimal        @default(0) @db.Decimal(14, 2)
+  /// metal value + charges − discount (0 when rate = 0)
+  finalAmount   Decimal        @default(0) @db.Decimal(14, 2)
+  cash          Decimal        @default(0) @db.Decimal(14, 2)
+  online        Decimal        @default(0) @db.Decimal(14, 2)
+  bankAccountId Int?
+  remark        String?
+  createdById   Int?
+  createdAt     DateTime       @default(now())
+  lines         ExchangeLine[]
+
+  @@unique([businessId, branchId, exchangeNo])
+  @@index([businessId, branchId, txnDate])
+  @@index([businessId, partyId])
+}
+
+model ExchangeLine {
+  id         Int      @id @default(autoincrement())
+  exchangeId Int
+  weight     Decimal  @db.Decimal(14, 3)
+  touch      Decimal  @db.Decimal(6, 3)
+  fine       Decimal  @db.Decimal(14, 3)
+  serialNo   String?
+  exchange   Exchange @relation(fields: [exchangeId], references: [id], onDelete: Cascade)
+
+  @@index([exchangeId])
+}
+
+model KachaProcess {
+  id          Int              @id @default(autoincrement())
+  businessId  Int
+  branchId    Int
+  type        KachaProcessType
+  metal       MetalKind
+  txnDate     DateTime         @db.Date
+  /// kacha fine consumed
+  inFine      Decimal          @db.Decimal(14, 3)
+  /// bullion fine produced (melt weight / refined bread)
+  outFine     Decimal          @db.Decimal(14, 3)
+  /// REFINE: residue that stays kacha
+  ravalFine   Decimal          @default(0) @db.Decimal(14, 3)
+  /// inFine − outFine − ravalFine (process loss; negative = gain)
+  difference  Decimal          @db.Decimal(14, 3)
+  exchangeId  Int?
+  remark      String?
+  reverted    Boolean          @default(false)
+  createdById Int?
+  createdAt   DateTime         @default(now())
+
+  @@index([businessId, branchId, metal, txnDate])
+}
+
+model BuySell {
+  id            Int           @id @default(autoincrement())
+  businessId    Int
+  branchId      Int
+  buySellNo     Int
+  side          TradeSide
+  partyId       Int
+  metal         MetalKind
+  txnDate       DateTime      @db.Date
+  /// Σ line weight (bullion fine)
+  totalWeight   Decimal       @db.Decimal(14, 3)
+  discount      Decimal       @default(0) @db.Decimal(14, 2)
+  /// Σ line amount − discount
+  totalAmount   Decimal       @db.Decimal(14, 2)
+  cash          Decimal       @default(0) @db.Decimal(14, 2)
+  online        Decimal       @default(0) @db.Decimal(14, 2)
+  bankAccountId Int?
+  bhavBookingId Int?
+  narration     String?
+  createdById   Int?
+  createdAt     DateTime      @default(now())
+  lines         BuySellLine[]
+
+  @@unique([businessId, branchId, buySellNo])
+  @@index([businessId, branchId, txnDate])
+  @@index([businessId, partyId])
+  @@index([bhavBookingId])
+}
+
+model BuySellLine {
+  id        Int     @id @default(autoincrement())
+  buySellId Int
+  weight    Decimal @db.Decimal(14, 3)
+  /// settings units
+  rate      Decimal @db.Decimal(14, 2)
+  amount    Decimal @db.Decimal(14, 2)
+  buySell   BuySell @relation(fields: [buySellId], references: [id], onDelete: Cascade)
+
+  @@index([buySellId])
+}
+
+model BhavBooking {
+  id            Int        @id @default(autoincrement())
+  businessId    Int
+  branchId      Int
+  bookingNo     Int
+  side          TradeSide
+  partyId       Int
+  metal         MetalKind
+  txnDate       DateTime   @db.Date
+  weight        Decimal    @db.Decimal(14, 3)
+  /// settings units, locked
+  rate          Decimal    @db.Decimal(14, 2)
+  amount        Decimal    @db.Decimal(14, 2)
+  /// advance received (party credit until delivered)
+  cash          Decimal    @default(0) @db.Decimal(14, 2)
+  online        Decimal    @default(0) @db.Decimal(14, 2)
+  bankAccountId Int?
+  /// weight − delivered via buy-sell
+  pendingWeight Decimal    @db.Decimal(14, 3)
+  status        BhavStatus @default(PENDING)
+  narration     String?
+  createdById   Int?
+  createdAt     DateTime   @default(now())
+  updatedAt     DateTime   @updatedAt
+
+  @@unique([businessId, branchId, bookingNo])
+  @@index([businessId, branchId, status])
+  @@index([businessId, partyId])
+}
+
+// ───────────── Phase 11: schemes (saving plans) + Anjuman (docs/api-phase11.md) ─────────────
+
+enum SchemeKind {
+  SAVING
+  ANJUMAN
+}
+
+enum SchemeType {
+  CASH
+  GOLD
+}
+
+enum SchemeBonusType {
+  NONE
+  ONE_EMI
+  PERCENT
+  FIXED
+}
+
+/// matured is derived (EMIs paid ≥ tenure), not stored
+enum SchemeEnrollmentStatus {
+  ACTIVE
+  WON
+  WITHDRAWN
+  CLOSED
+}
+
+/// CASH/ONLINE/TOKEN move money (ledger IN); DRAW/VENDOR count as paid with no money moved
+enum SchemePayMedium {
+  CASH
+  ONLINE
+  TOKEN
+  DRAW
+  VENDOR
+}
+
+model Scheme {
+  id           Int                @id @default(autoincrement())
+  businessId   Int
+  branchId     Int
+  kind         SchemeKind         @default(SAVING)
+  type         SchemeType
+  name         String
+  description  String?
+  emiAmount    Decimal            @db.Decimal(14, 2)
+  tenureMonths Int
+  bonusType    SchemeBonusType    @default(NONE)
+  /// PERCENT: % of paid (₹ or g); FIXED: ₹ (CASH) or g (GOLD)
+  bonusValue   Decimal            @default(0) @db.Decimal(14, 3)
+  startDate    DateTime           @db.Date
+  validityDate DateTime?          @db.Date
+  isActive     Boolean            @default(true)
+  createdById  Int?
+  createdAt    DateTime           @default(now())
+  updatedAt    DateTime           @updatedAt
+  groups       SchemeGroup[]
+  enrollments  SchemeEnrollment[]
+
+  @@index([businessId, branchId, kind, isActive])
+}
+
+model SchemeGroup {
+  id          Int                @id @default(autoincrement())
+  schemeId    Int
+  name        String
+  memberLimit Int?
+  createdAt   DateTime           @default(now())
+  scheme      Scheme             @relation(fields: [schemeId], references: [id], onDelete: Cascade)
+  enrollments SchemeEnrollment[]
+
+  @@unique([schemeId, name])
+}
+
+model SchemeEnrollment {
+  id          Int                    @id @default(autoincrement())
+  businessId  Int
+  branchId    Int
+  schemeId    Int
+  groupId     Int?
+  partyId     Int
+  assignId    String
+  displayName String
+  emiAmount   Decimal                @db.Decimal(14, 2)
+  startDate   DateTime               @db.Date
+  status      SchemeEnrollmentStatus @default(ACTIVE)
+  /// redeem / withdraw: ₹ credited to the party (udhar); GOLD also grams + rate used
+  redeemValue Decimal?               @db.Decimal(14, 2)
+  redeemFine  Decimal?               @db.Decimal(14, 3)
+  redeemRate  Decimal?               @db.Decimal(14, 2)
+  closedAt    DateTime?
+  createdById Int?
+  createdAt   DateTime               @default(now())
+  scheme      Scheme                 @relation(fields: [schemeId], references: [id])
+  group       SchemeGroup?           @relation(fields: [groupId], references: [id])
+  payments    SchemePayment[]
+
+  @@unique([schemeId, assignId])
+  @@index([businessId, branchId, schemeId, status])
+  @@index([businessId, partyId])
+  @@index([groupId])
+}
+
+model SchemePayment {
+  id            Int              @id @default(autoincrement())
+  enrollmentId  Int
+  /// installment 1..tenure; null for TOKEN / ad-hoc and after reversal (many NULLs allowed → a reversed month can be repaid)
+  emiNo         Int?
+  emiDate       DateTime?        @db.Date
+  txnDate       DateTime         @db.Date
+  amount        Decimal          @db.Decimal(14, 2)
+  medium        SchemePayMedium  @default(CASH)
+  bankAccountId Int?
+  /// GOLD schemes: rate in settings units (gold /10 g) and the fine bought, 3 dp
+  rate          Decimal?         @db.Decimal(14, 2)
+  fine          Decimal?         @db.Decimal(14, 3)
+  remark        String?
+  isReversed    Boolean          @default(false)
+  createdById   Int?
+  createdAt     DateTime         @default(now())
+  enrollment    SchemeEnrollment @relation(fields: [enrollmentId], references: [id], onDelete: Cascade)
+
+  @@unique([enrollmentId, emiNo])
+  @@index([enrollmentId])
+}

@@ -1,6 +1,6 @@
 // Baseline self-check by lead (hand-computed with the fixture-verified formulas).
 import { describe, expect, it } from 'vitest';
-import { computeBill, computeJustLine, computeLine, girviInterest, metalToMoney, moneyToMetal } from './index';
+import { computeBill, computeJustLine, computeLine, girviInterest, metalToMoney, moneyToMetal, schemeMaturity } from './index';
 
 describe('computeLine', () => {
   it('22K ring: multiplicative wastage, per-gram labour on gross, % discount on metal', () => {
@@ -92,5 +92,22 @@ describe('girviInterest', () => {
   it('same day or earlier → zero', () => {
     expect(girviInterest({ ...base, interestType: 'SI', method: 'DAY_WISE', to: '2026-01-15' }).interest).toBe('0.00');
     expect(girviInterest({ ...base, interestType: 'SI', method: 'DAY_WISE', to: '2026-01-01' }).interest).toBe('0.00');
+  });
+});
+
+describe('schemeMaturity', () => {
+  it('CASH 11+1: one EMI bonus', () => {
+    const payments = Array.from({ length: 11 }, () => ({ amount: 2000 }));
+    expect(schemeMaturity({ type: 'CASH', payments, bonusType: 'ONE_EMI', emiAmount: 2000 })).toEqual({ paid: '22000.00', fine: '0.000', bonus: '2000.00', maturity: '24000.00', maturityValue: '24000.00' });
+  });
+  it('CASH percent bonus, none when withdrawn early', () => {
+    const payments = Array.from({ length: 10 }, () => ({ amount: 5000 }));
+    expect(schemeMaturity({ type: 'CASH', payments, bonusType: 'PERCENT', bonusValue: 8, emiAmount: 5000 }).maturity).toBe('54000.00');
+    expect(schemeMaturity({ type: 'CASH', payments, bonusType: 'PERCENT', bonusValue: 8, emiAmount: 5000, early: true }).maturity).toBe('50000.00');
+  });
+  it('GOLD: stored 3-dp fines + 2% bonus valued at the redeem rate (per 10 g)', () => {
+    const payments = [60000, 62500, 65000].map((r) => ({ amount: 10000, fine: moneyToMetal(10000, r, 10) }));
+    expect(payments.map((p) => p.fine)).toEqual(['1.667', '1.600', '1.538']);
+    expect(schemeMaturity({ type: 'GOLD', payments, bonusType: 'PERCENT', bonusValue: 2, emiAmount: 10000, redeemRate: 65000 })).toEqual({ paid: '30000.00', fine: '4.805', bonus: '0.096', maturity: '4.901', maturityValue: '31856.50' });
   });
 });

@@ -219,3 +219,38 @@ export function girviInterest(i: GirviInterestInput): { interest: string; months
   }
   return { interest: M(interest), months: months.toDecimalPlaces(4).toString(), days };
 }
+
+export interface SchemeMaturityInput {
+  type: 'CASH' | 'GOLD';
+  /** non-reversed payments; GOLD: fine = the stored 3-dp grams (passbook = math) */
+  payments: Array<{ amount: Num; fine?: Num | null }>;
+  bonusType: 'NONE' | 'ONE_EMI' | 'PERCENT' | 'FIXED';
+  /** PERCENT: % of paid (₹ or g); FIXED: ₹ (CASH) or g (GOLD) */
+  bonusValue?: Num;
+  emiAmount: Num;
+  /** GOLD: rate on redemption day in settings units */
+  redeemRate?: Num;
+  /** GOLD settings unit (gold rates are per 10 g) */
+  rateUnitGrams?: Num;
+  /** withdrawal before maturity → no bonus */
+  early?: boolean;
+}
+
+/** CASH: maturity in ₹ = paid + bonus. GOLD: maturity in g = Σ fine + bonus g, valued at redeemRate. ONE_EMI on GOLD = one EMI's gold at redeemRate. */
+export function schemeMaturity(i: SchemeMaturityInput): { paid: string; fine: string; bonus: string; maturity: string; maturityValue: string } {
+  const gold = i.type === 'GOLD';
+  const unit = i.rateUnitGrams ?? 10;
+  const paid = i.payments.reduce((s, p) => s.plus(D(p.amount)), D(0));
+  const base = gold ? i.payments.reduce((s, p) => s.plus(D(p.fine)), D(0)) : paid;
+  const v = D(i.bonusValue);
+  let bonus = D(0);
+  if (!i.early) {
+    if (i.bonusType === 'PERCENT') bonus = base.times(v).div(100);
+    else if (i.bonusType === 'FIXED') bonus = v;
+    else if (i.bonusType === 'ONE_EMI') bonus = gold ? D(moneyToMetal(i.emiAmount, i.redeemRate ?? 0, unit)) : D(i.emiAmount);
+  }
+  const R = gold ? W : M;
+  const b = R(bonus);
+  const maturity = R(base.plus(b));
+  return { paid: M(paid), fine: gold ? W(base) : '0.000', bonus: b, maturity, maturityValue: gold ? metalToMoney(maturity, i.redeemRate ?? 0, unit) : maturity };
+}
