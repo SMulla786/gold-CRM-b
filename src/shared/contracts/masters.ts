@@ -247,6 +247,11 @@ const numbering = z.object({
   gstOnRemainingMetal: z.boolean().default(false),
 });
 
+/** TASK-84: item columns the printed invoice can show (empty list in invoice.content.columns = all). */
+export const INVOICE_PRINT_COLUMNS = [
+  'hsn', 'karat', 'pcs', 'gross', 'less', 'net', 'tunch', 'wastage', 'fine', 'stone', 'rate', 'labour', 'other', 'disc', 'total',
+] as const;
+
 /** Every allowed setting key with its value schema. Value defaults = shop defaults when no row exists. */
 export const SETTING_SCHEMAS = {
   'calc.basis': z.object({ sale: calcBasis.default('NET'), purchase: calcBasis.default('NET') }),
@@ -267,7 +272,16 @@ export const SETTING_SCHEMAS = {
     format: z.enum(['CLASSIC', 'PROFESSIONAL', 'PREMIUM_DARK', 'CLASSIC_BOXY', 'LETTERHEAD', 'LETTERHEAD_2']).default('CLASSIC'),
     terms: z.string().max(2000).default(''),
     justBillDisclaimer: z.string().max(1000).default(''),
-    columns: z.array(z.string()).default([]),
+    columns: z.array(z.enum(INVOICE_PRINT_COLUMNS)).default([]),
+    /** TASK-84: watermark image opacity, percent */
+    watermarkOpacity: z.number().int().min(0).max(100).default(10),
+  }),
+  /** TASK-84: uploaded invoice media (relative paths). Written ONLY by the upload endpoints — kept out of
+   *  invoice.content so saving the content form can never wipe an uploaded logo. */
+  'invoice.media': z.object({
+    logoUrl: z.string().nullable().default(null),
+    signatureUrl: z.string().nullable().default(null),
+    watermarkUrl: z.string().nullable().default(null),
   }),
   /** Girvi defaults (docs/modules/06 §6.7) — prefilled on New Girvi, editable per loan */
   'girvi.defaults': z.object({
