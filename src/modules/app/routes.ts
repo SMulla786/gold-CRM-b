@@ -27,11 +27,15 @@ import type { PartyImageField } from './uploads';
 import { inventoryRouter } from './inventory.routes';
 import { accountsRouter } from './accounts.routes';
 import { udharRouter } from './udhar.routes';
+import { billingRouter } from './billing/routes';
+import { reportsRouter } from './reports.routes';
 
 export const appRouter = Router();
 appRouter.use(inventoryRouter);
 appRouter.use(accountsRouter);
 appRouter.use(udharRouter);
+appRouter.use(billingRouter);
+appRouter.use(reportsRouter);
 
 const PARTIES = 'settings.parties';
 const MISC = 'settings.misc';

@@ -3,6 +3,7 @@ import { prisma } from '../../lib/prisma';
 import { scopedDb } from '../../lib/db';
 import * as ledger from '../../lib/ledger';
 import * as udhar from '../../lib/udhar';
+import { logActivity } from '../../lib/activity';
 import { HttpError } from '../../middleware/error';
 import type { TenantContext } from '../../middleware/context';
 import { moneyToMetal } from '../../shared';
@@ -55,13 +56,9 @@ export async function createUdharTxn(ctx: TenantContext, body: UdharBody): Promi
   if (body.onlineIn > 0 && !(await sdb.bankAccount.findUnique({ where: { id: body.inBankId! } }))) throw new HttpError(404, 'NOT_FOUND', 'Bank account not found');
 
   const received = D(body.cashIn).plus(body.onlineIn);
-  let settleBill: { id: number; paid: Prisma.Decimal } | null = null;
-  if (body.settleBillId != null) {
-    const b = await sdb.bill.findUnique({ where: { id: body.settleBillId } });
-    if (!b) throw new HttpError(404, 'NOT_FOUND', 'Bill not found');
-    if (b.kind !== 'SELL' || b.partyId !== body.partyId || b.status !== 'ACTIVE') throw new HttpError(409, 'CONFLICT', 'Bill is not open for this party');
-    if (D(b.final).minus(b.paid).lte(0)) throw new HttpError(409, 'CONFLICT', 'Bill is already settled');
-    settleBill = { id: b.id, paid: D(b.paid) };
+  // existence + tenant scope checked here; the ACTIVE/party/balance checks + paid update run atomically inside the tx
+  if (body.settleBillId != null && !(await sdb.bill.findUnique({ where: { id: body.settleBillId }, select: { id: true } }))) {
+    throw new HttpError(404, 'NOT_FOUND', 'Bill not found');
   }
 
   const txnDate = ledger.businessDate(body.txnDate ?? new Date());
@@ -153,13 +150,17 @@ export async function createUdharTxn(ctx: TenantContext, body: UdharBody): Promi
 
     // 5. Settle a pending SELL bill: record the received money as BillPayment(s); step 3 already moved the cash,
     // step 4 already reduced the party balance — so no extra ledger/udhar rows here.
-    if (settleBill) {
-      if (body.cashIn > 0) await tx.billPayment.create({ data: { billId: settleBill.id, mode: 'CASH', amount: body.cashIn, txnDate, udharTxnId: h.id, createdById: ctx.userId } });
-      if (body.onlineIn > 0) await tx.billPayment.create({ data: { billId: settleBill.id, mode: 'ONLINE', bankAccountId: body.inBankId!, amount: body.onlineIn, txnDate, udharTxnId: h.id, createdById: ctx.userId } });
-      await tx.bill.update({ where: { id: settleBill.id }, data: { paid: settleBill.paid.plus(received) } });
+    if (body.settleBillId != null) {
+      const b = await tx.bill.findUnique({ where: { id: body.settleBillId } }); // re-read inside tx: concurrency-safe checks + atomic paid
+      if (!b) throw new HttpError(404, 'NOT_FOUND', 'Bill not found');
+      if (b.kind !== 'SELL' || b.partyId !== body.partyId || b.status !== 'ACTIVE') throw new HttpError(409, 'CONFLICT', 'Bill is not open for this party');
+      if (D(b.final).minus(b.paid).lte(0)) throw new HttpError(409, 'CONFLICT', 'Bill is already settled');
+      if (body.cashIn > 0) await tx.billPayment.create({ data: { billId: b.id, mode: 'CASH', amount: body.cashIn, txnDate, udharTxnId: h.id, createdById: ctx.userId } });
+      if (body.onlineIn > 0) await tx.billPayment.create({ data: { billId: b.id, mode: 'ONLINE', bankAccountId: body.inBankId!, amount: body.onlineIn, txnDate, udharTxnId: h.id, createdById: ctx.userId } });
+      await tx.bill.update({ where: { id: b.id }, data: { paid: { increment: received } } });
     }
 
-    await tx.activityLog.create({ data: { businessId: ctx.businessId!, branchId, userId: ctx.userId, module: 'UDHAR', action: 'CREATED', entity: 'UdharTxn', entityId: sid, summary: `Udhar #${txnNo}`, partyName: party.name } });
+    await logActivity(tx, ctx, { module: 'UDHAR', action: 'CREATED', entity: 'UdharTxn', entityId: sid, summary: `Udhar #${txnNo}`, partyName: party.name });
     return h;
   });
 
@@ -235,11 +236,10 @@ export async function deleteUdharTxn(ctx: TenantContext, id: number): Promise<vo
       if (pays.length) {
         const back = pays.reduce((a, p) => a.plus(D(p.amount)), new Prisma.Decimal(0));
         await tx.billPayment.updateMany({ where: { id: { in: pays.map((p) => p.id) } }, data: { isActive: false } });
-        const b = await tx.bill.findUnique({ where: { id: t.settleBillId }, select: { paid: true } });
-        if (b) await tx.bill.update({ where: { id: t.settleBillId }, data: { paid: D(b.paid).minus(back) } });
+        await tx.bill.update({ where: { id: t.settleBillId }, data: { paid: { decrement: back } } });
       }
     }
-    await tx.activityLog.create({ data: { businessId: ctx.businessId!, branchId: t.branchId, userId: ctx.userId, module: 'UDHAR', action: 'REVERSED', entity: 'UdharTxn', entityId: sid, summary: `Deleted udhar #${t.txnNo}` } });
+    await logActivity(tx, ctx, { module: 'UDHAR', action: 'DELETED', entity: 'UdharTxn', entityId: sid, summary: `Deleted udhar #${t.txnNo}` });
   });
 }
 

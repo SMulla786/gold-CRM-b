@@ -212,8 +212,8 @@ async function decorateStock(ctx: TenantContext, items: any[]): Promise<StockIte
   });
 }
 
-/** Atomic per-(business,prefix) tag number. INSERT … ON CONFLICT … RETURNING is the lock-free increment. */
-async function nextTagNo(tx: Prisma.TransactionClient, businessId: number, prefix: string, digits: number): Promise<string> {
+/** Atomic per-(business,prefix) tag number. INSERT … ON CONFLICT … RETURNING is the lock-free increment. Exported so purchase bills reuse the same tag core. */
+export async function nextTagNo(tx: Prisma.TransactionClient, businessId: number, prefix: string, digits: number): Promise<string> {
   const r = await tx.$queryRaw<{ next: number }[]>`
     INSERT INTO "TagSequence" ("businessId", "prefix", "next") VALUES (${businessId}, ${prefix}, 2)
     ON CONFLICT ("businessId", "prefix") DO UPDATE SET "next" = "TagSequence"."next" + 1
@@ -361,10 +361,13 @@ async function applyStockEdit(tx: Prisma.TransactionClient, lctx: ledger.LedgerC
   await ledger.post(tx, lctx, [{ branchId: item.branchId, asset: ledger.assetForStockClass(item.stockClass), direction: 'IN', karatCode: r.karatCode, pcs: merged.pcs, gross: merged.gross, net: r.net, fine: r.fine, amount: r.purchaseCost, source: 'STOCK_INSERT', sourceId: String(item.id), stockItemId: item.id, narration: `Edit stock item #${item.id}` }]);
 }
 
-/** A sold item (any active SELL_BILL ledger row) can't be edited or deleted — it must be corrected from the bill. */
+/** A sold item can't be edited/deleted — but only while its SELL_BILL row is live. A bill deleted with stock return reverses that row, so the item is AVAILABLE again and must stay editable. */
 async function assertNotSold(ctx: TenantContext, ids: number[]): Promise<void> {
-  const sold = await prisma.ledgerEntry.findFirst({ where: { businessId: ctx.businessId!, stockItemId: { in: ids }, source: 'SELL_BILL', reversalOfId: null }, select: { stockItemId: true } });
-  if (sold) throw new HttpError(409, 'CONFLICT', `Item #${sold.stockItemId} is on a sell bill — correct it from the bill`);
+  const sellRows = await prisma.ledgerEntry.findMany({ where: { businessId: ctx.businessId!, stockItemId: { in: ids }, source: 'SELL_BILL', reversalOfId: null }, select: { id: true, stockItemId: true } });
+  if (sellRows.length === 0) return;
+  const reversed = new Set((await prisma.ledgerEntry.findMany({ where: { businessId: ctx.businessId!, reversalOfId: { in: sellRows.map((r) => r.id) } }, select: { reversalOfId: true } })).map((r) => r.reversalOfId));
+  const live = sellRows.find((r) => !reversed.has(r.id));
+  if (live) throw new HttpError(409, 'CONFLICT', `Item #${live.stockItemId} is on a sell bill — correct it from the bill`);
 }
 
 /** Lock the ids inside the tx and confirm all are still AVAILABLE (count must equal n), else 409 — closes the edit-vs-transfer/delete race. */
