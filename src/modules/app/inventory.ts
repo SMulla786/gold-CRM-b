@@ -1,0 +1,468 @@
+import type { Prisma } from '@prisma/client';
+import { prisma } from '../../lib/prisma';
+import { scopedDb } from '../../lib/db';
+import * as ledger from '../../lib/ledger';
+import { HttpError } from '../../middleware/error';
+import type { TenantContext } from '../../middleware/context';
+import { computeLine } from '../../shared';
+import type {
+  GroupStockDto,
+  ItemGroupDto,
+  ItemNameDto,
+  JewelleryTypeDto,
+  Paged,
+  ShortageRowDto,
+  StockClass,
+  StockEntryResultDto,
+  StockImportResultDto,
+  StockItemDto,
+  StockSummaryDto,
+} from '../../shared';
+
+/* eslint-disable @typescript-eslint/no-explicit-any */
+const num = (d: unknown): string => String(d);
+const numN = (d: unknown): number => Number(d);
+
+// ───────────── Jewellery types (global + custom; nullable businessId → scoped in-service) ─────────────
+
+export async function listJewelleryTypes(ctx: TenantContext, stockClass?: StockClass): Promise<JewelleryTypeDto[]> {
+  const rows = await prisma.jewelleryType.findMany({
+    where: { isActive: true, OR: [{ businessId: null }, { businessId: ctx.businessId! }], ...(stockClass ? { stockClass } : {}) },
+    orderBy: [{ businessId: 'asc' }, { name: 'asc' }],
+  });
+  return rows.map((t) => ({ id: t.id, name: t.name, stockClass: t.stockClass, isCustom: t.businessId != null }));
+}
+
+export async function createJewelleryType(ctx: TenantContext, body: { name: string; stockClass?: StockClass }): Promise<JewelleryTypeDto> {
+  const t = await prisma.jewelleryType.create({ data: { businessId: ctx.businessId!, name: body.name, stockClass: body.stockClass ?? null } });
+  return { id: t.id, name: t.name, stockClass: t.stockClass, isCustom: true };
+}
+
+// ───────────── Item groups ─────────────
+
+const groupDto = (g: any): ItemGroupDto => ({
+  id: g.id,
+  stockClass: g.stockClass,
+  name: g.name,
+  jewelleryType: g.jewelleryType ? { id: g.jewelleryType.id, name: g.jewelleryType.name } : null,
+  hsn: g.hsn ? { id: g.hsn.id, code: g.hsn.code } : null,
+  gstRate: num(g.gstRate),
+  minWeight: g.minWeight != null ? num(g.minWeight) : null,
+  maxWeight: g.maxWeight != null ? num(g.maxWeight) : null,
+  minPcs: g.minPcs,
+  maxPcs: g.maxPcs,
+  itemCount: g._count?.items ?? 0,
+  isActive: g.isActive,
+});
+
+/** ItemGroup has no `hsn` relation; resolve HSN codes for a page of groups. */
+async function hsnCodeMap(ids: (number | null)[]): Promise<Map<number, { id: number; code: string }>> {
+  const uniq = [...new Set(ids.filter((x): x is number => x != null))];
+  if (!uniq.length) return new Map();
+  const rows = await prisma.hsnCode.findMany({ where: { id: { in: uniq } }, select: { id: true, code: true } });
+  return new Map(rows.map((r) => [r.id, r]));
+}
+
+export async function listItemGroups(ctx: TenantContext, query: { page: number; pageSize: number; q?: string; stockClass?: StockClass; jewelleryTypeId?: number }): Promise<Paged<ItemGroupDto>> {
+  const sdb = scopedDb(ctx);
+  const where = {
+    ...(query.stockClass ? { stockClass: query.stockClass } : {}),
+    ...(query.jewelleryTypeId ? { jewelleryTypeId: query.jewelleryTypeId } : {}),
+    ...(query.q ? { name: { contains: query.q, mode: 'insensitive' as const } } : {}),
+  };
+  const [rows, total] = await Promise.all([
+    sdb.itemGroup.findMany({ where, include: { jewelleryType: true, _count: { select: { items: true } } }, skip: (query.page - 1) * query.pageSize, take: query.pageSize, orderBy: { name: 'asc' } }),
+    sdb.itemGroup.count({ where }),
+  ]);
+  const hsn = await hsnCodeMap(rows.map((r) => r.hsnId));
+  return { items: rows.map((g) => groupDto({ ...g, hsn: g.hsnId != null ? hsn.get(g.hsnId) : null })), total, page: query.page, pageSize: query.pageSize };
+}
+
+export async function createItemGroups(ctx: TenantContext, body: { stockClass: StockClass; jewelleryTypeId?: number; names: string[]; hsnId?: number; gstRate: number; minWeight?: number; maxWeight?: number; minPcs?: number; maxPcs?: number }): Promise<ItemGroupDto[]> {
+  const sdb = scopedDb(ctx);
+  if (body.jewelleryTypeId != null) {
+    const jt = await prisma.jewelleryType.findFirst({ where: { id: body.jewelleryTypeId, OR: [{ businessId: null }, { businessId: ctx.businessId! }] } });
+    if (!jt) throw new HttpError(404, 'NOT_FOUND', 'Jewellery type not found');
+  }
+  if (body.hsnId != null && !(await prisma.hsnCode.findUnique({ where: { id: body.hsnId } }))) throw new HttpError(404, 'NOT_FOUND', 'HSN not found');
+  const out: ItemGroupDto[] = [];
+  for (const name of body.names) {
+    const g = await sdb.itemGroup.create({
+      data: { stockClass: body.stockClass, jewelleryTypeId: body.jewelleryTypeId ?? null, name, hsnId: body.hsnId ?? null, gstRate: body.gstRate, minWeight: body.minWeight ?? null, maxWeight: body.maxWeight ?? null, minPcs: body.minPcs ?? null, maxPcs: body.maxPcs ?? null } as never,
+      include: { jewelleryType: true, _count: { select: { items: true } } },
+    });
+    const hsn = await hsnCodeMap([g.hsnId]);
+    out.push(groupDto({ ...g, hsn: g.hsnId != null ? hsn.get(g.hsnId) : null }));
+  }
+  return out;
+}
+
+export async function updateItemGroup(ctx: TenantContext, groupId: number, body: Record<string, any>): Promise<ItemGroupDto> {
+  if (body.hsnId != null && !(await prisma.hsnCode.findUnique({ where: { id: body.hsnId } }))) throw new HttpError(404, 'NOT_FOUND', 'HSN not found');
+  if (body.jewelleryTypeId != null && !(await prisma.jewelleryType.findFirst({ where: { id: body.jewelleryTypeId, OR: [{ businessId: null }, { businessId: ctx.businessId! }] } }))) throw new HttpError(404, 'NOT_FOUND', 'Jewellery type not found');
+  const g = await scopedDb(ctx).itemGroup.update({ where: { id: groupId }, data: body, include: { jewelleryType: true, _count: { select: { items: true } } } });
+  const hsn = await hsnCodeMap([g.hsnId]);
+  return groupDto({ ...g, hsn: g.hsnId != null ? hsn.get(g.hsnId) : null });
+}
+
+// ───────────── Item names ─────────────
+
+const itemNameDto = (n: any, hsn: { id: number; code: string } | null): ItemNameDto => ({
+  id: n.id,
+  name: n.name,
+  group: { id: n.group.id, name: n.group.name, stockClass: n.group.stockClass },
+  hsn,
+  taxValue: n.taxValue != null ? num(n.taxValue) : null,
+  taxUnit: n.taxUnit,
+  method: n.method,
+  tagPrefix: n.tagPrefix,
+  tagDigits: n.tagDigits,
+  minWeight: n.minWeight != null ? num(n.minWeight) : null,
+  maxWeight: n.maxWeight != null ? num(n.maxWeight) : null,
+  minPcs: n.minPcs,
+  maxPcs: n.maxPcs,
+  defKaratCode: n.defKaratCode,
+  defTunch: n.defTunch != null ? num(n.defTunch) : null,
+  defWastage: n.defWastage != null ? num(n.defWastage) : null,
+  defLabour: n.defLabour != null ? num(n.defLabour) : null,
+  defLabourUnit: n.defLabourUnit,
+  isActive: n.isActive,
+});
+
+export async function listItemNames(ctx: TenantContext, query: { page: number; pageSize: number; q?: string; stockClass?: StockClass; groupId?: number }): Promise<Paged<ItemNameDto>> {
+  const sdb = scopedDb(ctx);
+  const where = {
+    ...(query.groupId ? { groupId: query.groupId } : {}),
+    ...(query.stockClass ? { group: { stockClass: query.stockClass } } : {}),
+    ...(query.q ? { name: { contains: query.q, mode: 'insensitive' as const } } : {}),
+  };
+  const [rows, total] = await Promise.all([
+    sdb.itemName.findMany({ where, include: { group: true }, skip: (query.page - 1) * query.pageSize, take: query.pageSize, orderBy: { name: 'asc' } }),
+    sdb.itemName.count({ where }),
+  ]);
+  const hsn = await hsnCodeMap(rows.map((r) => r.hsnId));
+  return { items: rows.map((n) => itemNameDto(n, n.hsnId != null ? (hsn.get(n.hsnId) ?? null) : null)), total, page: query.page, pageSize: query.pageSize };
+}
+
+export async function createItemName(ctx: TenantContext, body: Record<string, any>): Promise<ItemNameDto> {
+  const sdb = scopedDb(ctx);
+  const group = await sdb.itemGroup.findUnique({ where: { id: body.groupId } });
+  if (!group) throw new HttpError(404, 'NOT_FOUND', 'Item group not found');
+  if ((body.method === 'TAG' || body.method === 'BOTH') && (!body.tagPrefix || !body.tagDigits)) {
+    throw new HttpError(400, 'VALIDATION', 'TAG/BOTH item names need tagPrefix and tagDigits');
+  }
+  if (body.hsnId != null && !(await prisma.hsnCode.findUnique({ where: { id: body.hsnId } }))) throw new HttpError(404, 'NOT_FOUND', 'HSN not found');
+  const n = await sdb.itemName.create({ data: body as never, include: { group: true } });
+  const hsn = await hsnCodeMap([n.hsnId]);
+  return itemNameDto(n, n.hsnId != null ? (hsn.get(n.hsnId) ?? null) : null);
+}
+
+export async function updateItemName(ctx: TenantContext, itemNameId: number, body: Record<string, any>): Promise<ItemNameDto> {
+  if (body.hsnId != null && !(await prisma.hsnCode.findUnique({ where: { id: body.hsnId } }))) throw new HttpError(404, 'NOT_FOUND', 'HSN not found');
+  if (body.groupId != null && !(await scopedDb(ctx).itemGroup.findUnique({ where: { id: body.groupId } }))) throw new HttpError(404, 'NOT_FOUND', 'Item group not found');
+  const n = await scopedDb(ctx).itemName.update({ where: { id: itemNameId }, data: body, include: { group: true } });
+  const hsn = await hsnCodeMap([n.hsnId]);
+  return itemNameDto(n, n.hsnId != null ? (hsn.get(n.hsnId) ?? null) : null);
+}
+
+// ───────────── Stock mapper + helpers ─────────────
+
+const stockDto = (s: any, branchName: string, hsnCode: string | null): StockItemDto => ({
+  id: s.id,
+  branch: { id: s.branchId, name: branchName },
+  stockClass: s.stockClass,
+  group: { id: s.group.id, name: s.group.name },
+  itemName: { id: s.itemName.id, name: s.itemName.name },
+  hsnCode,
+  method: s.method,
+  tagNo: s.tagNo,
+  huid: s.huid,
+  karatCode: s.karatCode,
+  pcs: s.pcs,
+  gross: num(s.gross),
+  less: num(s.less),
+  net: num(s.net),
+  tunch: num(s.tunch),
+  wastage: num(s.wastage),
+  fine: num(s.fine),
+  stoneCharge: num(s.stoneCharge),
+  labour: num(s.labour),
+  labourUnit: s.labourUnit,
+  other: num(s.other),
+  rate: s.rate != null ? num(s.rate) : null,
+  purchaseCost: s.purchaseCost != null ? num(s.purchaseCost) : null,
+  status: s.status,
+  entryNo: s.entryNo,
+  photoUrl: s.photoUrl,
+  remarks: s.remarks,
+  createdAt: s.createdAt.toISOString(),
+});
+
+async function decorateStock(ctx: TenantContext, items: any[]): Promise<StockItemDto[]> {
+  const branchIds = [...new Set(items.map((i) => i.branchId))];
+  const branches = branchIds.length ? await scopedDb(ctx).branch.findMany({ where: { id: { in: branchIds } }, select: { id: true, name: true } }) : [];
+  const brName = new Map(branches.map((b) => [b.id, b.name]));
+  const hsn = await hsnCodeMap(items.flatMap((i) => [i.itemName.hsnId, i.group.hsnId]));
+  return items.map((i) => {
+    const code = i.itemName.hsnId != null ? hsn.get(i.itemName.hsnId)?.code : i.group.hsnId != null ? hsn.get(i.group.hsnId)?.code : null;
+    return stockDto(i, brName.get(i.branchId) ?? '', code ?? null);
+  });
+}
+
+/** Atomic per-(business,prefix) tag number. INSERT … ON CONFLICT … RETURNING is the lock-free increment. */
+async function nextTagNo(tx: Prisma.TransactionClient, businessId: number, prefix: string, digits: number): Promise<string> {
+  const r = await tx.$queryRaw<{ next: number }[]>`
+    INSERT INTO "TagSequence" ("businessId", "prefix", "next") VALUES (${businessId}, ${prefix}, 2)
+    ON CONFLICT ("businessId", "prefix") DO UPDATE SET "next" = "TagSequence"."next" + 1
+    RETURNING "next"`;
+  const used = Number(r[0]!.next) - 1;
+  return `${prefix}${String(used).padStart(digits, '0')}`;
+}
+
+/** Race-free entry number via the same atomic TagSequence upsert (reserved prefix '#ENTRY'). */
+async function nextEntryNo(tx: Prisma.TransactionClient, businessId: number): Promise<number> {
+  const r = await tx.$queryRaw<{ next: number }[]>`
+    INSERT INTO "TagSequence" ("businessId", "prefix", "next") VALUES (${businessId}, '#ENTRY', 2)
+    ON CONFLICT ("businessId", "prefix") DO UPDATE SET "next" = "TagSequence"."next" + 1
+    RETURNING "next"`;
+  return Number(r[0]!.next) - 1;
+}
+
+function resolveRow(row: any, itemName: any, touchByCode: Map<string, number>) {
+  const karatCode = row.karatCode ?? itemName.defKaratCode ?? null;
+  const tunch = row.tunch ?? (karatCode ? touchByCode.get(karatCode) : undefined) ?? 100;
+  const line = computeLine({
+    pcs: row.pcs, gross: row.gross, less: row.less, tunch, wastage: row.wastage,
+    stoneCharge: row.stoneCharge, labour: row.labour, labourUnit: row.labourUnit, other: row.other,
+    rate: row.rate, rateUnitGrams: 1, basis: 'NET',
+  });
+  // Keep string/number weights as-is (no Number() round-trip for money/weights).
+  const purchaseCost: string | number | null = row.purchaseCost != null ? row.purchaseCost : row.rate != null ? line.total : null;
+  return { karatCode, tunch, net: line.net, fine: line.fine, purchaseCost };
+}
+
+// ───────────── Stock entry ─────────────
+
+export async function createStockEntry(ctx: TenantContext, body: { stockClass: StockClass; method: 'LOOSE' | 'TAG'; branchId?: number; txnDate?: Date; rows: any[] }): Promise<StockEntryResultDto> {
+  const branchId = body.branchId ?? ctx.activeBranchId ?? ctx.scopeBranchId;
+  if (branchId == null || !ctx.branchIds.includes(branchId)) throw new HttpError(404, 'NOT_FOUND', 'Branch not found');
+  const sdb = scopedDb(ctx);
+
+  // Resolve + validate every item name up-front (scoped).
+  const nameIds = [...new Set(body.rows.map((r) => r.itemNameId))];
+  const itemNames = await sdb.itemName.findMany({ where: { id: { in: nameIds } }, include: { group: true } });
+  const byId = new Map(itemNames.map((n) => [n.id, n]));
+  for (const r of body.rows) {
+    const n = byId.get(r.itemNameId);
+    if (!n) throw new HttpError(404, 'NOT_FOUND', `Item name ${r.itemNameId} not found`);
+    if (n.group.stockClass !== body.stockClass) throw new HttpError(400, 'VALIDATION', 'Item name does not match stock class');
+    if (n.method !== 'BOTH' && n.method !== body.method) throw new HttpError(400, 'VALIDATION', `Item "${n.name}" does not allow ${body.method}`);
+    if (body.method === 'TAG' && !r.tagNo && (!n.tagPrefix || !n.tagDigits)) throw new HttpError(400, 'VALIDATION', `Item "${n.name}" has no tag prefix/digits for auto-tagging`);
+  }
+  const touchByCode = new Map((await sdb.karatMapping.findMany({ select: { code: true, touch: true } })).map((k) => [k.code, Number(k.touch)]));
+  const lctx = { businessId: ctx.businessId!, branchIds: ctx.branchIds, userId: ctx.userId };
+
+  const createdIds = await prisma.$transaction(async (tx) => {
+    const entryNo = await nextEntryNo(tx, ctx.businessId!);
+    const ids: number[] = [];
+    for (const row of body.rows) {
+      const n = byId.get(row.itemNameId)!;
+      const r = resolveRow(row, n, touchByCode);
+      const tagNo = body.method === 'TAG' ? (row.tagNo ?? (await nextTagNo(tx, ctx.businessId!, n.tagPrefix!, n.tagDigits!))) : null;
+      const pcs = body.method === 'TAG' ? (row.pcs ?? 1) : row.pcs;
+      const item = await tx.stockItem.create({
+        data: {
+          businessId: ctx.businessId!, branchId, stockClass: body.stockClass, groupId: n.groupId, itemNameId: n.id, method: body.method,
+          tagNo, huid: row.huid ?? null, karatCode: r.karatCode, pcs, gross: row.gross, less: row.less, net: r.net, tunch: r.tunch, wastage: row.wastage,
+          fine: r.fine, stoneCharge: row.stoneCharge, labour: row.labour, labourUnit: row.labourUnit, other: row.other, rate: row.rate ?? null,
+          purchaseCost: r.purchaseCost, status: 'AVAILABLE', source: 'STOCK_INSERT', sourceId: String(entryNo), entryNo, remarks: row.remarks ?? null, createdById: ctx.userId,
+        },
+      });
+      await ledger.post(tx, lctx, [{
+        branchId, txnDate: body.txnDate, asset: ledger.assetForStockClass(body.stockClass), direction: 'IN', karatCode: r.karatCode, pcs, gross: row.gross,
+        net: r.net, fine: r.fine, amount: r.purchaseCost, source: 'STOCK_INSERT', sourceId: String(item.id), stockItemId: item.id, narration: `New stock entry #${entryNo}`,
+      }]);
+      ids.push(item.id);
+    }
+    return ids;
+  });
+
+  const items = await scopedDb(ctx).stockItem.findMany({ where: { id: { in: createdIds } }, include: { group: true, itemName: true } });
+  return { entryNo: items[0]?.entryNo ?? 0, items: await decorateStock(ctx, items) };
+}
+
+// ───────────── Stock list / get / by-tag / summary / groups ─────────────
+
+export async function listStock(ctx: TenantContext, query: any): Promise<Paged<StockItemDto>> {
+  const sdb = scopedDb(ctx);
+  const where: any = {
+    status: query.status,
+    ...(query.stockClass ? { stockClass: query.stockClass } : {}),
+    ...(query.method ? { method: query.method } : {}),
+    ...(query.groupId ? { groupId: query.groupId } : {}),
+    ...(query.itemNameId ? { itemNameId: query.itemNameId } : {}),
+    ...(query.karatCode ? { karatCode: query.karatCode } : {}),
+    ...(query.branchId ? { branchId: query.branchId } : {}),
+    ...(query.q ? { OR: [{ tagNo: { contains: query.q, mode: 'insensitive' } }, { huid: { contains: query.q, mode: 'insensitive' } }] } : {}),
+    ...(query.minWeight != null || query.maxWeight != null ? { net: { ...(query.minWeight != null ? { gte: query.minWeight } : {}), ...(query.maxWeight != null ? { lte: query.maxWeight } : {}) } } : {}),
+  };
+  const [rows, total] = await Promise.all([
+    sdb.stockItem.findMany({ where, include: { group: true, itemName: true }, skip: (query.page - 1) * query.pageSize, take: query.pageSize, orderBy: { id: 'desc' } }),
+    sdb.stockItem.count({ where }),
+  ]);
+  return { items: await decorateStock(ctx, rows), total, page: query.page, pageSize: query.pageSize };
+}
+
+export async function getStock(ctx: TenantContext, id: number): Promise<StockItemDto> {
+  const item = await scopedDb(ctx).stockItem.findUnique({ where: { id }, include: { group: true, itemName: true } });
+  if (!item) throw new HttpError(404, 'NOT_FOUND', 'Stock item not found');
+  return (await decorateStock(ctx, [item]))[0]!;
+}
+
+export async function getStockByTag(ctx: TenantContext, tagNo: string): Promise<StockItemDto> {
+  const branchFilter = ctx.activeBranchId != null ? { branchId: ctx.activeBranchId } : {};
+  const item = await scopedDb(ctx).stockItem.findFirst({ where: { tagNo: tagNo.toUpperCase(), status: 'AVAILABLE', ...branchFilter }, include: { group: true, itemName: true } });
+  if (!item) throw new HttpError(404, 'NOT_FOUND', 'Available item with that tag not found');
+  return (await decorateStock(ctx, [item]))[0]!;
+}
+
+export async function stockSummary(ctx: TenantContext): Promise<StockSummaryDto[]> {
+  const grouped = await scopedDb(ctx).stockItem.groupBy({ by: ['stockClass'], where: { status: 'AVAILABLE' }, _count: { _all: true }, _sum: { pcs: true, gross: true, net: true, fine: true, purchaseCost: true } });
+  return grouped.map((g) => ({ stockClass: g.stockClass, items: g._count._all, pcs: g._sum.pcs ?? 0, gross: num(g._sum.gross ?? 0), net: num(g._sum.net ?? 0), fine: num(g._sum.fine ?? 0), value: num(g._sum.purchaseCost ?? 0) }));
+}
+
+export async function stockGroups(ctx: TenantContext, query: any): Promise<GroupStockDto[]> {
+  const sdb = scopedDb(ctx);
+  const where: any = { status: 'AVAILABLE', ...(query.stockClass ? { stockClass: query.stockClass } : {}), ...(query.groupId ? { groupId: query.groupId } : {}) };
+  const grouped = await sdb.stockItem.groupBy({ by: ['groupId', 'karatCode'], where, _count: { _all: true }, _sum: { pcs: true, gross: true, net: true, fine: true, purchaseCost: true } });
+  const groups = await sdb.itemGroup.findMany({ where: { id: { in: [...new Set(grouped.map((g) => g.groupId))] } } });
+  const byId = new Map(groups.map((g) => [g.id, g]));
+  const hsn = await hsnCodeMap(groups.map((g) => g.hsnId));
+  return grouped.map((g) => {
+    const grp = byId.get(g.groupId);
+    return { groupId: g.groupId, groupName: grp?.name ?? '', hsnCode: grp?.hsnId != null ? (hsn.get(grp.hsnId)?.code ?? null) : null, karatCode: g.karatCode, items: g._count._all, pcs: g._sum.pcs ?? 0, gross: num(g._sum.gross ?? 0), net: num(g._sum.net ?? 0), fine: num(g._sum.fine ?? 0), value: num(g._sum.purchaseCost ?? 0) };
+  });
+}
+
+// ───────────── Stock edit / delete (with ledger reversal) ─────────────
+
+export async function updateStock(ctx: TenantContext, id: number, body: any): Promise<StockItemDto> {
+  const sdb = scopedDb(ctx);
+  const item = await sdb.stockItem.findUnique({ where: { id }, include: { itemName: true } });
+  if (!item) throw new HttpError(404, 'NOT_FOUND', 'Stock item not found');
+  if (item.status !== 'AVAILABLE') throw new HttpError(409, 'CONFLICT', 'Only AVAILABLE items can be edited');
+  const touchByCode = new Map((await sdb.karatMapping.findMany({ select: { code: true, touch: true } })).map((k) => [k.code, Number(k.touch)]));
+  const merged = { pcs: item.pcs, gross: numN(item.gross), less: numN(item.less), tunch: numN(item.tunch), wastage: numN(item.wastage), stoneCharge: numN(item.stoneCharge), labour: numN(item.labour), labourUnit: item.labourUnit, other: numN(item.other), rate: item.rate != null ? numN(item.rate) : undefined, purchaseCost: item.purchaseCost != null ? numN(item.purchaseCost) : undefined, karatCode: item.karatCode ?? undefined, huid: item.huid ?? undefined, remarks: item.remarks ?? undefined, ...body };
+  const r = resolveRow(merged, item.itemName, touchByCode);
+  const lctx = { businessId: ctx.businessId!, branchIds: ctx.branchIds, userId: ctx.userId };
+
+  await prisma.$transaction(async (tx) => {
+    await tx.stockItem.update({ where: { id }, data: { pcs: merged.pcs, gross: merged.gross, less: merged.less, tunch: r.tunch, wastage: merged.wastage, net: r.net, fine: r.fine, stoneCharge: merged.stoneCharge, labour: merged.labour, labourUnit: merged.labourUnit, other: merged.other, rate: merged.rate ?? null, purchaseCost: r.purchaseCost, karatCode: r.karatCode, huid: merged.huid ?? null, remarks: merged.remarks ?? null } });
+    await ledger.reverse(tx, lctx, { source: 'STOCK_INSERT', sourceId: String(id) });
+    await ledger.post(tx, lctx, [{ branchId: item.branchId, asset: ledger.assetForStockClass(item.stockClass), direction: 'IN', karatCode: r.karatCode, pcs: merged.pcs, gross: merged.gross, net: r.net, fine: r.fine, amount: r.purchaseCost, source: 'STOCK_INSERT', sourceId: String(id), stockItemId: id, narration: `Edit stock item #${id}` }]);
+  });
+  return getStock(ctx, id);
+}
+
+export async function deleteStock(ctx: TenantContext, id: number): Promise<void> {
+  const item = await scopedDb(ctx).stockItem.findUnique({ where: { id } });
+  if (!item) throw new HttpError(404, 'NOT_FOUND', 'Stock item not found');
+  const lctx = { businessId: ctx.businessId!, branchIds: ctx.branchIds, userId: ctx.userId };
+  await prisma.$transaction(async (tx) => {
+    await tx.stockItem.update({ where: { id }, data: { status: 'DELETED' } });
+    await ledger.reverse(tx, lctx, { source: 'STOCK_INSERT', sourceId: String(id) });
+  });
+}
+
+// ───────────── Shortage ─────────────
+
+export async function shortage(ctx: TenantContext, query: { stockClass?: StockClass; jewelleryTypeId?: number; status?: 'SHORTAGE' | 'WARNING' | 'OK'; q?: string }): Promise<ShortageRowDto[]> {
+  const sdb = scopedDb(ctx);
+  const groups = await sdb.itemGroup.findMany({
+    where: { isActive: true, ...(query.stockClass ? { stockClass: query.stockClass } : {}), ...(query.jewelleryTypeId ? { jewelleryTypeId: query.jewelleryTypeId } : {}), ...(query.q ? { name: { contains: query.q, mode: 'insensitive' } } : {}) },
+    include: { jewelleryType: true },
+  });
+  const totals = await sdb.stockItem.groupBy({ by: ['groupId'], where: { status: 'AVAILABLE' }, _sum: { net: true, pcs: true } });
+  const byGroup = new Map(totals.map((t) => [t.groupId, t]));
+  const rows: ShortageRowDto[] = [];
+  for (const g of groups) {
+    const t = byGroup.get(g.id);
+    const net = t?._sum.net != null ? Number(t._sum.net) : 0;
+    const pcs = t?._sum.pcs ?? 0;
+    const min = g.minWeight != null ? Number(g.minWeight) : null;
+    const status: ShortageRowDto['status'] = min != null && net < min ? 'SHORTAGE' : min != null && net < min * 1.2 ? 'WARNING' : 'OK';
+    if (query.status && status !== query.status) continue;
+    rows.push({ level: 'GROUP', id: g.id, name: g.name, stockClass: g.stockClass, jewelleryType: g.jewelleryType?.name ?? null, currentWeight: net.toFixed(3), currentPcs: pcs, minWeight: g.minWeight != null ? num(g.minWeight) : null, maxWeight: g.maxWeight != null ? num(g.maxWeight) : null, minPcs: g.minPcs, maxPcs: g.maxPcs, status });
+  }
+  return rows;
+}
+
+// ───────────── CSV import ─────────────
+
+const CSV_COLS = ['item_name', 'tag_no', 'huid', 'karat', 'pcs', 'gross', 'less', 'tunch', 'wastage', 'stone_charge', 'labour', 'labour_unit', 'other', 'rate', 'purchase_cost', 'remarks'];
+
+/** Minimal CSV parser: handles quoted fields + escaped quotes; no embedded newlines inside quotes. */
+function parseCsv(text: string): string[][] {
+  return text.replace(/\r/g, '').split('\n').filter((l) => l.trim() !== '').map((line) => {
+    const out: string[] = [];
+    let cur = '';
+    let q = false;
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      if (q) {
+        if (ch === '"' && line[i + 1] === '"') { cur += '"'; i++; } else if (ch === '"') q = false; else cur += ch;
+      } else if (ch === '"') q = true;
+      else if (ch === ',') { out.push(cur); cur = ''; } else cur += ch;
+    }
+    out.push(cur);
+    return out.map((c) => c.trim());
+  });
+}
+
+export async function importStock(ctx: TenantContext, csv: string, fields: { stockClass: StockClass; method: 'LOOSE' | 'TAG'; groupId: number; dryRun: boolean }): Promise<StockImportResultDto> {
+  const sdb = scopedDb(ctx);
+  const group = await sdb.itemGroup.findUnique({ where: { id: fields.groupId } });
+  if (!group) throw new HttpError(404, 'NOT_FOUND', 'Item group not found');
+
+  const table = parseCsv(csv);
+  const errors: StockImportResultDto['errors'] = [];
+  if (table.length === 0) throw new HttpError(400, 'VALIDATION', 'Empty CSV');
+  const header = table[0]!.map((h) => h.toLowerCase());
+  const dataRows = table.slice(1);
+  if (dataRows.length > 5000) throw new HttpError(400, 'VALIDATION', 'CSV exceeds 5000 rows');
+  const col = (r: string[], name: string) => { const idx = header.indexOf(name); return idx >= 0 ? (r[idx] ?? '') : ''; };
+
+  // Resolve item names in the group by name.
+  const names = await sdb.itemName.findMany({ where: { groupId: fields.groupId } });
+  const byName = new Map(names.map((n) => [n.name.toLowerCase(), n]));
+
+  const parsed: { itemNameId: number; tagNo?: string; huid?: string; karatCode?: string; pcs: number; gross: number; less: number; tunch?: number; wastage: number; stoneCharge: number; labour: number; labourUnit: 'PER_GRAM' | 'PERCENT' | 'FIXED'; other: number; rate?: number; purchaseCost?: number; remarks?: string }[] = [];
+  dataRows.forEach((r, i) => {
+    const rowNo = i + 2; // 1-based incl header
+    const itemName = byName.get(col(r, 'item_name').toLowerCase());
+    if (!itemName) { errors.push({ row: rowNo, field: 'item_name', message: `Unknown item name "${col(r, 'item_name')}"` }); return; }
+    const gross = Number(col(r, 'gross'));
+    if (!(gross > 0)) { errors.push({ row: rowNo, field: 'gross', message: 'gross must be > 0' }); return; }
+    const less = Number(col(r, 'less') || 0);
+    if (less > gross) { errors.push({ row: rowNo, field: 'less', message: 'less cannot exceed gross' }); return; }
+    const lu = (col(r, 'labour_unit') || 'PER_GRAM').toUpperCase();
+    if (!['PER_GRAM', 'PERCENT', 'FIXED'].includes(lu)) { errors.push({ row: rowNo, field: 'labour_unit', message: 'invalid labour_unit' }); return; }
+    parsed.push({
+      itemNameId: itemName.id, tagNo: col(r, 'tag_no') || undefined, huid: col(r, 'huid') || undefined, karatCode: col(r, 'karat') || undefined,
+      pcs: Number(col(r, 'pcs') || 1), gross, less, tunch: col(r, 'tunch') ? Number(col(r, 'tunch')) : undefined, wastage: Number(col(r, 'wastage') || 0),
+      stoneCharge: Number(col(r, 'stone_charge') || 0), labour: Number(col(r, 'labour') || 0), labourUnit: lu as 'PER_GRAM' | 'PERCENT' | 'FIXED', other: Number(col(r, 'other') || 0),
+      rate: col(r, 'rate') ? Number(col(r, 'rate')) : undefined, purchaseCost: col(r, 'purchase_cost') ? Number(col(r, 'purchase_cost')) : undefined, remarks: col(r, 'remarks') || undefined,
+    });
+  });
+
+  if (fields.dryRun || errors.length) {
+    return { dryRun: true, total: dataRows.length, valid: parsed.length, imported: 0, errors, entryNo: null };
+  }
+  const result = await createStockEntry(ctx, { stockClass: fields.stockClass, method: fields.method, rows: parsed });
+  return { dryRun: false, total: dataRows.length, valid: parsed.length, imported: result.items.length, errors, entryNo: result.entryNo };
+}
+
+export function sampleCsv(): string {
+  return [CSV_COLS.join(','), 'Gold Ring,,,,1,10.500,0.200,91.67,2,0,500,PER_GRAM,0,,52000,sample tag row', 'Gold Chain,,,22K,1,22.000,0,91.67,0,0,8,PERCENT,0,,,sample loose row'].join('\n');
+}
+/* eslint-enable @typescript-eslint/no-explicit-any */

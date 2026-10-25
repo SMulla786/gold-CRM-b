@@ -1,0 +1,61 @@
+import { access, rm } from 'node:fs/promises';
+import path from 'node:path';
+import { afterAll, beforeEach, describe, expect, it } from 'vitest';
+import { db, truncateAll } from '../../../test/helpers/db';
+import { createBusiness } from '../../../test/helpers/factory';
+import { savePartyImage } from './uploads';
+import type { TenantContext } from '../../middleware/context';
+
+const UPLOAD_ROOT = path.join(process.cwd(), 'uploads');
+const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3, 4]);
+const JPG = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 1, 2, 3, 4]);
+
+const ctxFor = (businessId: number): TenantContext => ({
+  userId: 1,
+  level: 'ADMIN',
+  isOwner: true,
+  businessId,
+  scopeBranchId: null,
+  branchIds: [],
+  activeBranchId: null,
+  readOnly: false,
+  modules: [],
+  limits: null,
+  permissions: {},
+  impersonatorId: null,
+});
+
+const exists = (rel: string) => access(path.join(UPLOAD_ROOT, rel)).then(() => true).catch(() => false);
+
+let cleanupBusinessIds: number[] = [];
+beforeEach(truncateAll);
+afterAll(async () => {
+  for (const id of cleanupBusinessIds) await rm(path.join(UPLOAD_ROOT, String(id)), { recursive: true, force: true }).catch(() => {});
+  await db.$disconnect();
+});
+
+describe('savePartyImage', () => {
+  it('rejects a non-image buffer -> 400', async () => {
+    const { business } = await createBusiness({ name: 'A' });
+    cleanupBusinessIds.push(business.id);
+    const party = await db.party.create({ data: { businessId: business.id, type: 'CUSTOMER', name: 'C', mobile: '9000000001' } });
+    await expect(savePartyImage(ctxFor(business.id), party.id, 'photoUrl', Buffer.from('not an image'))).rejects.toMatchObject({ status: 400 });
+  });
+
+  it('saves by magic bytes, stores the relative path, and deletes the old file on replace', async () => {
+    const { business } = await createBusiness({ name: 'A' });
+    cleanupBusinessIds.push(business.id);
+    const party = await db.party.create({ data: { businessId: business.id, type: 'CUSTOMER', name: 'C', mobile: '9000000002' } });
+    const ctx = ctxFor(business.id);
+
+    const rel1 = await savePartyImage(ctx, party.id, 'photoUrl', PNG);
+    expect(rel1).toMatch(new RegExp(`^${business.id}/parties/[0-9a-f-]+\\.png$`));
+    expect(await exists(rel1)).toBe(true);
+    expect((await db.party.findUniqueOrThrow({ where: { id: party.id } })).photoUrl).toBe(rel1);
+
+    const rel2 = await savePartyImage(ctx, party.id, 'photoUrl', JPG);
+    expect(rel2.endsWith('.jpg')).toBe(true);
+    expect(await exists(rel2)).toBe(true);
+    expect(await exists(rel1)).toBe(false); // old file removed on replace
+  });
+});

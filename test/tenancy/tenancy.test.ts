@@ -179,7 +179,19 @@ describe('(c) subscription read-only guard', () => {
     expect([200, 201]).toContain(res.status);
   });
 
-  it.todo('T-c4 module not in plan -> 403 MODULE_DISABLED (wire when TASK-14 lands: any /api/app route of a module absent from the plan)');
+  it('T-c4 module not in plan -> 403 MODULE_DISABLED', async () => {
+    const plan = await createPlan({ modules: [] }); // 'inventory' not granted
+    const { business, root } = await createBusiness({ name: 'NoInventory' });
+    await createSubscription({ businessId: business.id, planId: plan.id, modules: [] });
+    const owner = await createUser({ businessId: business.id, branchId: root.id, level: 'ADMIN', isOwner: true });
+    const { token } = await loginAs(owner.username);
+    const res = await api
+      .get('/api/app/stock')
+      .set('Authorization', bearer(token!))
+      .set('X-Branch-Id', String(root.id));
+    expect(res.status).toBe(403);
+    expect(res.body.error.code).toBe('MODULE_DISABLED');
+  });
 });
 
 describe('(d) plan-limit guards', () => {

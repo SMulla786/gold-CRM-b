@@ -1,4 +1,6 @@
+import path from 'node:path';
 import { Router } from 'express';
+import multer from 'multer';
 import { assertMpin, requireMpin, requirePermission } from '../../middleware/guards';
 import {
   HEADERS,
@@ -20,11 +22,16 @@ import {
 import type { Metal } from '../../shared';
 import { HttpError } from '../../middleware/error';
 import * as svc from './service';
+import { partyImagePath, savePartyImage } from './uploads';
+import type { PartyImageField } from './uploads';
+import { inventoryRouter } from './inventory.routes';
 
 export const appRouter = Router();
+appRouter.use(inventoryRouter);
 
 const PARTIES = 'settings.parties';
 const MISC = 'settings.misc';
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 2 * 1024 * 1024 } });
 
 // ───────────── Parties ─────────────
 appRouter.get('/parties', requirePermission(PARTIES, 'view'), async (req, res) => res.json(await svc.listParties(req.ctx!, partyListQuery.parse(req.query))));
@@ -40,10 +47,17 @@ appRouter.delete('/parties/:id', requirePermission(PARTIES, 'delete'), async (re
   await svc.deleteParty(req.ctx!, idSchema.parse(req.params.id));
   res.status(204).end();
 });
-for (const p of ['/parties/:id/photo', '/parties/:id/shop-logo']) {
-  appRouter.post(p, requirePermission(PARTIES, 'edit'), (_req, res) => {
-    // shortcut: file upload needs multer (dependency add = lead's package.json); stubbed until then.
-    res.status(501).json({ error: { code: 'INTERNAL', message: 'File upload not yet enabled (needs multer)' } });
+const FIELD: Record<'photo' | 'shop-logo', PartyImageField> = { photo: 'photoUrl', 'shop-logo': 'shopLogoUrl' };
+const CONTENT_TYPE: Record<string, string> = { '.jpg': 'image/jpeg', '.png': 'image/png', '.webp': 'image/webp' };
+for (const kind of ['photo', 'shop-logo'] as const) {
+  appRouter.post(`/parties/:id/${kind}`, requirePermission(PARTIES, 'edit'), upload.single('file'), async (req, res) => {
+    if (!req.file) throw new HttpError(400, 'VALIDATION', 'No file uploaded (field "file")');
+    const rel = await savePartyImage(req.ctx!, idSchema.parse(req.params.id), FIELD[kind], req.file.buffer);
+    res.status(201).json({ url: `/api/app/files/parties/${idSchema.parse(req.params.id)}/${kind}`, path: rel });
+  });
+  appRouter.get(`/files/parties/:id/${kind}`, requirePermission(PARTIES, 'view'), async (req, res) => {
+    const abs = await partyImagePath(req.ctx!, idSchema.parse(req.params.id), FIELD[kind]);
+    res.type(CONTENT_TYPE[path.extname(abs)] ?? 'application/octet-stream').sendFile(abs);
   });
 }
 

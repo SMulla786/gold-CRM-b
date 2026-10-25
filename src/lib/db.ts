@@ -36,6 +36,13 @@ const TENANT_MODELS: Record<string, Scope> = {
   MetalRate: 'business',
   RateLimit: 'business',
   BusinessHsn: 'business',
+  // Phase 2 inventory + ledger:
+  ItemGroup: 'business',
+  ItemName: 'business',
+  StockItem: 'branch',
+  LedgerEntry: 'branch',
+  // JewelleryType omitted (nullable businessId: global + custom) — scoped in its service like Role.
+  // TagSequence omitted — incremented via a raw locked UPDATE inside the stock-entry tx with explicit businessId.
 };
 
 const UNIQUE_WHERE_OPS = new Set(['findUnique', 'findUniqueOrThrow', 'update', 'delete']);
