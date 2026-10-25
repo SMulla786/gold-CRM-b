@@ -175,6 +175,8 @@ export interface BillListItemDto {
   party: PartyRefDto;
   branch: { id: number; name: string };
   itemCount: number;
+  /** TASK-83: e.g. "2× Ring, 1× Chain" — filled by the pending-bills list only */
+  itemsSummary?: string;
   final: string;
   paid: string;
   /** final − paid (negative = advance) */

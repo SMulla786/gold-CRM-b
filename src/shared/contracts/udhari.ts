@@ -3,6 +3,7 @@
  * Sign convention everywhere: + = party owes the shop, − = shop owes the party.
  */
 import { z } from 'zod';
+import { LEDGER_SOURCES } from '../enums';
 import { id, pageQuery } from './common';
 import { decimalInput, METALS, PARTY_TYPES } from './masters';
 import type { PartyRefDto } from './masters';
@@ -83,7 +84,8 @@ export interface UdharTxnDto {
 /** Udhar List (transaction-wise across sources, from UdharEntry grouped by source+sourceId). */
 export const udharEntryListQuery = pageQuery.extend({
   partyId: id.optional(),
-  source: z.enum(['UDHAR', 'BHAV_CUT', 'SELL_BILL', 'PURCHASE_BILL']).optional(),
+  /** TASK-83: any ledger source an UdharEntry can carry (order receive, karigar, scheme, girvi, …) */
+  source: z.enum(LEDGER_SOURCES).optional(),
   from: z.coerce.date().optional(),
   to: z.coerce.date().optional(),
 });
@@ -107,10 +109,19 @@ export const udharLedgerQuery = pageQuery.extend({
   type: z.enum(PARTY_TYPES).optional(),
   /** hide parties whose three balances are all zero */
   nonZero: z.enum(['true', 'false']).default('true'),
+  /** TASK-83: period for the Old/In/Out/Final columns */
+  from: z.coerce.date().optional(),
+  to: z.coerce.date().optional(),
 });
 export interface PartyBalanceRowDto extends BalanceDto {
   party: PartyRefDto;
   lastTxnDate: string | null;
+  /** TASK-83 columnar view per unit: old = Σ before `from`, in = Σ positive, out = Σ |negative|
+   *  in the period, final = old + in − out. The inherited amount/gold/silver stay the all-time current balance. */
+  old?: BalanceDto;
+  in?: BalanceDto;
+  out?: BalanceDto;
+  final?: BalanceDto;
 }
 
 /** Party statement: opening + rows in range with running balance per unit. */
