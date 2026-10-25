@@ -12,6 +12,7 @@ const DAYBOOK_PERM: Record<LedgerAsset, string> = { MONEY: 'daybook.money', GOLD
 
 // ───────────── Income / Expense ─────────────
 accountsRouter.post('/income-expense', requirePermission(IE_ENTRY, 'edit'), async (req, res) => res.status(201).json(await acc.createIncomeExpense(req.ctx!, incomeExpenseBody.parse(req.body))));
+accountsRouter.get('/income-expense/summary', requirePermission(IE_LIST, 'view'), async (req, res) => res.json(await acc.incomeExpenseDailySummary(req.ctx!, incomeExpenseListQuery.parse(req.query))));
 accountsRouter.get('/income-expense', requirePermission(IE_LIST, 'view'), async (req, res) => res.json(await acc.listIncomeExpense(req.ctx!, incomeExpenseListQuery.parse(req.query))));
 accountsRouter.patch('/income-expense/:id', requirePermission(IE_ENTRY, 'edit'), requireMpin, async (req, res) => res.json(await acc.updateIncomeExpense(req.ctx!, idSchema.parse(req.params.id), incomeExpenseBody.parse(req.body))));
 accountsRouter.delete('/income-expense/:id', requirePermission(IE_ENTRY, 'delete'), requireMpin, async (req, res) => {

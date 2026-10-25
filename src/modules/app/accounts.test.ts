@@ -2,6 +2,7 @@ import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { db, truncateAll } from '../../../test/helpers/db';
 import { createBusiness } from '../../../test/helpers/factory';
 import * as acc from './accounts';
+import * as ledger from '../../lib/ledger';
 import type { TenantContext } from '../../middleware/context';
 
 const ctxFor = (businessId: number, branchId: number): TenantContext => ({
@@ -94,5 +95,46 @@ describe('income/expense + asset ledgers', () => {
     expect(money.items.some((r) => r.isReversal)).toBe(true); // the old 50 row was reversed
     expect(money.items.some((r) => r.reversed)).toBe(true);
     expect(Number(money.items.at(-1)!.balance)).toBe(777); // net balance after reverse + repost
+  });
+});
+
+describe('TASK-81 income/expense daily summary + sourceType', () => {
+  const autoRow = (businessId: number, branchId: number, over: Record<string, unknown>) =>
+    db.ledgerEntry.create({ data: { businessId, branchId, txnDate: ledger.businessDate(), asset: 'MONEY', direction: 'IN', amount: 0, source: 'SELL_BILL', sourceId: '42', createdById: 1, ...over } });
+
+  it('daily summary rolls up cash in/out, profit (money IN−OUT) and metal net for the day', async () => {
+    const s = await setup();
+    await acc.createIncomeExpense(s.ctx, ie({ cash: 1000, gold: 2 }));
+    await acc.createIncomeExpense(s.ctx, ie({ type: 'EXPENSE', cash: 300, reason: 'Tea' }));
+    const summary = await acc.incomeExpenseDailySummary(s.ctx, {});
+    expect(summary).toHaveLength(1);
+    expect(Number(summary[0]!.cashIn)).toBe(1000);
+    expect(Number(summary[0]!.cashOut)).toBe(300);
+    expect(Number(summary[0]!.profit)).toBe(700);
+    expect(Number(summary[0]!.goldNet)).toBe(2);
+  });
+
+  it('sourceType: DIRECT lists manual entries; an auto source lists per-document aggregates', async () => {
+    const s = await setup();
+    await acc.createIncomeExpense(s.ctx, ie({ cash: 1000, reason: 'Manual' }));
+    await autoRow(s.business.id, s.root.id, { amount: 5000, sourceId: '42' }); // a sale bill posting money IN
+
+    const direct = await acc.listIncomeExpense(s.ctx, { page: 1, pageSize: 20 }); // default DIRECT
+    expect(direct.total).toBe(1);
+    expect(direct.items[0]!.reason).toBe('Manual');
+
+    const sales = await acc.listIncomeExpense(s.ctx, { page: 1, pageSize: 20, sourceType: 'SELL_BILL' });
+    expect(sales.total).toBe(1);
+    expect(sales.items[0]!.id).toBe(42);
+    expect(sales.items[0]!.type).toBe('INCOME');
+    expect(Number(sales.items[0]!.cash)).toBe(5000);
+  });
+
+  it('summary filtered by sourceType counts only that source', async () => {
+    const s = await setup();
+    await acc.createIncomeExpense(s.ctx, ie({ cash: 1000 })); // INCOME_EXPENSE = DIRECT
+    await autoRow(s.business.id, s.root.id, { amount: 5000, sourceId: '42' }); // SELL_BILL
+    expect(Number((await acc.incomeExpenseDailySummary(s.ctx, { sourceType: 'SELL_BILL' }))[0]!.profit)).toBe(5000);
+    expect(Number((await acc.incomeExpenseDailySummary(s.ctx, { sourceType: 'DIRECT' }))[0]!.profit)).toBe(1000);
   });
 });

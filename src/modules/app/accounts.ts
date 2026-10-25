@@ -5,8 +5,18 @@ import * as ledger from '../../lib/ledger';
 import { logActivity } from '../../lib/activity';
 import { HttpError } from '../../middleware/error';
 import type { TenantContext } from '../../middleware/context';
-import { LEDGER_ASSETS } from '../../shared';
-import type { AssetTotalsDto, DayBookDto, IncomeExpenseDto, LedgerAsset, LedgerPageDto, LedgerRowDto, LedgerSource, Paged } from '../../shared';
+import { IE_SOURCE_TYPES, LEDGER_ASSETS } from '../../shared';
+import type { AssetTotalsDto, DayBookDto, IncomeExpenseDailySummaryDto, IncomeExpenseDto, LedgerAsset, LedgerPageDto, LedgerRowDto, LedgerSource, Paged } from '../../shared';
+
+type IeSourceType = (typeof IE_SOURCE_TYPES)[number];
+// TASK-81: which ledger sources each IE source-type surfaces. DIRECT = manual income/expense rows.
+const IE_SOURCE_MAP: Record<IeSourceType, LedgerSource[]> = {
+  DIRECT: ['INCOME_EXPENSE'],
+  SELL_BILL: ['SELL_BILL', 'ORDER_SELL_BILL', 'SELL_BILL_STOCK_RETURN'],
+  PURCHASE_BILL: ['PURCHASE_BILL', 'ORDER_PURCHASE_BILL', 'PURCHASE_BILL_STOCK_RETURN'],
+  GIRVI: ['GIRVI'],
+  UDHAR: ['UDHAR'],
+};
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
@@ -88,7 +98,11 @@ export async function createIncomeExpense(ctx: TenantContext, body: IeBody): Pro
   return (await decorateIE(ctx, [header]))[0]!;
 }
 
-export async function listIncomeExpense(ctx: TenantContext, query: { page: number; pageSize: number; type?: 'INCOME' | 'EXPENSE'; from?: Date; to?: Date }): Promise<Paged<IncomeExpenseDto>> {
+type IeListQuery = { page: number; pageSize: number; type?: 'INCOME' | 'EXPENSE'; from?: Date; to?: Date; sourceType?: IeSourceType };
+
+export async function listIncomeExpense(ctx: TenantContext, query: IeListQuery): Promise<Paged<IncomeExpenseDto>> {
+  const sourceType = query.sourceType ?? 'DIRECT';
+  if (sourceType !== 'DIRECT') return autoEntryList(ctx, sourceType, query); // cross-module auto-entries, aggregated per document
   const sdb = scopedDb(ctx);
   const where: any = { isDeleted: false, branchId: { in: branchFilter(ctx) }, ...(query.type ? { type: query.type } : {}), ...dateWhere(query.from, query.to) };
   const [rows, total] = await Promise.all([
@@ -96,6 +110,65 @@ export async function listIncomeExpense(ctx: TenantContext, query: { page: numbe
     sdb.incomeExpense.count({ where }),
   ]);
   return { items: await decorateIE(ctx, rows), total, page: query.page, pageSize: query.pageSize };
+}
+
+const toDec = (x: Prisma.Decimal | null): Prisma.Decimal => new Prisma.Decimal(x ?? 0);
+const IE_SOURCE_LABEL: Record<Exclude<IeSourceType, 'DIRECT'>, string> = { SELL_BILL: 'Sale', PURCHASE_BILL: 'Purchase', GIRVI: 'Girvi', UDHAR: 'Udhar' };
+
+/** TASK-81: auto-entries from another module, one IncomeExpenseDto per source document (money net in `cash`, metals in gold/silver).
+ *  shortcut: aggregates + paginates in memory — fine at pilot scale; move to a SQL rollup if a shop's ledger grows large. */
+async function autoEntryList(ctx: TenantContext, sourceType: Exclude<IeSourceType, 'DIRECT'>, query: IeListQuery): Promise<Paged<IncomeExpenseDto>> {
+  const base = { branchId: { in: branchFilter(ctx) }, source: { in: IE_SOURCE_MAP[sourceType] }, reversalOfId: null, ...dateWhere(query.from, query.to) };
+  const rows = await scopedDb(ctx).ledgerEntry.groupBy({ by: ['sourceId', 'txnDate', 'asset', 'direction'], where: base, _sum: { amount: true, fine: true } });
+  const docs = new Map<string, { sourceId: string; txnDate: Date; moneyIn: Prisma.Decimal; moneyOut: Prisma.Decimal; gold: Prisma.Decimal; silver: Prisma.Decimal }>();
+  for (const r of rows) {
+    const d = docs.get(r.sourceId) ?? { sourceId: r.sourceId, txnDate: r.txnDate, moneyIn: toDec(null), moneyOut: toDec(null), gold: toDec(null), silver: toDec(null) };
+    if (r.asset === 'MONEY') { if (r.direction === 'IN') d.moneyIn = d.moneyIn.plus(toDec(r._sum.amount)); else d.moneyOut = d.moneyOut.plus(toDec(r._sum.amount)); }
+    else if (r.asset === 'GOLD') d.gold = d.gold.plus(r.direction === 'IN' ? toDec(r._sum.fine) : toDec(r._sum.fine).neg());
+    else if (r.asset === 'SILVER') d.silver = d.silver.plus(r.direction === 'IN' ? toDec(r._sum.fine) : toDec(r._sum.fine).neg());
+    docs.set(r.sourceId, d);
+  }
+  let list = [...docs.values()].map((d) => ({ d, net: d.moneyIn.minus(d.moneyOut) }));
+  if (query.type) list = list.filter(({ net }) => (query.type === 'INCOME' ? net.gte(0) : net.lt(0)));
+  list.sort((a, b) => b.d.txnDate.getTime() - a.d.txnDate.getTime() || Number(b.d.sourceId) - Number(a.d.sourceId));
+  const total = list.length;
+  const items: IncomeExpenseDto[] = list.slice((query.page - 1) * query.pageSize, query.page * query.pageSize).map(({ d, net }) => ({
+    id: Number(d.sourceId),
+    txnDate: dateOnly(d.txnDate),
+    type: net.gte(0) ? 'INCOME' : 'EXPENSE',
+    reason: `${IE_SOURCE_LABEL[sourceType]} #${d.sourceId}`,
+    cash: net.abs().toString(),
+    online: '0',
+    bankAccount: null,
+    gold: d.gold.toString(),
+    silver: d.silver.toString(),
+    remark: null,
+    createdBy: null,
+    createdAt: dateOnly(d.txnDate),
+  }));
+  return { items, total, page: query.page, pageSize: query.pageSize };
+}
+
+/** TASK-81: per-day Cash In/Out, Profit (money IN−OUT) and Gold/Silver net, across all sources or one sourceType. */
+export async function incomeExpenseDailySummary(ctx: TenantContext, query: { from?: Date; to?: Date; sourceType?: IeSourceType }): Promise<IncomeExpenseDailySummaryDto[]> {
+  const from = ledger.businessDate(query.from ?? new Date());
+  const to = ledger.businessDate(query.to ?? new Date());
+  const sdb = scopedDb(ctx);
+  const base: any = { branchId: { in: branchFilter(ctx) }, reversalOfId: null, txnDate: { gte: from, lte: to }, ...(query.sourceType ? { source: { in: IE_SOURCE_MAP[query.sourceType] } } : {}) };
+  const [money, cash, metal] = await Promise.all([
+    sdb.ledgerEntry.groupBy({ by: ['txnDate', 'direction'], where: { ...base, asset: 'MONEY' }, _sum: { amount: true } }),
+    sdb.ledgerEntry.groupBy({ by: ['txnDate', 'direction'], where: { ...base, asset: 'MONEY', bankAccountId: null }, _sum: { amount: true } }),
+    sdb.ledgerEntry.groupBy({ by: ['txnDate', 'asset', 'direction'], where: { ...base, asset: { in: ['GOLD', 'SILVER'] } }, _sum: { fine: true } }),
+  ]);
+  type Day = { cashIn: Prisma.Decimal; cashOut: Prisma.Decimal; moneyIn: Prisma.Decimal; moneyOut: Prisma.Decimal; gold: Prisma.Decimal; silver: Prisma.Decimal };
+  const days = new Map<string, Day>();
+  const day = (d: Date): Day => { const k = dateOnly(d); let e = days.get(k); if (!e) { e = { cashIn: toDec(null), cashOut: toDec(null), moneyIn: toDec(null), moneyOut: toDec(null), gold: toDec(null), silver: toDec(null) }; days.set(k, e); } return e; };
+  for (const r of money) { const e = day(r.txnDate); if (r.direction === 'IN') e.moneyIn = e.moneyIn.plus(toDec(r._sum.amount)); else e.moneyOut = e.moneyOut.plus(toDec(r._sum.amount)); }
+  for (const r of cash) { const e = day(r.txnDate); if (r.direction === 'IN') e.cashIn = e.cashIn.plus(toDec(r._sum.amount)); else e.cashOut = e.cashOut.plus(toDec(r._sum.amount)); }
+  for (const r of metal) { const e = day(r.txnDate); const net = r.direction === 'IN' ? toDec(r._sum.fine) : toDec(r._sum.fine).neg(); if (r.asset === 'GOLD') e.gold = e.gold.plus(net); else e.silver = e.silver.plus(net); }
+  return [...days.entries()]
+    .sort(([a], [b]) => (a < b ? 1 : -1))
+    .map(([date, e]) => ({ date, cashIn: e.cashIn.toString(), cashOut: e.cashOut.toString(), profit: e.moneyIn.minus(e.moneyOut).toString(), goldNet: e.gold.toString(), silverNet: e.silver.toString() }));
 }
 
 export async function updateIncomeExpense(ctx: TenantContext, id: number, body: IeBody): Promise<IncomeExpenseDto> {
@@ -297,7 +370,14 @@ export async function getDayBook(ctx: TenantContext, query: { from?: Date; to?: 
   }
   const bySource = [...bySourceMap.values()].map((e) => ({ source: e.source as LedgerSource, asset: e.asset, in: e.in.toString(), out: e.out.toString() }));
 
-  return { from: dateOnly(from), to: dateOnly(to), totals, bySource };
+  // TASK-80: single-day requests carry the branch-day status (OPEN when no row yet); ranges / all-branches = null.
+  let status: 'OPEN' | 'CLOSED' | null = null;
+  if (from.getTime() === to.getTime() && ctx.activeBranchId != null) {
+    const row = await scopedDb(ctx).dayBook.findUnique({ where: { businessId_branchId_date: { businessId: ctx.businessId!, branchId: ctx.activeBranchId, date: from } } });
+    status = row?.status ?? 'OPEN';
+  }
+
+  return { from: dateOnly(from), to: dateOnly(to), totals, bySource, status };
 }
 
 // ───────────── helpers ─────────────
