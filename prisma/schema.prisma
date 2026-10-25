@@ -1847,3 +1847,32 @@ model SchemePayment {
   @@unique([enrollmentId, emiNo])
   @@index([enrollmentId])
 }
+
+// ═════════════ TASK-87 — permission enquiries (staff ask for access, a manager decides) ═════════════
+
+enum EnquiryStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+/// A staff request for view/edit/delete on one page permission. Reviewers see only requesters inside their
+/// branch subtree; one PENDING per (user, permission) is enforced in the service under an advisory lock.
+model PermissionEnquiry {
+  id           Int           @id @default(autoincrement())
+  businessId   Int
+  userId       Int
+  permissionId Int
+  wantView     Boolean       @default(false)
+  wantEdit     Boolean       @default(false)
+  wantDelete   Boolean       @default(false)
+  reason       String?
+  status       EnquiryStatus @default(PENDING)
+  decidedById  Int?
+  decidedAt    DateTime?
+  decisionNote String?
+  createdAt    DateTime      @default(now())
+
+  @@index([businessId, status])
+  @@index([userId, permissionId, status])
+}

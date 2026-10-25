@@ -185,3 +185,38 @@ export interface AdminOverviewDto {
   /** business-level current rates */
   rates: CurrentRatesDto;
 }
+
+// ── TASK-87: permission enquiries ───────────────────────────────────────────────────────────
+export const ENQUIRY_STATUS = ['PENDING', 'APPROVED', 'REJECTED'] as const;
+
+/** POST /app/permission-enquiries — any signed-in store user. */
+export const permissionEnquiryBody = z
+  .object({
+    permissionKey: z.enum(PAGE_KEYS as [string, ...string[]]),
+    view: z.boolean().default(false),
+    edit: z.boolean().default(false),
+    delete: z.boolean().default(false),
+    reason: z.string().trim().max(300).optional(),
+  })
+  .refine((b) => b.view || b.edit || b.delete, { message: 'Ask for at least one of view, edit or delete' });
+
+/** POST /admin/permission-enquiries/:id/reject */
+export const enquiryRejectBody = z.object({ note: z.string().trim().max(300).optional() });
+
+export const enquiryListQuery = pageQuery.extend({ status: z.enum(ENQUIRY_STATUS).optional() });
+
+export interface PermissionEnquiryDto {
+  id: number;
+  user: { id: number; name: string };
+  permissionKey: string;
+  permissionLabel: string;
+  view: boolean;
+  edit: boolean;
+  delete: boolean;
+  reason: string | null;
+  status: (typeof ENQUIRY_STATUS)[number];
+  decidedBy: string | null;
+  decidedAt: string | null;
+  decisionNote: string | null;
+  createdAt: string;
+}
