@@ -68,13 +68,16 @@ export async function updateRepairStatus(ctx: TenantContext, id: number, body: {
   if (!t) throw new HttpError(404, 'NOT_FOUND', 'Repair ticket not found');
   if (t.status === 'DELIVERED' || t.status === 'CANCELLED') throw new HttpError(409, 'CONFLICT', `A ${t.status.toLowerCase()} ticket cannot change status`);
   if (body.status === 'CANCELLED') {
-    await sdb.repairTicket.update({ where: { id }, data: { status: 'CANCELLED', ...(body.karigarId != null ? { karigarId: body.karigarId } : {}) } });
+    // guard on the current status so a concurrent move can't flip it out from under us
+    const c = await sdb.repairTicket.updateMany({ where: { id, status: t.status }, data: { status: 'CANCELLED', ...(body.karigarId != null ? { karigarId: body.karigarId } : {}) } });
+    if (c.count !== 1) throw new HttpError(409, 'CONFLICT', 'Ticket status just changed');
     return getRepair(ctx, id);
   }
   // forward only
   if (FLOW.indexOf(body.status) <= FLOW.indexOf(t.status as any)) throw new HttpError(409, 'CONFLICT', `Cannot move a ${t.status} ticket to ${body.status}`);
   if (body.status === 'READY' && (body.finalWeight == null || !body.remarks)) throw new HttpError(400, 'VALIDATION', 'Final weight and remarks are required to mark READY');
-  await sdb.repairTicket.update({ where: { id }, data: { status: body.status, ...(body.karigarId != null ? { karigarId: body.karigarId } : {}), ...(body.finalWeight != null ? { finalWeight: body.finalWeight } : {}), ...(body.remarks ? { remarks: body.remarks } : {}) } });
+  const c = await sdb.repairTicket.updateMany({ where: { id, status: t.status }, data: { status: body.status, ...(body.karigarId != null ? { karigarId: body.karigarId } : {}), ...(body.finalWeight != null ? { finalWeight: body.finalWeight } : {}), ...(body.remarks ? { remarks: body.remarks } : {}) } });
+  if (c.count !== 1) throw new HttpError(409, 'CONFLICT', 'Ticket status just changed');
   return getRepair(ctx, id);
 }
 
@@ -97,13 +100,15 @@ export async function deliverRepair(ctx: TenantContext, id: number, body: Delive
   const lctx = lctxOf(ctx);
 
   await prisma.$transaction(async (tx) => {
+    // claim the ticket atomically on its READY status BEFORE posting — a ticket can't be delivered twice (BUG-10)
+    const claim = await tx.repairTicket.updateMany({ where: { id, status: 'READY' }, data: { status: 'DELIVERED', addedMetal: body.addedMetal ?? null, addedFine: body.addedFine || null, addedRate: body.addedRate || null, deliveryCash: body.cash, deliveryOnline: body.online, deliveryBankId: body.bankAccountId ?? null, deliveredAt: new Date(), ...(body.remarks ? { remarks: body.remarks } : {}) } });
+    if (claim.count !== 1) throw new HttpError(409, 'CONFLICT', 'Ticket was just delivered');
     const rows: ledger.LedgerEntryInput[] = [];
     if (body.cash > 0) rows.push({ branchId, txnDate, asset: 'MONEY', direction: 'IN', amount: body.cash, source: 'REPAIR', sourceId: String(id), narration: 'Repair delivery (cash)' });
     if (body.online > 0) rows.push({ branchId, txnDate, asset: 'MONEY', direction: 'IN', bankAccountId: body.bankAccountId ?? null, amount: body.online, source: 'REPAIR', sourceId: String(id), narration: 'Repair delivery (online)' });
     if (body.addedFine > 0 && body.addedMetal) rows.push({ branchId, txnDate, asset: body.addedMetal, direction: 'OUT', metalForm: 'USUAL', gross: body.addedFine, net: body.addedFine, fine: body.addedFine, amount: addedValue, source: 'REPAIR', sourceId: String(id), narration: 'Repair solder (shop metal)' });
     if (rows.length) await ledger.post(tx, lctx, rows);
     if (!balance.isZero()) await udhar.post(tx, lctx, [{ branchId, partyId: t.partyId, txnDate, amount: balance, source: 'REPAIR', sourceId: String(id), narration: `Repair #${t.ticketNo} balance` }]);
-    await tx.repairTicket.update({ where: { id }, data: { status: 'DELIVERED', addedMetal: body.addedMetal ?? null, addedFine: body.addedFine || null, addedRate: body.addedRate || null, deliveryCash: body.cash, deliveryOnline: body.online, deliveryBankId: body.bankAccountId ?? null, deliveredAt: new Date(), ...(body.remarks ? { remarks: body.remarks } : {}) } });
     await logActivity(tx, ctx, { module: 'REPAIR', action: 'EDITED', entity: 'RepairTicket', entityId: String(id), summary: `Repair ticket #${t.ticketNo} delivered` });
   });
   return getRepair(ctx, id);

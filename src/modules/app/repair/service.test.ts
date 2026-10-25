@@ -72,6 +72,20 @@ describe('repair', () => {
     await expect(repair.deliverRepair(s.ctx, t.id, { addedFine: 0, addedRate: 0, cash: 0, online: 0 } as any)).rejects.toMatchObject({ status: 409 });
   });
 
+  it('two concurrent deliveries → one wins, one 409, money posted once (BUG-10)', async () => {
+    const s = await setup();
+    const t = await repair.createRepair(s.ctx, base({ partyId: s.customer.id, labourCharge: 1000, otherCharge: 0, advanceCash: 0 }) as any);
+    await repair.updateRepairStatus(s.ctx, t.id, { status: 'IN_PROGRESS' });
+    await repair.updateRepairStatus(s.ctx, t.id, { status: 'IN_REVIEW' });
+    await repair.updateRepairStatus(s.ctx, t.id, { status: 'READY', finalWeight: 12, remarks: 'ok' });
+    const del = () => repair.deliverRepair(s.ctx, t.id, { addedFine: 0, addedRate: 0, cash: 1000, online: 0 } as any);
+    const results = await Promise.allSettled([del(), del()]);
+    expect(results.filter((r) => r.status === 'fulfilled')).toHaveLength(1);
+    expect(results.filter((r) => r.status === 'rejected' && (r.reason as any).status === 409)).toHaveLength(1);
+    const moneyIn = await db.ledgerEntry.findMany({ where: { source: 'REPAIR', asset: 'MONEY', direction: 'IN' } });
+    expect(moneyIn.reduce((a, r) => a + Number(r.amount), 0)).toBe(1000); // delivery charged once, not twice
+  });
+
   it('cross-tenant party → 404', async () => {
     const s = await setup();
     const other = await createBusiness({ name: 'B' });

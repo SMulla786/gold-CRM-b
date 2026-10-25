@@ -146,8 +146,10 @@ export async function cancelOrder(ctx: TenantContext, id: number): Promise<void>
   if (order.status !== 'PENDING' && order.status !== 'IN_PROCESS') throw new HttpError(409, 'CONFLICT', `A ${order.status.toLowerCase()} order cannot be cancelled`);
   if (order.items.some((it) => it.status === 'ASSIGNED')) throw new HttpError(409, 'CONFLICT', 'Receive or close the open karigar issue before cancelling');
   await prisma.$transaction(async (tx) => {
-    await tx.order.update({ where: { id }, data: { status: 'CANCELLED' } }); // advances stay as the party's credit (refund = a normal udhar entry)
-    await logActivity(tx, ctx, { module: 'ORDER', action: 'DELETED', entity: 'Order', entityId: String(id), summary: `Order #${order.orderNo} cancelled` });
+    // guard on the current cancellable status so two concurrent cancels can't both run
+    const claim = await tx.order.updateMany({ where: { id, status: { in: ['PENDING', 'IN_PROCESS'] } }, data: { status: 'CANCELLED' } });
+    if (claim.count !== 1) throw new HttpError(409, 'CONFLICT', 'Order is no longer cancellable');
+    await logActivity(tx, ctx, { module: 'ORDER', action: 'DELETED', entity: 'Order', entityId: String(id), summary: `Order #${order.orderNo} cancelled` }); // advances stay as the party's credit
   });
 }
 
@@ -189,7 +191,9 @@ export async function createKarigarIssue(ctx: TenantContext, body: KarigarIssueB
   const issueId = await prisma.$transaction(async (tx) => {
     const issueNo = await nextNo(tx, ctx.businessId!, branchId, 'KARIGAR_ISSUE');
     const issue = await tx.karigarIssue.create({ data: { businessId: ctx.businessId!, branchId, issueNo, karigarId: body.karigarId, issueDate, dueDate: body.dueDate ? ledger.businessDate(body.dueDate) : null, goldFine: body.goldFine, silverFine: body.silverFine, cash: body.cash, online: body.online, bankAccountId: body.bankAccountId ?? null, remark: body.remark ?? null, status: 'OPEN', createdById: ctx.userId } });
-    await tx.orderItem.updateMany({ where: { id: { in: body.orderItemIds } }, data: { status: 'ASSIGNED', karigarIssueId: issue.id } });
+    // claim the items atomically on their PENDING status — a concurrent issue can't grab the same item twice
+    const claim = await tx.orderItem.updateMany({ where: { id: { in: body.orderItemIds }, status: 'PENDING' }, data: { status: 'ASSIGNED', karigarIssueId: issue.id } });
+    if (claim.count !== new Set(body.orderItemIds).size) throw new HttpError(409, 'CONFLICT', 'Some items were just assigned to another issue');
     await tx.order.updateMany({ where: { id: { in: [...new Set(items.map((i) => i.orderId))] }, status: 'PENDING' }, data: { status: 'IN_PROCESS' } });
 
     const ledRows: ledger.LedgerEntryInput[] = [];
@@ -229,6 +233,10 @@ export async function receiveKarigar(ctx: TenantContext, issueId: number, body: 
   const lctx = lctxOf(ctx);
   const txnDate = ledger.businessDate();
   await prisma.$transaction(async (tx) => {
+    // claim the items atomically on their ASSIGNED status BEFORE creating any stock — two concurrent receives
+    // can't both pass, so a finished piece is never created twice (BUG-10).
+    const claim = await tx.orderItem.updateMany({ where: { id: { in: ids }, karigarIssueId: issueId, status: 'ASSIGNED' }, data: { status: 'RECEIVED' } });
+    if (claim.count !== new Set(ids).size) throw new HttpError(409, 'CONFLICT', 'Some items were just received');
     let goldBack = new Prisma.Decimal(0), silverBack = new Prisma.Decimal(0), labourTotal = new Prisma.Decimal(0);
     for (const row of body.items) {
       const oi = oiById.get(row.orderItemId)!;

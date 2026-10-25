@@ -111,6 +111,26 @@ describe('orders', () => {
     await expect(makeOrder(s.ctx, s.itemName.id, bParty.id)).rejects.toMatchObject({ status: 404 });
   });
 
+  it('two concurrent receives of the same item → one wins, one 409, exactly one finished piece (BUG-10)', async () => {
+    const s = await setup();
+    const order = await makeOrder(s.ctx, s.itemName.id, s.customer.id);
+    const issue = await orders.createKarigarIssue(s.ctx, { karigarId: s.karigar.id, orderItemIds: [order.items[0]!.id], goldFine: 10, silverFine: 0, cash: 0, online: 0 } as any);
+    const recv = () => orders.receiveKarigar(s.ctx, issue.id, { items: [{ orderItemId: order.items[0]!.id, returnedGross: 9.5, returnedLess: 0, touch: 100, ghatAllowance: 0.3, labour: 800 }] } as any);
+    const results = await Promise.allSettled([recv(), recv()]);
+    expect(results.filter((r) => r.status === 'fulfilled')).toHaveLength(1);
+    expect(results.filter((r) => r.status === 'rejected' && (r.reason as any).status === 409)).toHaveLength(1);
+    expect(await db.stockItem.count({ where: { source: 'ORDER_RECEIVE', sourceId: String(order.id) } })).toBe(1); // no duplicate piece
+  });
+
+  it('two concurrent issues of the same item → one wins, one 409 (BUG-10)', async () => {
+    const s = await setup();
+    const order = await makeOrder(s.ctx, s.itemName.id, s.customer.id);
+    const issue = () => orders.createKarigarIssue(s.ctx, { karigarId: s.karigar.id, orderItemIds: [order.items[0]!.id], goldFine: 1, silverFine: 0, cash: 0, online: 0 } as any);
+    const results = await Promise.allSettled([issue(), issue()]);
+    expect(results.filter((r) => r.status === 'fulfilled')).toHaveLength(1);
+    expect(results.filter((r) => r.status === 'rejected' && (r.reason as any).status === 409)).toHaveLength(1);
+  });
+
   it('a non-karigar party cannot be issued to (400)', async () => {
     const s = await setup();
     const order = await makeOrder(s.ctx, s.itemName.id, s.customer.id);
