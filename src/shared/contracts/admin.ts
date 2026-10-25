@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { PAGE_KEYS } from '../permissions';
 import { gstin, id, mobile, mpin, pageQuery, password, username } from './common';
+import type { CurrentRatesDto } from './masters';
 
 export const branchBody = z.object({
   /** Must be inside caller's subtree; required (root is created with the business). */
@@ -139,4 +140,48 @@ export interface BusinessProfileDto {
   address: string | null;
   stateId: number | null;
   districtId: number | null;
+}
+
+// ── TASK-88: admin consolidated overview (GET /api/admin/overview) ──────────────────────────
+// Over the caller's accessible branch subtree (branch-admins see only theirs). Decimals as strings.
+
+export interface AdminMetalMoneyDto {
+  /** ₹ */
+  amount: string;
+  /** fine grams */
+  gold: string;
+  silver: string;
+}
+
+export interface AdminOverviewStockDto {
+  goldFine: string;
+  silverFine: string;
+  items: number;
+  /** Σ stock value ₹ */
+  value: string;
+}
+
+export interface AdminOverviewRowDto {
+  branch: { id: number; name: string; path: string; depth: number; isAdminNode: boolean };
+  stock: AdminOverviewStockDto;
+  /** Σ final of today's non-deleted SELL bills (GST + ROUGH) */
+  salesToday: string;
+  /** Signed attribution: Σ udhar movements posted at this branch (can be negative = net payable). */
+  udhariReceivable: AdminMetalMoneyDto;
+  userCount: number;
+}
+
+export interface AdminOverviewDto {
+  /** caller subtree, in path order */
+  branches: AdminOverviewRowDto[];
+  totals: {
+    stock: AdminOverviewStockDto;
+    salesToday: string;
+    /** True business receivable = Σ positive party balances. Party balances are business-wide, so this
+     *  is NOT the sum of the per-branch attributions above. */
+    udhariReceivable: AdminMetalMoneyDto;
+    userCount: number;
+  };
+  /** business-level current rates */
+  rates: CurrentRatesDto;
 }
