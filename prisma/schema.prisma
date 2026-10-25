@@ -797,3 +797,34 @@ model LedgerEntry {
   @@index([businessId, source, sourceId])
   @@index([businessId, partyId])
 }
+
+// ═════════════ Phase 3 — accounts (spec: docs/modules/09-accounts-ledgers.md) ═════════════
+// Day-Book and asset ledgers are computed from LedgerEntry; no table needed.
+// shortcut: no day open/close locking yet — add a DayClose(businessId, branchId, date) table when shops ask to lock past days.
+
+enum IncomeExpenseType {
+  INCOME
+  EXPENSE
+}
+
+/// Header for a manual income/expense entry; its money/metal movements are LedgerEntry rows (source INCOME_EXPENSE, sourceId = id).
+model IncomeExpense {
+  id            Int               @id @default(autoincrement())
+  businessId    Int
+  branchId      Int
+  txnDate       DateTime          @db.Date
+  type          IncomeExpenseType
+  reason        String
+  cash          Decimal           @default(0) @db.Decimal(14, 2)
+  online        Decimal           @default(0) @db.Decimal(14, 2)
+  bankAccountId Int?
+  gold          Decimal           @default(0) @db.Decimal(14, 3)
+  silver        Decimal           @default(0) @db.Decimal(14, 3)
+  remark        String?
+  isDeleted     Boolean           @default(false)
+  createdById   Int?
+  createdAt     DateTime          @default(now())
+  updatedAt     DateTime          @updatedAt
+
+  @@index([businessId, branchId, txnDate])
+}

@@ -7,4 +7,5 @@ export * from './contracts/platform';
 export * from './contracts/admin';
 export * from './contracts/masters';
 export * from './contracts/inventory';
+export * from './contracts/accounts';
 export * from './calc';
