@@ -25,9 +25,11 @@ import * as svc from './service';
 import { partyImagePath, savePartyImage } from './uploads';
 import type { PartyImageField } from './uploads';
 import { inventoryRouter } from './inventory.routes';
+import { accountsRouter } from './accounts.routes';
 
 export const appRouter = Router();
 appRouter.use(inventoryRouter);
+appRouter.use(accountsRouter);
 
 const PARTIES = 'settings.parties';
 const MISC = 'settings.misc';

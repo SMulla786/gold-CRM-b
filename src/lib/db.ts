@@ -21,8 +21,9 @@ import type { TenantContext } from '../middleware/context';
  * branch:     businessId + branchId ∈ subtree (branch-owned rows).
  * self:       businessId + the row's own id ∈ subtree (the Branch tree itself).
  * bankBranch: businessId + branchId ∈ [0, ...subtree] (business-wide id 0 + any branch in subtree).
+ * transfer:   businessId + (fromBranchId OR toBranchId ∈ subtree) — a transfer is visible from either end.
  */
-type Scope = 'business' | 'branch' | 'self' | 'bankBranch';
+type Scope = 'business' | 'branch' | 'self' | 'bankBranch' | 'transfer';
 
 const TENANT_MODELS: Record<string, Scope> = {
   Branch: 'self',
@@ -42,6 +43,8 @@ const TENANT_MODELS: Record<string, Scope> = {
   ItemName: 'business',
   StockItem: 'branch',
   LedgerEntry: 'branch',
+  IncomeExpense: 'branch',
+  StockTransfer: 'transfer',
   // JewelleryType omitted (nullable businessId: global + custom) — scoped in its service like Role.
   // TagSequence omitted — incremented via a raw locked UPDATE inside the stock-entry tx with explicit businessId.
 };
@@ -63,7 +66,9 @@ export function scopedDb(ctx: TenantContext) {
         ? { businessId, id: { in: branchIds } }
         : scope === 'bankBranch'
           ? { businessId, branchId: { in: [0, ...branchIds] } }
-          : { businessId };
+          : scope === 'transfer'
+            ? { businessId, OR: [{ fromBranchId: { in: branchIds } }, { toBranchId: { in: branchIds } }] }
+            : { businessId };
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const withBusiness = (d: any) => ({ ...d, businessId });
