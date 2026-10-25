@@ -16,6 +16,7 @@ import {
   userListQuery,
 } from '../../shared';
 import * as svc from './service';
+import { adminOverview } from './overview';
 
 export const adminRouter = Router();
 
@@ -30,6 +31,9 @@ adminRouter.use((req, _res, next) => {
 const ownerOnly = (req: { ctx?: { isOwner: boolean } }): void => {
   if (!req.ctx?.isOwner) throw new HttpError(403, 'FORBIDDEN', 'Owner only');
 };
+
+// Consolidated per-branch + business overview across the caller's accessible subtree (read-only).
+adminRouter.get('/overview', async (req, res) => res.json(await adminOverview(req.ctx!)));
 
 // Branches
 adminRouter.get('/branches', async (req, res) => res.json(await svc.getBranchTree(req.ctx!)));
