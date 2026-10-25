@@ -85,3 +85,27 @@ describe('stock entry + ledger core', () => {
     expect(Number(gold.gross)).toBeCloseTo(15, 3);
   });
 });
+
+describe('TASK-16b additions', () => {
+  it('H1 updateItemName rejects a cross-tenant groupId -> 404', async () => {
+    const s = await setup();
+    const b = await createBusiness({ name: 'B' });
+    const bGroup = await db.itemGroup.create({ data: { businessId: b.business.id, stockClass: 'GOLD', name: 'B-Rings', gstRate: 3 } });
+    await expect(inv.updateItemName(s.ctx, s.itemName.id, { groupId: bGroup.id })).rejects.toMatchObject({ status: 404 });
+  });
+
+  it('H2 updateItemGroup rejects a cross-tenant jewelleryTypeId -> 404', async () => {
+    const s = await setup();
+    const b = await createBusiness({ name: 'B' });
+    const bType = await db.jewelleryType.create({ data: { businessId: b.business.id, name: 'B-Type' } });
+    await expect(inv.updateItemGroup(s.ctx, s.group.id, { jewelleryTypeId: bType.id })).rejects.toMatchObject({ status: 404 });
+  });
+
+  it('M1 CSV import: a non-numeric cell is a row error, not a 500', async () => {
+    const s = await setup();
+    const csv = ['item_name,gross', `${s.itemName.name},abc`].join('\n');
+    const res = await inv.importStock(s.ctx, csv, { stockClass: 'GOLD', method: 'TAG', groupId: s.group.id, dryRun: true });
+    expect(res.imported).toBe(0);
+    expect(res.errors.some((e) => e.row === 2 && e.field === 'gross')).toBe(true);
+  });
+});

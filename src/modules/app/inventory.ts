@@ -4,7 +4,7 @@ import { scopedDb } from '../../lib/db';
 import * as ledger from '../../lib/ledger';
 import { HttpError } from '../../middleware/error';
 import type { TenantContext } from '../../middleware/context';
-import { computeLine } from '../../shared';
+import { computeLine, stockRowInput } from '../../shared';
 import type {
   GroupStockDto,
   ItemGroupDto,
@@ -429,34 +429,33 @@ export async function importStock(ctx: TenantContext, csv: string, fields: { sto
   if (table.length === 0) throw new HttpError(400, 'VALIDATION', 'Empty CSV');
   const header = table[0]!.map((h) => h.toLowerCase());
   const dataRows = table.slice(1);
-  if (dataRows.length > 5000) throw new HttpError(400, 'VALIDATION', 'CSV exceeds 5000 rows');
+  // shortcut: 500-row cap matches stockEntryBody.max(500); add batching if shops need bigger imports.
+  if (dataRows.length > 500) throw new HttpError(400, 'VALIDATION', 'CSV exceeds 500 rows');
   const col = (r: string[], name: string) => { const idx = header.indexOf(name); return idx >= 0 ? (r[idx] ?? '') : ''; };
 
   // Resolve item names in the group by name.
   const names = await sdb.itemName.findMany({ where: { groupId: fields.groupId } });
   const byName = new Map(names.map((n) => [n.name.toLowerCase(), n]));
 
-  const parsed: { itemNameId: number; tagNo?: string; huid?: string; karatCode?: string; pcs: number; gross: number; less: number; tunch?: number; wastage: number; stoneCharge: number; labour: number; labourUnit: 'PER_GRAM' | 'PERCENT' | 'FIXED'; other: number; rate?: number; purchaseCost?: number; remarks?: string }[] = [];
+  // CSV→row maps: item_name resolved by name, the rest validated by the shared stockRowInput zod (row-scoped errors).
+  const CELL: Record<string, string> = { tagNo: 'tag_no', huid: 'huid', karatCode: 'karat', pcs: 'pcs', gross: 'gross', less: 'less', tunch: 'tunch', wastage: 'wastage', stoneCharge: 'stone_charge', labour: 'labour', other: 'other', rate: 'rate', purchaseCost: 'purchase_cost', remarks: 'remarks' };
+  const parsed: any[] = [];
   dataRows.forEach((r, i) => {
     const rowNo = i + 2; // 1-based incl header
     const itemName = byName.get(col(r, 'item_name').toLowerCase());
     if (!itemName) { errors.push({ row: rowNo, field: 'item_name', message: `Unknown item name "${col(r, 'item_name')}"` }); return; }
-    const gross = Number(col(r, 'gross'));
-    if (!(gross > 0)) { errors.push({ row: rowNo, field: 'gross', message: 'gross must be > 0' }); return; }
-    const less = Number(col(r, 'less') || 0);
-    if (less > gross) { errors.push({ row: rowNo, field: 'less', message: 'less cannot exceed gross' }); return; }
-    const lu = (col(r, 'labour_unit') || 'PER_GRAM').toUpperCase();
-    if (!['PER_GRAM', 'PERCENT', 'FIXED'].includes(lu)) { errors.push({ row: rowNo, field: 'labour_unit', message: 'invalid labour_unit' }); return; }
-    parsed.push({
-      itemNameId: itemName.id, tagNo: col(r, 'tag_no') || undefined, huid: col(r, 'huid') || undefined, karatCode: col(r, 'karat') || undefined,
-      pcs: Number(col(r, 'pcs') || 1), gross, less, tunch: col(r, 'tunch') ? Number(col(r, 'tunch')) : undefined, wastage: Number(col(r, 'wastage') || 0),
-      stoneCharge: Number(col(r, 'stone_charge') || 0), labour: Number(col(r, 'labour') || 0), labourUnit: lu as 'PER_GRAM' | 'PERCENT' | 'FIXED', other: Number(col(r, 'other') || 0),
-      rate: col(r, 'rate') ? Number(col(r, 'rate')) : undefined, purchaseCost: col(r, 'purchase_cost') ? Number(col(r, 'purchase_cost')) : undefined, remarks: col(r, 'remarks') || undefined,
-    });
+    const raw: Record<string, string | number> = { itemNameId: itemName.id };
+    for (const [field, cell] of Object.entries(CELL)) { const v = col(r, cell); if (v !== '') raw[field] = v; }
+    if (col(r, 'labour_unit')) raw.labourUnit = col(r, 'labour_unit').toUpperCase();
+    const res = stockRowInput.safeParse(raw);
+    if (!res.success) { for (const issue of res.error.issues) errors.push({ row: rowNo, field: String(issue.path[0] ?? ''), message: issue.message }); return; }
+    if (res.data.less > res.data.gross) { errors.push({ row: rowNo, field: 'less', message: 'less cannot exceed gross' }); return; }
+    parsed.push(res.data);
   });
 
+  // dryRun, or a real run that hit row errors, validates only — echo the requested dryRun value.
   if (fields.dryRun || errors.length) {
-    return { dryRun: true, total: dataRows.length, valid: parsed.length, imported: 0, errors, entryNo: null };
+    return { dryRun: fields.dryRun, total: dataRows.length, valid: parsed.length, imported: 0, errors, entryNo: null };
   }
   const result = await createStockEntry(ctx, { stockClass: fields.stockClass, method: fields.method, rows: parsed });
   return { dryRun: false, total: dataRows.length, valid: parsed.length, imported: result.items.length, errors, entryNo: result.entryNo };

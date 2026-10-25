@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { db, truncateAll } from '../../../test/helpers/db';
-import { createBusiness, createPlan } from '../../../test/helpers/factory';
+import { createBranch, createBusiness, createPlan } from '../../../test/helpers/factory';
 import * as svc from './service';
 import * as platform from '../platform/service';
 import type { TenantContext } from '../../middleware/context';
@@ -81,5 +81,41 @@ describe('business-creation hook', () => {
     });
     expect(await db.karatMapping.count({ where: { businessId: detail.id } })).toBe(7);
     expect(await db.rateLimit.count({ where: { businessId: detail.id } })).toBe(4);
+  });
+});
+
+describe('TASK-14c', () => {
+  it('(a) a branch user cannot update/delete a sibling branch bank account', async () => {
+    const A = await createBusiness({ name: 'A' });
+    const x = await createBranch({ businessId: A.business.id, parentId: A.root.id, name: 'X' });
+    const y = await createBranch({ businessId: A.business.id, parentId: A.root.id, name: 'Y' });
+    const ownerCtx = ctx({ businessId: A.business.id, scopeBranchId: A.root.id, branchIds: [A.root.id, x.id, y.id] });
+    await svc.createBankAccount(ownerCtx, { branchId: y.id, bankName: 'YBank', accountNo: '123456', ifsc: 'HDFC0001234', applyTo: 'ALL', isActive: true });
+    const acct = await db.bankAccount.findFirstOrThrow({ where: { businessId: A.business.id, branchId: y.id } });
+    const xUser = ctx({ businessId: A.business.id, level: 'BRANCH_USER', isOwner: false, scopeBranchId: x.id, branchIds: [x.id], activeBranchId: x.id });
+
+    await expect(svc.updateBankAccount(xUser, acct.id, { bankName: 'HACKED' })).rejects.toBeTruthy();
+    expect((await db.bankAccount.findUniqueOrThrow({ where: { id: acct.id } })).bankName).toBe('YBank');
+    await expect(svc.deleteBankAccount(xUser, acct.id)).rejects.toBeTruthy();
+    expect((await db.bankAccount.findUniqueOrThrow({ where: { id: acct.id } })).isActive).toBe(true);
+  });
+
+  it('(b) putRateLimits is atomic — a failed replace leaves the old limits intact', async () => {
+    const B = await createBusiness({ name: 'B' });
+    const bctx = ctx({ businessId: B.business.id, scopeBranchId: B.root.id, branchIds: [B.root.id] });
+    await db.rateLimit.create({ data: { businessId: B.business.id, metal: 'GOLD', rateUnit: 'GRAM_10', minRate: 1, maxRate: 2 } });
+    // Two rows with the same (metal,rateUnit) → createMany P2002 → whole tx rolls back (deleteMany undone).
+    await expect(svc.putRateLimits(bctx, [{ metal: 'SILVER', rateUnit: 'KG_1', minRate: 1, maxRate: 2 }, { metal: 'SILVER', rateUnit: 'KG_1', minRate: 3, maxRate: 4 }])).rejects.toBeTruthy();
+    const after = await db.rateLimit.findMany({ where: { businessId: B.business.id } });
+    expect(after).toHaveLength(1);
+    expect(after[0]!.metal).toBe('GOLD');
+  });
+
+  it('(d) cannot change a customer type away from CUSTOMER while it has members', async () => {
+    const C = await createBusiness({ name: 'C' });
+    const cctx = ctx({ businessId: C.business.id, scopeBranchId: C.root.id, branchIds: [C.root.id], activeBranchId: C.root.id });
+    const cust = await svc.createParty(cctx, { type: 'CUSTOMER', name: 'Cust', mobile: '9000000010', countryCode: '+91' });
+    await svc.createParty(cctx, { type: 'CUSTOMER', name: 'Son', mobile: '9000000011', countryCode: '+91', parentId: cust.dto.id });
+    await expect(svc.updateParty(cctx, cust.dto.id, { type: 'SUPPLIER' })).rejects.toMatchObject({ status: 400 });
   });
 });

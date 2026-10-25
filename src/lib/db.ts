@@ -17,11 +17,12 @@ import type { TenantContext } from '../middleware/context';
  */
 
 /**
- * business: businessId only (shared-at-business masters; branchId=0 = business-wide, handled in services).
- * branch:   businessId + branchId ∈ subtree (branch-owned rows).
- * self:     businessId + the row's own id ∈ subtree (the Branch tree itself).
+ * business:   businessId only (shared-at-business masters; branchId=0 = business-wide, handled in services).
+ * branch:     businessId + branchId ∈ subtree (branch-owned rows).
+ * self:       businessId + the row's own id ∈ subtree (the Branch tree itself).
+ * bankBranch: businessId + branchId ∈ [0, ...subtree] (business-wide id 0 + any branch in subtree).
  */
-type Scope = 'business' | 'branch' | 'self';
+type Scope = 'business' | 'branch' | 'self' | 'bankBranch';
 
 const TENANT_MODELS: Record<string, Scope> = {
   Branch: 'self',
@@ -30,7 +31,7 @@ const TENANT_MODELS: Record<string, Scope> = {
   Subscription: 'business',
   SubscriptionPayment: 'business',
   Party: 'business',
-  BankAccount: 'business',
+  BankAccount: 'bankBranch',
   Setting: 'business',
   KaratMapping: 'business',
   MetalRate: 'business',
@@ -56,7 +57,13 @@ export function scopedDb(ctx: TenantContext) {
 
   // Filter fields for MULTI ops and non-self UNIQUE ops (no key collision with a unique `id`).
   const filterFields = (scope: Scope): Record<string, unknown> =>
-    scope === 'branch' ? { businessId, branchId: { in: branchIds } } : scope === 'self' ? { businessId, id: { in: branchIds } } : { businessId };
+    scope === 'branch'
+      ? { businessId, branchId: { in: branchIds } }
+      : scope === 'self'
+        ? { businessId, id: { in: branchIds } }
+        : scope === 'bankBranch'
+          ? { businessId, branchId: { in: [0, ...branchIds] } }
+          : { businessId };
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const withBusiness = (d: any) => ({ ...d, businessId });

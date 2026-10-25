@@ -115,6 +115,9 @@ export async function updateParty(ctx: TenantContext, partyId: number, body: Rec
     const parent = await sdb.party.findUnique({ where: { id: body.parentId } });
     if (!parent || parent.type !== 'CUSTOMER') throw new HttpError(400, 'VALIDATION', 'parentId must be a customer of this business');
   }
+  if (body.type != null && body.type !== 'CUSTOMER' && target.members.length > 0) {
+    throw new HttpError(400, 'VALIDATION', 'Cannot change type: this customer has family members');
+  }
   await sdb.party.update({ where: { id: partyId }, data: body });
   return getParty(ctx, partyId);
 }
@@ -179,8 +182,7 @@ export async function listHsn(ctx: TenantContext, query: { q?: string; category?
 
 export async function toggleHsn(ctx: TenantContext, hsnId: number, active: boolean): Promise<void> {
   if (!(await prisma.hsnCode.findUnique({ where: { id: hsnId } }))) throw new HttpError(404, 'NOT_FOUND', 'HSN code not found');
-  await scopedDb(ctx).businessHsn.deleteMany({ where: { hsnId } });
-  await scopedDb(ctx).businessHsn.create({ data: { hsnId, isActive: active } as never });
+  await scopedDb(ctx).businessHsn.upsert({ where: { businessId_hsnId: { businessId: ctx.businessId!, hsnId } }, update: { isActive: active }, create: { hsnId, isActive: active } as never });
 }
 
 // ───────────── Karats ─────────────
@@ -277,8 +279,11 @@ export async function listRateLimits(ctx: TenantContext): Promise<RateLimitDto[]
 
 export async function putRateLimits(ctx: TenantContext, limits: { metal: Metal; rateUnit: RateUnitKey; minRate: number; maxRate: number }[]): Promise<RateLimitDto[]> {
   const sdb = scopedDb(ctx);
-  await sdb.rateLimit.deleteMany({});
-  await sdb.rateLimit.createMany({ data: limits.map((l) => ({ metal: l.metal, rateUnit: l.rateUnit, minRate: l.minRate, maxRate: l.maxRate })) as never });
+  // One transaction: replacing all limits must never leave a shop with zero limits mid-write.
+  await sdb.$transaction([
+    sdb.rateLimit.deleteMany({}),
+    sdb.rateLimit.createMany({ data: limits.map((l) => ({ metal: l.metal, rateUnit: l.rateUnit, minRate: l.minRate, maxRate: l.maxRate })) as never }),
+  ]);
   return listRateLimits(ctx);
 }
 
@@ -302,8 +307,10 @@ export async function putSetting(ctx: TenantContext, key: string, branchId: numb
   const parsed = SETTING_SCHEMAS[key as SettingKey].parse(value);
   const bId = branchId ?? 0;
   if (bId !== 0 && !(await scopedDb(ctx).branch.findUnique({ where: { id: bId } }))) throw new HttpError(404, 'NOT_FOUND', 'Branch not found');
-  const sdb = scopedDb(ctx);
-  await sdb.setting.deleteMany({ where: { branchId: bId, key } });
-  await sdb.setting.create({ data: { branchId: bId, key, value: parsed as object, updatedById: ctx.userId } as never });
+  await scopedDb(ctx).setting.upsert({
+    where: { businessId_branchId_key: { businessId: ctx.businessId!, branchId: bId, key } },
+    update: { value: parsed as object, updatedById: ctx.userId },
+    create: { branchId: bId, key, value: parsed as object, updatedById: ctx.userId } as never,
+  });
   return getSettings(ctx);
 }
