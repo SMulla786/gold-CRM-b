@@ -847,3 +847,230 @@ model StockTransfer {
   @@index([businessId, fromBranchId])
   @@index([businessId, toBranchId])
 }
+
+// ───────────── Phase 4: billing ─────────────
+
+enum BillKind {
+  SELL
+  PURCHASE
+}
+
+/// GST invoice vs ROUGH estimate: separate number series, ROUGH has no GST
+enum BillType {
+  GST
+  ROUGH
+}
+
+enum BillStatus {
+  ACTIVE
+  DELETED
+}
+
+/// what an unpaid / overpaid bill balance is kept as in the party udhar account
+enum KeepBalanceAs {
+  MONEY
+  GOLD
+  SILVER
+}
+
+enum DiscountUnit {
+  FIXED
+  PERCENT
+}
+
+enum BillPaymentMode {
+  CASH
+  ONLINE
+  METAL
+}
+
+/// Gap-free per-branch document numbering (bills, udhar). key e.g. "SELL:GST:2026-27"; incremented by an atomic upsert inside the document tx.
+model DocSequence {
+  businessId Int
+  branchId   Int
+  key        String
+  next       Int    @default(1)
+
+  @@id([businessId, branchId, key])
+}
+
+model Bill {
+  id               Int           @id @default(autoincrement())
+  businessId       Int
+  branchId         Int
+  kind             BillKind
+  billType         BillType
+  /// formatted per invoice settings, e.g. INV/2026-27/00001
+  billNo           String
+  seq              Int
+  partyId          Int
+  billDate         DateTime      @db.Date
+  dueDate          DateTime?     @db.Date
+  /// GST computed as IGST (party state differs from branch/business state)
+  interState       Boolean       @default(false)
+  sub              Decimal       @db.Decimal(14, 2)
+  discount         Decimal       @default(0) @db.Decimal(14, 2)
+  discountUnit     DiscountUnit  @default(FIXED)
+  discountAmount   Decimal       @default(0) @db.Decimal(14, 2)
+  gstPercent       Decimal       @default(0) @db.Decimal(5, 2)
+  taxable          Decimal       @db.Decimal(14, 2)
+  cgst             Decimal       @default(0) @db.Decimal(14, 2)
+  sgst             Decimal       @default(0) @db.Decimal(14, 2)
+  igst             Decimal       @default(0) @db.Decimal(14, 2)
+  total            Decimal       @db.Decimal(14, 2)
+  round            Decimal       @default(0) @db.Decimal(8, 2)
+  final            Decimal       @db.Decimal(14, 2)
+  /// sum of active payments (money value), kept in step with every payment add/reverse
+  paid             Decimal       @default(0) @db.Decimal(14, 2)
+  keepBalanceAs    KeepBalanceAs @default(MONEY)
+  /// rate per rate-unit used to convert the balance to metal (GOLD/SILVER keep)
+  keepRate         Decimal?      @db.Decimal(14, 2)
+  keepWeight       Decimal?      @db.Decimal(14, 3)
+  remark           String?
+  status           BillStatus    @default(ACTIVE)
+  /// set on delete: true = stock returned (sell: AVAILABLE again, purchase: DELETED)
+  deletedWithStock Boolean?
+  deletedAt        DateTime?
+  createdById      Int?
+  createdAt        DateTime      @default(now())
+  updatedAt        DateTime      @updatedAt
+  items            BillItem[]
+  payments         BillPayment[]
+
+  @@unique([businessId, branchId, kind, billType, billNo])
+  @@index([businessId, branchId, kind, billDate])
+  @@index([businessId, partyId])
+}
+
+model BillItem {
+  id           Int          @id @default(autoincrement())
+  billId       Int
+  /// SELL: the stock item sold (null = direct item not in stock); PURCHASE: the stock item created
+  stockItemId  Int?
+  itemNameId   Int?
+  groupId      Int?
+  stockClass   StockClass
+  description  String
+  hsnCode      String?
+  tagNo        String?
+  karatCode    String?
+  pcs          Int          @default(1)
+  gross        Decimal      @db.Decimal(14, 3)
+  less         Decimal      @default(0) @db.Decimal(14, 3)
+  net          Decimal      @db.Decimal(14, 3)
+  tunch        Decimal      @default(100) @db.Decimal(6, 3)
+  wastage      Decimal      @default(0) @db.Decimal(6, 3)
+  fine         Decimal      @db.Decimal(14, 3)
+  stoneCharge  Decimal      @default(0) @db.Decimal(14, 2)
+  rate         Decimal      @default(0) @db.Decimal(14, 2)
+  labour       Decimal      @default(0) @db.Decimal(12, 2)
+  labourUnit   ChargeUnit   @default(PER_GRAM)
+  other        Decimal      @default(0) @db.Decimal(14, 2)
+  discount     Decimal      @default(0) @db.Decimal(14, 2)
+  discountUnit DiscountUnit @default(FIXED)
+  metalAmount  Decimal      @db.Decimal(14, 2)
+  labourAmount Decimal      @db.Decimal(14, 2)
+  total        Decimal      @db.Decimal(14, 2)
+  bill         Bill         @relation(fields: [billId], references: [id], onDelete: Cascade)
+
+  @@index([billId])
+  @@index([stockItemId])
+}
+
+model BillPayment {
+  id            Int             @id @default(autoincrement())
+  billId        Int
+  mode          BillPaymentMode
+  bankAccountId Int?
+  /// METAL payments
+  metal         MetalKind?
+  metalForm     MetalForm?
+  gross         Decimal?        @db.Decimal(14, 3)
+  net           Decimal?        @db.Decimal(14, 3)
+  tunch         Decimal?        @db.Decimal(6, 3)
+  fine          Decimal?        @db.Decimal(14, 3)
+  rate          Decimal?        @db.Decimal(14, 2)
+  /// money value of the payment (METAL: fine x rate / unit)
+  amount        Decimal         @db.Decimal(14, 2)
+  remark        String?
+  txnDate       DateTime        @db.Date
+  /// false after the bill is deleted (ledger reversed)
+  isActive      Boolean         @default(true)
+  /// set when the payment came from a New Udhar entry that settled this bill
+  udharTxnId    Int?
+  createdById   Int?
+  createdAt     DateTime        @default(now())
+  bill          Bill            @relation(fields: [billId], references: [id], onDelete: Cascade)
+
+  @@index([billId])
+}
+
+// ───────────── Phase 5: udhari (party accounts) ─────────────
+
+/// Append-only party account movements in three units, written ONLY via lib/udhar.ts post/reverse (same pattern as LedgerEntry).
+/// Sign: + = party owes the shop, - = shop owes the party. Balance = sum.
+model UdharEntry {
+  id           BigInt   @id @default(autoincrement())
+  businessId   Int
+  branchId     Int
+  partyId      Int
+  txnDate      DateTime @db.Date
+  amount       Decimal  @default(0) @db.Decimal(14, 2)
+  gold         Decimal  @default(0) @db.Decimal(14, 3)
+  silver       Decimal  @default(0) @db.Decimal(14, 3)
+  /// LedgerSource (SELL_BILL, PURCHASE_BILL, UDHAR, BHAV_CUT ...) + document id
+  source       String
+  sourceId     String
+  narration    String?
+  reversalOfId BigInt?
+  createdById  Int?
+  createdAt    DateTime @default(now())
+
+  @@index([businessId, partyId, txnDate])
+  @@index([businessId, branchId, txnDate])
+  @@index([businessId, source, sourceId])
+}
+
+enum BhavDirection {
+  MONEY_TO_METAL
+  METAL_TO_MONEY
+}
+
+/// One "New Udhar" form save. Posts LedgerEntry (shop cash/bank/metal) + UdharEntry (party balance).
+model UdharTxn {
+  id            Int            @id @default(autoincrement())
+  businessId    Int
+  branchId      Int
+  txnNo         Int
+  partyId       Int
+  txnDate       DateTime       @db.Date
+  /// given to the party (party owes more)
+  cashOut       Decimal        @default(0) @db.Decimal(14, 2)
+  onlineOut     Decimal        @default(0) @db.Decimal(14, 2)
+  outBankId     Int?
+  /// received from the party (party owes less)
+  cashIn        Decimal        @default(0) @db.Decimal(14, 2)
+  onlineIn      Decimal        @default(0) @db.Decimal(14, 2)
+  inBankId      Int?
+  goldOut       Decimal        @default(0) @db.Decimal(14, 3)
+  goldIn        Decimal        @default(0) @db.Decimal(14, 3)
+  silverOut     Decimal        @default(0) @db.Decimal(14, 3)
+  silverIn      Decimal        @default(0) @db.Decimal(14, 3)
+  /// bhav cut: converts part of the party balance between money and metal (no shop asset movement)
+  bhavDirection BhavDirection?
+  bhavMetal     MetalKind?
+  bhavAmount    Decimal?       @db.Decimal(14, 2)
+  bhavRate      Decimal?       @db.Decimal(14, 2)
+  bhavUnitGrams Decimal?       @db.Decimal(10, 4)
+  bhavWeight    Decimal?       @db.Decimal(14, 3)
+  /// received money applied to this bill (adds a BillPayment)
+  settleBillId  Int?
+  remark        String?
+  isDeleted     Boolean        @default(false)
+  createdById   Int?
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+
+  @@unique([businessId, branchId, txnNo])
+  @@index([businessId, partyId])
+}
