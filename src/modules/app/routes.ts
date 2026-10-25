@@ -100,7 +100,9 @@ appRouter.delete('/karats/:id', requirePermission(MISC, 'delete'), requireMpin, 
 });
 
 // ───────────── Rates & limits ─────────────
-appRouter.get('/rates/current', requirePermission(MISC, 'view'), async (req, res) => res.json(await svc.currentRates(req.ctx!)));
+// Current rates are readable by ANY authenticated tenant user (no module/permission gate) — the dashboard rate card and
+// every billing/udhar screen show them, so cashiers/billing-only users must see them. setRates + rate limits stay gated (edit).
+appRouter.get('/rates/current', async (req, res) => res.json(await svc.currentRates(req.ctx!)));
 appRouter.post('/rates', requirePermission(MISC, 'edit'), async (req, res) => {
   const body = setRatesBody.parse(req.body);
   const offending = await svc.checkRateLimits(req.ctx!, body);
