@@ -2,6 +2,7 @@ import { Router } from 'express';
 import type { Request } from 'express';
 import { env } from '../../config/env';
 import { requireAuth } from '../../middleware/auth';
+import { authRateLimit } from '../../middleware/rateLimit';
 import {
   REFRESH_COOKIE,
   changePasswordBody,
@@ -24,7 +25,7 @@ const meta = (req: Request): svc.SessionMeta => ({ userAgent: req.headers['user-
 
 export const authRouter = Router();
 
-authRouter.post('/login', async (req, res) => {
+authRouter.post('/login', authRateLimit, async (req, res) => {
   const { response, refreshToken } = await svc.login(loginBody.parse(req.body), meta(req));
   res.cookie(REFRESH_COOKIE, refreshToken, cookieOpts).json(response);
 });
@@ -58,12 +59,12 @@ authRouter.post('/mpin/verify', requireAuth, async (req, res) => {
   res.status(204).end();
 });
 
-authRouter.post('/forgot-password', async (req, res) => {
+authRouter.post('/forgot-password', authRateLimit, async (req, res) => {
   await svc.forgotPassword(forgotPasswordBody.parse(req.body).login);
   res.status(202).end();
 });
 
-authRouter.post('/reset-password', async (req, res) => {
+authRouter.post('/reset-password', authRateLimit, async (req, res) => {
   await svc.resetPassword(resetPasswordBody.parse(req.body));
   res.status(204).end();
 });

@@ -5,6 +5,7 @@ import helmet from 'helmet';
 import { env } from './config/env';
 import { prisma } from './lib/prisma';
 import { errorHandler } from './middleware/error';
+import { requestLog } from './middleware/requestLog';
 import { requireAuth } from './middleware/auth';
 import { loadContext } from './middleware/context';
 import { requireLevel } from './middleware/guards';
@@ -18,6 +19,9 @@ import { requireWrite } from './middleware/guards';
 /** App factory (no listen) so supertest can mount it. Module routers get registered here. */
 export function createApp() {
   const app = express();
+  // behind Caddy in prod: trust the one proxy hop so req.ip is the real client (for rate limiting + secure cookies)
+  if (env.NODE_ENV === 'production') app.set('trust proxy', 1);
+  app.use(requestLog);
   app.use(helmet());
   app.use(cors({ origin: env.WEB_ORIGIN, credentials: true }));
   app.use(express.json({ limit: '2mb' }));
