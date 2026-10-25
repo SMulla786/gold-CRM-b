@@ -15,4 +15,6 @@ export * from './contracts/opening';
 export * from './contracts/justbill';
 export * from './contracts/orders';
 export * from './contracts/girvi';
+export * from './contracts/trade';
+export * from './contracts/schemes';
 export * from './calc';
