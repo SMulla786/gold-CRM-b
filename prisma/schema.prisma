@@ -801,7 +801,28 @@ model LedgerEntry {
 
 // ═════════════ Phase 3 — accounts (spec: docs/modules/09-accounts-ledgers.md) ═════════════
 // Day-Book and asset ledgers are computed from LedgerEntry; no table needed.
-// shortcut: no day open/close locking yet — add a DayClose(businessId, branchId, date) table when shops ask to lock past days.
+
+enum DayStatus {
+  OPEN
+  CLOSED
+}
+
+/// TASK-80: per-branch day open/close. Balances stay derived from LedgerEntry; this row only gates postings
+/// (lib/ledger.post rejects a txnDate whose branch-day is CLOSED). Reopen = set status back to OPEN.
+model DayBook {
+  id         Int       @id @default(autoincrement())
+  businessId Int
+  branchId   Int
+  date       DateTime  @db.Date
+  status     DayStatus @default(OPEN)
+  openedAt   DateTime?
+  openedById Int?
+  closedAt   DateTime?
+  closedById Int?
+
+  @@unique([businessId, branchId, date])
+  @@index([businessId, branchId])
+}
 
 enum IncomeExpenseType {
   INCOME

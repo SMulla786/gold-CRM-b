@@ -135,6 +135,8 @@ export interface AssetTotalsDto {
 export interface DayBookDto {
   from: string;
   to: string;
+  /** TASK-80: the branch-day status when a single day is requested (from === to); null for a range. */
+  status?: 'OPEN' | 'CLOSED' | null;
   totals: AssetTotalsDto[];
   bySource: Array<{ source: (typeof LEDGER_SOURCES)[number]; asset: (typeof LEDGER_ASSETS)[number]; in: string; out: string }>;
 }
