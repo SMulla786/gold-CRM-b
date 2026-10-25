@@ -1,6 +1,6 @@
 // Baseline self-check by lead (hand-computed with the fixture-verified formulas).
 import { describe, expect, it } from 'vitest';
-import { computeBill, computeLine, metalToMoney, moneyToMetal } from './index';
+import { computeBill, computeJustLine, computeLine, metalToMoney, moneyToMetal } from './index';
 
 describe('computeLine', () => {
   it('22K ring: multiplicative wastage, per-gram labour on gross, % discount on metal', () => {
@@ -58,5 +58,18 @@ describe('conversions', () => {
   it('money <-> metal at rate per 10 g', () => {
     expect(moneyToMetal(13000, 130000, 10)).toBe('1.000');
     expect(metalToMoney('2.5', 130000, 10)).toBe('32500.00');
+  });
+});
+
+describe('computeJustLine', () => {
+  it('GRAM line with per-gram making', () => {
+    expect(computeJustLine({ quantity: '10.5', unit: 'GRAM', rate: 6000, making: 500, makingUnit: 'PER_GRAM', other: 100 })).toEqual({ amount: '63000.00', making: '5250.00', total: '68350.00' });
+  });
+  it('PCS line with percent and fixed making', () => {
+    expect(computeJustLine({ quantity: 2, unit: 'PCS', rate: 1500, making: 10, makingUnit: 'PERCENT' })).toEqual({ amount: '3000.00', making: '300.00', total: '3300.00' });
+    expect(computeJustLine({ quantity: 2, unit: 'PCS', rate: 1500, making: 250, makingUnit: 'FIXED' }).total).toBe('3250.00');
+  });
+  it('per-gram making on a PCS line is an error', () => {
+    expect(() => computeJustLine({ quantity: 1, unit: 'PCS', rate: 100, making: 5, makingUnit: 'PER_GRAM' })).toThrow();
   });
 });

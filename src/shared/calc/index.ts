@@ -151,3 +151,21 @@ export function metalToMoney(weight: Num, rate: Num, rateUnitGrams: Num = 1): st
   const u = D(rateUnitGrams);
   return u.isZero() ? '0.00' : M(D(weight).times(D(rate)).div(u));
 }
+
+export interface JustLineInput {
+  quantity: Num;
+  unit: 'GRAM' | 'PCS';
+  rate?: Num;
+  making?: Num;
+  makingUnit?: LabourUnit;
+  other?: Num;
+}
+
+/** Just Bill line (no stock): amount = qty × rate; making PER_GRAM = qty × making (GRAM lines only), PERCENT = % of amount, FIXED = making. */
+export function computeJustLine(i: JustLineInput): { amount: string; making: string; total: string } {
+  const mu = i.makingUnit ?? 'PER_GRAM';
+  if (mu === 'PER_GRAM' && i.unit !== 'GRAM' && !D(i.making).isZero()) throw new Error('Making per gram needs a GRAM line');
+  const amount = D(i.quantity).times(D(i.rate));
+  const making = mu === 'PER_GRAM' ? D(i.quantity).times(D(i.making)) : mu === 'PERCENT' ? amount.times(D(i.making)).div(100) : D(i.making);
+  return { amount: M(amount), making: M(making), total: M(amount.plus(making).plus(D(i.other))) };
+}
