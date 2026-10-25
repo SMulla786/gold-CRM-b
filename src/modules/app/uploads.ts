@@ -55,3 +55,34 @@ export const saveStockImage = (ctx: TenantContext, stockId: number, buffer: Buff
   saveImage(ctx, () => scopedDb(ctx).stockItem.findUnique({ where: { id: stockId } }), (rel) => scopedDb(ctx).stockItem.update({ where: { id: stockId }, data: { photoUrl: rel } }), 'stock', 'photoUrl', buffer, 'Stock item not found');
 export const stockImagePath = (ctx: TenantContext, stockId: number): Promise<string> =>
   imagePath(() => scopedDb(ctx).stockItem.findUnique({ where: { id: stockId } }), 'photoUrl');
+
+// TASK-84 — invoice media (business-level). Paths live in the 'invoice.media' setting, written ONLY here so the
+// invoice.content settings form can never wipe an uploaded image.
+const INVOICE_MEDIA_KEY = 'invoice.media';
+export type InvoiceImageField = 'logoUrl' | 'signatureUrl' | 'watermarkUrl';
+
+async function readInvoiceMedia(ctx: TenantContext): Promise<Record<string, unknown>> {
+  const row = await scopedDb(ctx).setting.findUnique({ where: { businessId_branchId_key: { businessId: ctx.businessId!, branchId: 0, key: INVOICE_MEDIA_KEY } } });
+  return (row?.value as Record<string, unknown> | null) ?? {};
+}
+
+/** Save an invoice image and merge its path into invoice.media (deletes the replaced file); leaves the other media keys intact. */
+export function saveInvoiceImage(ctx: TenantContext, field: InvoiceImageField, buffer: Buffer): Promise<string> {
+  let current: Record<string, unknown> = {};
+  return saveImage(
+    ctx,
+    async () => (current = await readInvoiceMedia(ctx)),
+    (rel) =>
+      scopedDb(ctx).setting.upsert({
+        where: { businessId_branchId_key: { businessId: ctx.businessId!, branchId: 0, key: INVOICE_MEDIA_KEY } },
+        update: { value: { ...current, [field]: rel } as object, updatedById: ctx.userId },
+        create: { branchId: 0, key: INVOICE_MEDIA_KEY, value: { ...current, [field]: rel } as object, updatedById: ctx.userId } as never,
+      }),
+    'invoice',
+    field,
+    buffer,
+    'Business not found',
+  );
+}
+
+export const invoiceImagePath = (ctx: TenantContext, field: InvoiceImageField): Promise<string> => imagePath(() => readInvoiceMedia(ctx), field);

@@ -3,7 +3,8 @@ import path from 'node:path';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { db, truncateAll } from '../../../test/helpers/db';
 import { createBusiness } from '../../../test/helpers/factory';
-import { savePartyImage, saveStockImage } from './uploads';
+import { invoiceImagePath, savePartyImage, saveInvoiceImage, saveStockImage } from './uploads';
+import { putSetting } from './service';
 import type { TenantContext } from '../../middleware/context';
 
 const UPLOAD_ROOT = path.join(process.cwd(), 'uploads');
@@ -85,5 +86,44 @@ describe('saveStockImage', () => {
     const item = await stockItem(business.id, root.id);
     const outside = { ...ctxFor(business.id), branchIds: [root.id + 1000], activeBranchId: root.id + 1000 };
     await expect(saveStockImage(outside, item.id, PNG)).rejects.toMatchObject({ status: 404 });
+  });
+});
+
+describe('saveInvoiceImage (TASK-84)', () => {
+  const media = (businessId: number) => db.setting.findUniqueOrThrow({ where: { businessId_branchId_key: { businessId, branchId: 0, key: 'invoice.media' } } }).then((s) => s.value as Record<string, unknown>);
+
+  it('saves under <businessId>/invoice, stores the path in invoice.media, merges fields, and deletes a replaced file', async () => {
+    const { business } = await createBusiness({ name: 'Inv' });
+    cleanupBusinessIds.push(business.id);
+    const ctx = ctxFor(business.id);
+
+    const logo = await saveInvoiceImage(ctx, 'logoUrl', PNG);
+    expect(logo).toMatch(new RegExp(`^${business.id}/invoice/[0-9a-f-]+\\.png$`));
+    expect(await exists(logo)).toBe(true);
+    expect((await media(business.id)).logoUrl).toBe(logo);
+
+    const sig = await saveInvoiceImage(ctx, 'signatureUrl', JPG);
+    const m2 = await media(business.id);
+    expect(m2.logoUrl).toBe(logo); // untouched by the second upload
+    expect(m2.signatureUrl).toBe(sig);
+
+    const logo2 = await saveInvoiceImage(ctx, 'logoUrl', JPG);
+    expect(await exists(logo2)).toBe(true);
+    expect(await exists(logo)).toBe(false); // old logo file removed on replace
+  });
+
+  it('saving invoice.content does not touch invoice.media', async () => {
+    const { business } = await createBusiness({ name: 'Inv2' });
+    cleanupBusinessIds.push(business.id);
+    const ctx = ctxFor(business.id);
+    const logo = await saveInvoiceImage(ctx, 'logoUrl', PNG);
+    await putSetting(ctx, 'invoice.content', 0, { format: 'CLASSIC', terms: 'hi', columns: [], watermarkOpacity: 50 });
+    expect((await media(business.id)).logoUrl).toBe(logo);
+  });
+
+  it('invoiceImagePath 404s when nothing is uploaded', async () => {
+    const { business } = await createBusiness({ name: 'Inv3' });
+    cleanupBusinessIds.push(business.id);
+    await expect(invoiceImagePath(ctxFor(business.id), 'watermarkUrl')).rejects.toMatchObject({ status: 404 });
   });
 });

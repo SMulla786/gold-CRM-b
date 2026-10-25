@@ -23,8 +23,8 @@ import {
 import type { Metal } from '../../shared';
 import { HttpError } from '../../middleware/error';
 import * as svc from './service';
-import { partyImagePath, savePartyImage } from './uploads';
-import type { PartyImageField } from './uploads';
+import { invoiceImagePath, partyImagePath, savePartyImage, saveInvoiceImage } from './uploads';
+import type { InvoiceImageField, PartyImageField } from './uploads';
 import { inventoryRouter } from './inventory.routes';
 import { daybookRouter } from './daybook/routes';
 import { accountsRouter } from './accounts.routes';
@@ -87,6 +87,21 @@ for (const kind of ['photo', 'shop-logo'] as const) {
   });
   appRouter.get(`/files/parties/:id/${kind}`, requirePermission(PARTIES, 'view'), async (req, res) => {
     const abs = await partyImagePath(req.ctx!, idSchema.parse(req.params.id), FIELD[kind]);
+    res.type(CONTENT_TYPE[path.extname(abs)] ?? 'application/octet-stream').sendFile(abs);
+  });
+}
+
+// ───────────── Invoice media (TASK-84) ─────────────
+// Upload = settings write (settings.misc edit + MPIN); GET serves branding to any signed-in app user (prints on every invoice).
+const INVOICE_FIELD: Record<'logo' | 'signature' | 'watermark', InvoiceImageField> = { logo: 'logoUrl', signature: 'signatureUrl', watermark: 'watermarkUrl' };
+for (const kind of ['logo', 'signature', 'watermark'] as const) {
+  appRouter.post(`/settings/invoice/${kind}`, requirePermission(MISC, 'edit'), requireMpin, upload.single('file'), async (req, res) => {
+    if (!req.file) throw new HttpError(400, 'VALIDATION', 'No file uploaded (field "file")');
+    const rel = await saveInvoiceImage(req.ctx!, INVOICE_FIELD[kind], req.file.buffer);
+    res.status(201).json({ url: `/api/app/files/invoice/${kind}`, path: rel });
+  });
+  appRouter.get(`/files/invoice/${kind}`, async (req, res) => {
+    const abs = await invoiceImagePath(req.ctx!, INVOICE_FIELD[kind]);
     res.type(CONTENT_TYPE[path.extname(abs)] ?? 'application/octet-stream').sendFile(abs);
   });
 }
