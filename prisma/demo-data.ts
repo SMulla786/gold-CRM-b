@@ -54,10 +54,9 @@ async function main() {
   const silverKarats = await prisma.karatMapping.findMany({ where: { businessId: biz.id, metal: 'SILVER' }, orderBy: { sort: 'asc' } });
   const k22 = goldKarats.find((k) => k.code.includes('22'))?.code ?? goldKarats[0]!.code;
   const silverCode = silverKarats[0]?.code ?? 'SILVER';
-  // Wide demo rate bands so the demo sell rates (gold 60000/10g, silver 78000/kg) pass the per-line limit check.
-  await app.putRateLimits(hq, [{ metal: 'GOLD', rateUnit: 'GRAM_10', minRate: 40000, maxRate: 90000 }, { metal: 'SILVER', rateUnit: 'KG_1', minRate: 50000, maxRate: 120000 }]);
-  await app.setRates(hq, { metal: 'GOLD', rateUnit: 'GRAM_10', rates: goldKarats.map((k) => ({ karatCode: k.code, sellRate: Math.round(63000 * (Number(k.touch) / 100)), buyRate: Math.round(63000 * (Number(k.touch) / 100)) - 1500 })) });
-  if (silverKarats.length) await app.setRates(hq, { metal: 'SILVER', rateUnit: 'KG_1', rates: silverKarats.map((k) => ({ karatCode: k.code, sellRate: 78000, buyRate: 75000 })) });
+  // Current-market demo rates inside the real default limits (gold 145000–200000/10g, silver 240000–300000/kg) — the demo runs with the real rate guard.
+  await app.setRates(hq, { metal: 'GOLD', rateUnit: 'GRAM_10', rates: goldKarats.map((k) => ({ karatCode: k.code, sellRate: Math.round(165000 * (Number(k.touch) / 100)), buyRate: Math.round(165000 * (Number(k.touch) / 100)) - 3000 })) });
+  if (silverKarats.length) await app.setRates(hq, { metal: 'SILVER', rateUnit: 'KG_1', rates: silverKarats.map((k) => ({ karatCode: k.code, sellRate: 275000, buyRate: 268000 })) });
 
   // ── Masters: groups + item names (GOLD + SILVER, TAG + LOOSE) ───
   const [goldGroup] = await inv.createItemGroups(hq, { stockClass: 'GOLD', names: ['Gold Jewellery'], gstRate: 3 });
@@ -68,21 +67,23 @@ async function main() {
   const silverCoin = await inv.createItemName(hq, { groupId: silverGroup!.id, name: 'Silver Coin', method: 'TAG', tagPrefix: 'SC', tagDigits: 4 });
   const silverBar = await inv.createItemName(hq, { groupId: silverGroup!.id, name: 'Silver Bar', method: 'LOOSE' });
 
-  const tagRow = (itemNameId: number, karatCode: string, gross: number, cost: number) => ({ itemNameId, karatCode, pcs: 1, gross, less: 0, wastage: 2, stoneCharge: 0, labour: 500, labourUnit: 'PER_GRAM', other: 0, purchaseCost: cost });
-  const looseRow = (itemNameId: number, karatCode: string, gross: number, cost: number) => ({ itemNameId, karatCode, pcs: 1, gross, less: 0, wastage: 0, stoneCharge: 0, labour: 0, labourUnit: 'PER_GRAM', other: 0, purchaseCost: cost });
+  const GOLD_G = 16000; // demo purchase cost per gram (gold), under the ~16500 sell → visible margin
+  const SILVER_G = 260; // demo purchase cost per gram (silver)
+  const tagRow = (itemNameId: number, karatCode: string, gross: number, perGram: number) => ({ itemNameId, karatCode, pcs: 1, gross, less: 0, wastage: 2, stoneCharge: 0, labour: 500, labourUnit: 'PER_GRAM', other: 0, purchaseCost: Math.round(gross * perGram) });
+  const looseRow = (itemNameId: number, karatCode: string, gross: number, perGram: number) => ({ itemNameId, karatCode, pcs: 1, gross, less: 0, wastage: 0, stoneCharge: 0, labour: 0, labourUnit: 'PER_GRAM', other: 0, purchaseCost: Math.round(gross * perGram) });
   const entry = async (ctx: TenantContext, branchId: number, stockClass: 'GOLD' | 'SILVER', method: 'TAG' | 'LOOSE', rows: Record<string, unknown>[], dAgo: number) =>
     (await inv.createStockEntry(ctx, { stockClass, method, branchId, txnDate: daysAgo(dAgo), rows })).items.map((i) => i.id);
 
   // ~21 stock items across HQ / Pune / Kothrud
-  const hqRings = await entry(hq, HQ, 'GOLD', 'TAG', [tagRow(goldRing!.id, k22, 8, 44000), tagRow(goldRing!.id, k22, 10, 55000), tagRow(goldRing!.id, k22, 9, 49500), tagRow(goldRing!.id, k22, 11, 60500), tagRow(goldRing!.id, k22, 7.5, 41000)], 28);
-  const hqChains = await entry(hq, HQ, 'GOLD', 'TAG', [tagRow(goldChain!.id, k22, 15, 82500), tagRow(goldChain!.id, k22, 20, 110000)], 27);
-  await entry(hq, HQ, 'GOLD', 'LOOSE', [looseRow(goldBar!.id, k22, 100, 550000)], 27);
-  const puneRings = await entry(pune, PUNE, 'GOLD', 'TAG', [tagRow(goldRing!.id, k22, 9, 49500), tagRow(goldRing!.id, k22, 12, 66000), tagRow(goldRing!.id, k22, 8.5, 46750)], 25);
-  await entry(pune, PUNE, 'SILVER', 'TAG', [tagRow(silverCoin!.id, silverCode, 50, 3900), tagRow(silverCoin!.id, silverCode, 100, 7800), tagRow(silverCoin!.id, silverCode, 25, 1950)], 24);
-  await entry(pune, PUNE, 'SILVER', 'LOOSE', [looseRow(silverBar!.id, silverCode, 1000, 75000)], 24);
-  await entry(kothrud, KOTHRUD, 'GOLD', 'TAG', [tagRow(goldRing!.id, k22, 10, 55000), tagRow(goldRing!.id, k22, 6, 33000), tagRow(goldRing!.id, k22, 14, 77000)], 22);
-  const kothrudCoins = await entry(kothrud, KOTHRUD, 'SILVER', 'TAG', [tagRow(silverCoin!.id, silverCode, 75, 5850), tagRow(silverCoin!.id, silverCode, 40, 3120)], 22);
-  await entry(kothrud, KOTHRUD, 'GOLD', 'LOOSE', [looseRow(goldBar!.id, k22, 50, 275000)], 22);
+  const hqRings = await entry(hq, HQ, 'GOLD', 'TAG', [tagRow(goldRing!.id, k22, 8, GOLD_G), tagRow(goldRing!.id, k22, 10, GOLD_G), tagRow(goldRing!.id, k22, 9, GOLD_G), tagRow(goldRing!.id, k22, 11, GOLD_G), tagRow(goldRing!.id, k22, 7.5, GOLD_G)], 28);
+  const hqChains = await entry(hq, HQ, 'GOLD', 'TAG', [tagRow(goldChain!.id, k22, 15, GOLD_G), tagRow(goldChain!.id, k22, 20, GOLD_G)], 27);
+  await entry(hq, HQ, 'GOLD', 'LOOSE', [looseRow(goldBar!.id, k22, 100, GOLD_G)], 27);
+  const puneRings = await entry(pune, PUNE, 'GOLD', 'TAG', [tagRow(goldRing!.id, k22, 9, GOLD_G), tagRow(goldRing!.id, k22, 12, GOLD_G), tagRow(goldRing!.id, k22, 8.5, GOLD_G)], 25);
+  await entry(pune, PUNE, 'SILVER', 'TAG', [tagRow(silverCoin!.id, silverCode, 50, SILVER_G), tagRow(silverCoin!.id, silverCode, 100, SILVER_G), tagRow(silverCoin!.id, silverCode, 25, SILVER_G)], 24);
+  await entry(pune, PUNE, 'SILVER', 'LOOSE', [looseRow(silverBar!.id, silverCode, 1000, SILVER_G)], 24);
+  await entry(kothrud, KOTHRUD, 'GOLD', 'TAG', [tagRow(goldRing!.id, k22, 10, GOLD_G), tagRow(goldRing!.id, k22, 6, GOLD_G), tagRow(goldRing!.id, k22, 14, GOLD_G)], 22);
+  const kothrudCoins = await entry(kothrud, KOTHRUD, 'SILVER', 'TAG', [tagRow(silverCoin!.id, silverCode, 75, SILVER_G), tagRow(silverCoin!.id, silverCode, 40, SILVER_G)], 22);
+  await entry(kothrud, KOTHRUD, 'GOLD', 'LOOSE', [looseRow(goldBar!.id, k22, 50, GOLD_G)], 22);
 
   // ── Parties (customers / suppliers / karigar) ──────────────────
   const party = async (type: 'CUSTOMER' | 'SUPPLIER' | 'KARIGAR', name: string, mobile: string) => (await app.createParty(hq, { type, name, mobile, countryCode: '+91' })).dto.id;
@@ -102,35 +103,35 @@ async function main() {
   // ── Purchase bill (creates new stock at HQ) ────────────────────
   await billing.createBill(hq, billBody.parse({
     kind: 'PURCHASE', billType: 'GST', partyId: goldTraders, billDate: daysAgo(20), gstPercent: 3,
-    items: [{ itemNameId: goldRing!.id, gross: 10, karatCode: k22, rate: 5200 }, { itemNameId: goldChain!.id, gross: 18, karatCode: k22, rate: 5200 }],
+    items: [{ itemNameId: goldRing!.id, gross: 10, karatCode: k22, rate: 16500 }, { itemNameId: goldChain!.id, gross: 18, karatCode: k22, rate: 16500 }],
     payments: [{ mode: 'ONLINE', amount: 100000, bankAccountId: bankId }],
   }));
 
   // ── Sell bills ─────────────────────────────────────────────────
   // 1) GST, mixed cash + online + metal payment, small pending
   await billing.createBill(hq, billBody.parse({
-    kind: 'SELL', billType: 'GST', partyId: rahul, billDate: daysAgo(12), gstPercent: 3, items: [{ stockItemId: hqRings[0], gross: 10, rate: 60000 }],
-    payments: [{ mode: 'CASH', amount: 30000 }, { mode: 'ONLINE', amount: 20000, bankAccountId: bankId }, { mode: 'METAL', metal: 'GOLD', metalForm: 'BULLION', gross: 2, tunch: 91.67, rate: 60000 }],
+    kind: 'SELL', billType: 'GST', partyId: rahul, billDate: daysAgo(12), gstPercent: 3, items: [{ stockItemId: hqRings[0], gross: 10, rate: 165000 }],
+    payments: [{ mode: 'CASH', amount: 30000 }, { mode: 'ONLINE', amount: 20000, bankAccountId: bankId }, { mode: 'METAL', metal: 'GOLD', metalForm: 'BULLION', gross: 2, tunch: 91.67, rate: 165000 }],
   }));
   // 2) ROUGH, balance kept as GOLD
   await billing.createBill(pune, billBody.parse({
-    kind: 'SELL', billType: 'ROUGH', partyId: priya, billDate: daysAgo(10), items: [{ stockItemId: puneRings[0], gross: 9, rate: 60000 }],
-    payments: [{ mode: 'CASH', amount: 20000 }], keepBalanceAs: 'GOLD', keepRate: 60000,
+    kind: 'SELL', billType: 'ROUGH', partyId: priya, billDate: daysAgo(10), items: [{ stockItemId: puneRings[0], gross: 9, rate: 165000 }],
+    payments: [{ mode: 'CASH', amount: 20000 }], keepBalanceAs: 'GOLD', keepRate: 165000,
   }));
   // 3) GST silver sale, fully paid cash
   await billing.createBill(kothrud, billBody.parse({
-    kind: 'SELL', billType: 'GST', partyId: amit, billDate: daysAgo(7), gstPercent: 3, items: [{ stockItemId: kothrudCoins[0], gross: 75, rate: 78000 }],
+    kind: 'SELL', billType: 'GST', partyId: amit, billDate: daysAgo(7), gstPercent: 3, items: [{ stockItemId: kothrudCoins[0], gross: 75, rate: 275000 }],
     payments: [{ mode: 'CASH', amount: 6500 }],
   }));
   // 4) GST, partial cash → pending money balance (settled by an udhar txn below)
   const pendingBill = await billing.createBill(hq, billBody.parse({
-    kind: 'SELL', billType: 'GST', partyId: sneha, billDate: daysAgo(4), gstPercent: 3, items: [{ stockItemId: hqChains[0], gross: 15, rate: 60000 }],
+    kind: 'SELL', billType: 'GST', partyId: sneha, billDate: daysAgo(4), gstPercent: 3, items: [{ stockItemId: hqChains[0], gross: 15, rate: 165000 }],
     payments: [{ mode: 'CASH', amount: 20000 }],
   }));
 
   // ── Udhar txns ─────────────────────────────────────────────────
   // bhav cut: convert ₹50,000 of Rahul's balance into gold at 60000/10g
-  await udhar.createUdharTxn(hq, udharBody.parse({ partyId: rahul, txnDate: daysAgo(3), bhav: { direction: 'MONEY_TO_METAL', metal: 'GOLD', amount: 50000, rate: 60000, unitGrams: 10 }, remark: 'Bhav cut — money to gold' }));
+  await udhar.createUdharTxn(hq, udharBody.parse({ partyId: rahul, txnDate: daysAgo(3), bhav: { direction: 'MONEY_TO_METAL', metal: 'GOLD', amount: 50000, rate: 165000, unitGrams: 10 }, remark: 'Bhav cut — money to gold' }));
   // settle the pending sell bill with cash received
   await udhar.createUdharTxn(hq, udharBody.parse({ partyId: sneha, txnDate: daysAgo(2), cashIn: Number(pendingBill.balance), settleBillId: pendingBill.id, remark: 'Settled pending bill' }));
 

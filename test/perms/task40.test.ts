@@ -59,4 +59,15 @@ describe('TASK-40 widened read permissions', () => {
     expect(res.body).toHaveProperty('gstin');
     expect(res.body).toHaveProperty('state');
   });
+
+  it('business-profile prefers the active branch GSTIN / state when the branch has them', async () => {
+    const { business, root } = await biz();
+    await db.state.upsert({ where: { id: 27 }, update: {}, create: { id: 27, name: 'Maharashtra' } });
+    await db.branch.update({ where: { id: root.id }, data: { gstin: '27ABCDE1234F1Z5', stateId: 27 } });
+    const token = await branchUser(business.id, root.id, []); // branch user's active branch = root
+    const res = await api.get('/api/app/business-profile').set('Authorization', bearer(token));
+    expect(res.status).toBe(200);
+    expect(res.body.gstin).toBe('27ABCDE1234F1Z5'); // branch override, not the business's
+    expect(res.body.state).toEqual({ id: 27, name: 'Maharashtra' });
+  });
 });
