@@ -1,7 +1,9 @@
+import path from 'node:path';
 import { Router } from 'express';
 import multer from 'multer';
 import { requireMpin, requirePermission } from '../../middleware/guards';
 import { HttpError } from '../../middleware/error';
+import { saveStockImage, stockImagePath } from './uploads';
 import {
   bulkStockDeleteBody,
   bulkStockEditBody,
@@ -66,4 +68,17 @@ inventoryRouter.patch('/stock/:id', requirePermission('inventory.all_stock', 'ed
 inventoryRouter.delete('/stock/:id', requirePermission('inventory.all_stock', 'delete'), requireMpin, async (req, res) => {
   await inv.deleteStock(req.ctx!, idSchema.parse(req.params.id));
   res.status(204).end();
+});
+
+// Per-row stock image — magic-byte validated + scoped in uploads.ts; served via the files route.
+const CONTENT_TYPE: Record<string, string> = { '.jpg': 'image/jpeg', '.png': 'image/png', '.webp': 'image/webp' };
+inventoryRouter.post('/stock/:id/photo', requirePermission('inventory.all_stock', 'edit'), upload.single('file'), async (req, res) => {
+  if (!req.file) throw new HttpError(400, 'VALIDATION', 'No file uploaded (field "file")');
+  const id = idSchema.parse(req.params.id);
+  const rel = await saveStockImage(req.ctx!, id, req.file.buffer);
+  res.status(201).json({ url: `/api/app/files/stock/${id}/photo`, path: rel });
+});
+inventoryRouter.get('/files/stock/:id/photo', requirePermission('inventory.all_stock', 'view'), async (req, res) => {
+  const abs = await stockImagePath(req.ctx!, idSchema.parse(req.params.id));
+  res.type(CONTENT_TYPE[path.extname(abs)] ?? 'application/octet-stream').sendFile(abs);
 });

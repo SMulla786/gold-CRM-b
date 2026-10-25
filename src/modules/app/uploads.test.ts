@@ -3,7 +3,7 @@ import path from 'node:path';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { db, truncateAll } from '../../../test/helpers/db';
 import { createBusiness } from '../../../test/helpers/factory';
-import { savePartyImage } from './uploads';
+import { savePartyImage, saveStockImage } from './uploads';
 import type { TenantContext } from '../../middleware/context';
 
 const UPLOAD_ROOT = path.join(process.cwd(), 'uploads');
@@ -57,5 +57,33 @@ describe('savePartyImage', () => {
     expect(rel2.endsWith('.jpg')).toBe(true);
     expect(await exists(rel2)).toBe(true);
     expect(await exists(rel1)).toBe(false); // old file removed on replace
+  });
+});
+
+describe('saveStockImage', () => {
+  const stockItem = async (businessId: number, branchId: number) => {
+    const group = await db.itemGroup.create({ data: { businessId, stockClass: 'GOLD', name: 'G' } });
+    const itemName = await db.itemName.create({ data: { businessId, groupId: group.id, name: 'I' } });
+    return db.stockItem.create({ data: { businessId, branchId, stockClass: 'GOLD', groupId: group.id, itemNameId: itemName.id, method: 'TAG', source: 'STOCK_INSERT' } });
+  };
+
+  it('saves a per-row image under <businessId>/stock and stores the path', async () => {
+    const { business, root } = await createBusiness({ name: 'S' });
+    cleanupBusinessIds.push(business.id);
+    const item = await stockItem(business.id, root.id);
+    const ctx = { ...ctxFor(business.id), branchIds: [root.id], activeBranchId: root.id };
+
+    const rel = await saveStockImage(ctx, item.id, PNG);
+    expect(rel).toMatch(new RegExp(`^${business.id}/stock/[0-9a-f-]+\\.png$`));
+    expect(await exists(rel)).toBe(true);
+    expect((await db.stockItem.findUniqueOrThrow({ where: { id: item.id } })).photoUrl).toBe(rel);
+  });
+
+  it('404s for a stock item outside the caller branch subtree', async () => {
+    const { business, root } = await createBusiness({ name: 'S2' });
+    cleanupBusinessIds.push(business.id);
+    const item = await stockItem(business.id, root.id);
+    const outside = { ...ctxFor(business.id), branchIds: [root.id + 1000], activeBranchId: root.id + 1000 };
+    await expect(saveStockImage(outside, item.id, PNG)).rejects.toMatchObject({ status: 404 });
   });
 });
