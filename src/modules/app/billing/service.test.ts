@@ -138,6 +138,18 @@ describe('sell bill', () => {
     await expect(billing.createBill(s.ctx, parse({ kind: 'SELL', billType: 'ROUGH', partyId: s.party.id, items: [{ stockItemId: itemId, gross: 10, rate: 80000 }] }))).rejects.toMatchObject({ status: 400 });
   });
 
+  it('two concurrent sells of the same TAG item → exactly one succeeds, the other 409s', async () => {
+    const s = await setup();
+    const itemId = await newTagItem(s.ctx, s.itemName.id);
+    const sell = () => billing.createBill(s.ctx, parse({ kind: 'SELL', billType: 'ROUGH', partyId: s.party.id, items: [{ stockItemId: itemId, gross: 10, rate: 60000 }] }));
+    const results = await Promise.allSettled([sell(), sell()]);
+    expect(results.filter((r) => r.status === 'fulfilled')).toHaveLength(1);
+    const failed = results.filter((r) => r.status === 'rejected') as PromiseRejectedResult[];
+    expect(failed).toHaveLength(1);
+    expect(failed[0]!.reason).toMatchObject({ status: 409 });
+    expect((await db.stockItem.findUniqueOrThrow({ where: { id: itemId } })).status).toBe('SOLD');
+  });
+
   it('cross-tenant party → 404', async () => {
     const s = await setup();
     const b = await createBusiness({ name: 'B' });

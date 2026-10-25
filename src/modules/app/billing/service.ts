@@ -224,15 +224,18 @@ export async function createBill(ctx: TenantContext, body: BillBody): Promise<Bi
     for (const r of lines) {
       let stockItemId: number | null = null;
       if (r.action === 'SELL_TAG') {
-        await tx.stockItem.update({ where: { id: r.stockItem.id }, data: { status: 'SOLD' } });
+        // Atomic claim: only an AVAILABLE item in this branch flips to SOLD, so two concurrent bills can't both sell it.
+        const sold = await tx.stockItem.updateMany({ where: { id: r.stockItem.id, status: 'AVAILABLE', branchId }, data: { status: 'SOLD' } });
+        if (sold.count !== 1) throw new HttpError(409, 'CONFLICT', `Stock item ${r.stockItem.id} is no longer AVAILABLE`);
         stockItemId = r.stockItem.id;
       } else if (r.action === 'SELL_LOOSE') {
-        const it = r.stockItem;
-        const g = D(it.gross).minus(r.gross);
-        const l = D(it.less).minus(r.less);
-        const net = Prisma.Decimal.max(g.minus(l), 0);
+        // Atomic take with a gross/less/pcs guard — no lost update when two bills draw from the same loose item.
+        const taken = await tx.stockItem.updateMany({ where: { id: r.stockItem.id, status: 'AVAILABLE', gross: { gte: r.gross }, less: { gte: r.less }, pcs: { gte: r.pcs } }, data: { gross: { decrement: r.gross }, less: { decrement: r.less }, pcs: { decrement: r.pcs } } });
+        if (taken.count !== 1) throw new HttpError(409, 'CONFLICT', `Stock item ${r.stockItem.id} does not hold that much`);
+        const it = await tx.stockItem.findUniqueOrThrow({ where: { id: r.stockItem.id } });
+        const net = Prisma.Decimal.max(D(it.gross).minus(it.less), 0);
         const fine = net.times(D(it.tunch)).div(100).times(D(it.wastage).div(100).plus(1));
-        await tx.stockItem.update({ where: { id: it.id }, data: { gross: g, less: l, pcs: it.pcs - r.pcs, net, fine, status: g.lte(0) ? 'SOLD' : 'AVAILABLE' } });
+        await tx.stockItem.update({ where: { id: it.id }, data: { net, fine, status: D(it.gross).lte(0) ? 'SOLD' : 'AVAILABLE' } });
         stockItemId = it.id;
       } else if (r.action === 'PURCHASE') {
         const method = r.input.tagNo || r.itemName.method === 'TAG' ? 'TAG' : 'LOOSE';
@@ -320,27 +323,28 @@ export async function deleteBill(ctx: TenantContext, id: number, returnStock: bo
   if (bill.status !== 'ACTIVE') throw new HttpError(409, 'CONFLICT', 'Bill is not active');
   const lctx = lctxOf(ctx);
 
-  // PURCHASE return: every created item must still be AVAILABLE (not sold/transferred away).
-  if (returnStock && bill.kind === 'PURCHASE') {
-    const ids = bill.items.map((i) => i.stockItemId).filter((x): x is number => x != null);
-    const items = ids.length ? await sdb.stockItem.findMany({ where: { id: { in: ids } } }) : [];
-    for (const it of items) if (it.status !== 'AVAILABLE') throw new HttpError(409, 'CONFLICT', `Purchased item #${it.id} is no longer available — cannot return stock`);
-  }
-
   await prisma.$transaction(async (tx) => {
-    await tx.bill.update({ where: { id }, data: { status: 'DELETED', deletedAt: new Date(), deletedWithStock: returnStock } });
+    // Flip ACTIVE→DELETED atomically FIRST — two concurrent deletes can't both run the return (double stock).
+    const flipped = await tx.bill.updateMany({ where: { id, status: 'ACTIVE' }, data: { status: 'DELETED', deletedAt: new Date(), deletedWithStock: returnStock } });
+    if (flipped.count !== 1) throw new HttpError(409, 'CONFLICT', 'Bill is not active');
     await tx.billPayment.updateMany({ where: { billId: id }, data: { isActive: false } });
     for (const p of bill.payments) await ledger.reverse(tx, lctx, { source: billSource(bill.kind), sourceId: `${id}-P${p.id}` });
     await udhar.reverse(tx, lctx, { source: billSource(bill.kind), sourceId: String(id) });
 
     if (returnStock) {
       await ledger.reverse(tx, lctx, { source: billSource(bill.kind), sourceId: String(id) }); // stock rows
+      if (bill.kind === 'PURCHASE') {
+        // Availability check + delete in one atomic write: every created item must still be AVAILABLE.
+        const ids = bill.items.map((i) => i.stockItemId).filter((x): x is number => x != null);
+        if (ids.length) {
+          const del = await tx.stockItem.updateMany({ where: { id: { in: ids }, status: 'AVAILABLE' }, data: { status: 'DELETED' } });
+          if (del.count !== ids.length) throw new HttpError(409, 'CONFLICT', 'A purchased item is no longer available — cannot return stock');
+        }
+        await logActivity(tx, ctx, { module: bill.kind, action: 'DELETED', entity: 'BILL', entityId: String(id), summary: `Deleted purchase bill ${bill.billNo}` });
+        return;
+      }
       for (const it of bill.items) {
         if (it.stockItemId == null) continue;
-        if (bill.kind === 'PURCHASE') {
-          await tx.stockItem.update({ where: { id: it.stockItemId }, data: { status: 'DELETED' } });
-          continue;
-        }
         const stock = await tx.stockItem.findUnique({ where: { id: it.stockItemId } });
         if (!stock) continue;
         if (stock.method === 'LOOSE') {
