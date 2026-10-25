@@ -354,20 +354,32 @@ export async function statement(ctx: TenantContext, partyId: number, q: { from?:
 /** Pending bills (balance ≠ 0), both kinds. Reads Bill (empty until billing lands). */
 export async function pendingBills(ctx: TenantContext, q: { page: number; pageSize: number; partyId?: number; type?: PartyType }): Promise<Paged<BillListItemDto>> {
   const sdb = scopedDb(ctx);
-  // shortcut: final≠paid can't be a column-vs-column Prisma filter, so load ACTIVE bills and filter in app; fine while bill volume is modest, else move to a raw query.
+  if (ctx.branchIds.length === 0) return { items: [], total: 0, page: q.page, pageSize: q.pageSize };
+  // Pending = ACTIVE bill with final ≠ paid (a column-vs-column comparison Prisma can't express through the scoped client),
+  // so resolve the matching ids with a scoped raw query (type filters on the party via a join), then page them normally.
+  const conds: Prisma.Sql[] = [
+    Prisma.sql`b."businessId" = ${ctx.businessId!}`,
+    Prisma.sql`b."branchId" IN (${Prisma.join(ctx.branchIds)})`,
+    Prisma.sql`b.status::text = 'ACTIVE'`,
+    Prisma.sql`b.final <> b.paid`,
+  ];
+  if (q.partyId) conds.push(Prisma.sql`b."partyId" = ${q.partyId}`);
+  if (q.type) conds.push(Prisma.sql`p.type::text = ${q.type}`);
+  const join = q.type ? Prisma.sql`JOIN "Party" p ON p.id = b."partyId"` : Prisma.empty;
+  const ids = (await prisma.$queryRaw<{ id: number }[]>(Prisma.sql`SELECT b.id FROM "Bill" b ${join} WHERE ${Prisma.join(conds, ' AND ')}`)).map((r) => r.id);
+  if (ids.length === 0) return { items: [], total: 0, page: q.page, pageSize: q.pageSize };
+
   const bills = await sdb.bill.findMany({
-    where: { status: 'ACTIVE', ...(q.partyId ? { partyId: q.partyId } : {}) },
+    where: { id: { in: ids } },
     include: { _count: { select: { items: true } } },
     orderBy: [{ billDate: 'desc' }, { id: 'desc' }],
+    skip: (q.page - 1) * q.pageSize,
+    take: q.pageSize,
   });
   const partyMap = await partyRefs(sdb, bills.map((b) => b.partyId));
   const branchMap = await branchNames(sdb, bills.map((b) => b.branchId));
-  let rows = bills.filter((b) => !D(b.final).minus(b.paid).isZero());
-  if (q.type) rows = rows.filter((b) => partyMap.get(b.partyId)?.type === q.type);
-  const total = rows.length;
-  const page = rows.slice((q.page - 1) * q.pageSize, (q.page - 1) * q.pageSize + q.pageSize);
-  const creatorMap = await userNames(ctx, page.map((b) => b.createdById));
-  const items: BillListItemDto[] = page.map((b) => ({
+  const creatorMap = await userNames(ctx, bills.map((b) => b.createdById));
+  const items: BillListItemDto[] = bills.map((b) => ({
     id: b.id,
     kind: b.kind,
     billType: b.billType,
@@ -385,7 +397,7 @@ export async function pendingBills(ctx: TenantContext, q: { page: number; pageSi
     createdBy: b.createdById != null ? (creatorMap.get(b.createdById) ?? null) : null,
     createdAt: b.createdAt.toISOString(),
   }));
-  return { items, total, page: q.page, pageSize: q.pageSize };
+  return { items, total: ids.length, page: q.page, pageSize: q.pageSize };
 }
 
 // ───────────── helpers ─────────────
