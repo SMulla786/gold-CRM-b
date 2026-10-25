@@ -31,6 +31,13 @@ function emiDateFor(start: Date, emiNo: number): Date {
 const todayGoldRate = async (ctx: TenantContext) => Number((await currentRates(ctx)).gold.rows[0]?.sellRate ?? 0);
 const isP2002 = (e: unknown) => e instanceof Prisma.PrismaClientKnownRequestError && e.code === 'P2002';
 
+/** Row-lock the enrollment inside a tx (serializes a concurrent payment against a redeem — BUG-13) and return its live status. */
+async function lockEnrollment(tx: Prisma.TransactionClient, id: number): Promise<string> {
+  const r = await tx.$queryRaw<{ status: string }[]>`SELECT status FROM "SchemeEnrollment" WHERE id = ${id} FOR UPDATE`;
+  if (r.length === 0) throw new HttpError(404, 'NOT_FOUND', 'Enrollment not found');
+  return r[0]!.status;
+}
+
 // ───────────── Schemes ─────────────
 
 export async function createScheme(ctx: TenantContext, body: any): Promise<SchemeDto> {
@@ -182,7 +189,12 @@ export async function addPayment(ctx: TenantContext, body: any): Promise<Enrollm
   if (enrollment.status !== 'ACTIVE' && enrollment.status !== 'WON') throw new HttpError(409, 'CONFLICT', `Cannot add money to a ${enrollment.status.toLowerCase()} enrollment`);
   const scheme = await sdb.scheme.findUniqueOrThrow({ where: { id: enrollment.schemeId } });
   const goldRate = scheme.type === 'GOLD' ? await todayGoldRate(ctx) : 0;
-  await prisma.$transaction((tx) => postPayment(tx, ctx, enrollment, scheme, body, goldRate));
+  await prisma.$transaction(async (tx) => {
+    // lock first so a redeem in flight either sees this payment or closes before it (BUG-13)
+    const status = await lockEnrollment(tx, enrollment.id);
+    if (status !== 'ACTIVE' && status !== 'WON') throw new HttpError(409, 'CONFLICT', `Cannot add money to a ${status.toLowerCase()} enrollment`);
+    await postPayment(tx, ctx, enrollment, scheme, body, goldRate);
+  });
   return getEnrollment(ctx, enrollment.id);
 }
 
@@ -219,16 +231,18 @@ export async function redeem(ctx: TenantContext, id: number, body: any): Promise
   if (!e) throw new HttpError(404, 'NOT_FOUND', 'Enrollment not found');
   if (e.status !== 'ACTIVE' && e.status !== 'WON') throw new HttpError(409, 'CONFLICT', `A ${e.status.toLowerCase()} enrollment cannot be redeemed`);
   const scheme = await sdb.scheme.findUniqueOrThrow({ where: { id: e.schemeId } });
-  const payments = await prisma.schemePayment.findMany({ where: { enrollmentId: id, isReversed: false } });
-  const emisPaid = payments.filter((p) => p.emiNo != null).length;
-  if (!body.early && emisPaid < scheme.tenureMonths) throw new HttpError(409, 'CONFLICT', 'Not matured — withdraw instead');
-
   const gold = scheme.type === 'GOLD';
   const redeemRate = gold ? (body.redeemRate != null ? Number(body.redeemRate) : await todayGoldRate(ctx)) : 0;
-  const m = schemeMaturity({ type: scheme.type, payments: payments.map((p) => ({ amount: p.amount, fine: p.fine })), bonusType: scheme.bonusType, bonusValue: scheme.bonusValue, emiAmount: e.emiAmount, redeemRate, rateUnitGrams: GOLD_UNIT, early: body.early });
   const newStatus = body.early ? 'WITHDRAWN' : 'CLOSED';
 
   await prisma.$transaction(async (tx) => {
+    // lock the row BEFORE reading payments, so a concurrent addPayment is either included here or blocked out (BUG-13)
+    const status = await lockEnrollment(tx, id);
+    if (status !== 'ACTIVE' && status !== 'WON') throw new HttpError(409, 'CONFLICT', 'Enrollment was just closed');
+    const payments = await tx.schemePayment.findMany({ where: { enrollmentId: id, isReversed: false } });
+    const emisPaid = payments.filter((p) => p.emiNo != null).length;
+    if (!body.early && emisPaid < scheme.tenureMonths) throw new HttpError(409, 'CONFLICT', 'Not matured — withdraw instead');
+    const m = schemeMaturity({ type: scheme.type, payments: payments.map((p) => ({ amount: p.amount, fine: p.fine })), bonusType: scheme.bonusType, bonusValue: scheme.bonusValue, emiAmount: e.emiAmount, redeemRate, rateUnitGrams: GOLD_UNIT, early: body.early });
     const r = await tx.schemeEnrollment.updateMany({ where: { id, status: { in: ['ACTIVE', 'WON'] } }, data: { status: newStatus, redeemValue: m.maturityValue, redeemFine: gold ? m.maturity : null, redeemRate: gold ? redeemRate : null, closedAt: new Date() } });
     if (r.count !== 1) throw new HttpError(409, 'CONFLICT', 'Enrollment was just closed');
     // credit the customer (shop owes them the maturity value); a Sell Bill nets it like an order advance

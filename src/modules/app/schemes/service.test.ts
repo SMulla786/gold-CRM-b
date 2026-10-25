@@ -100,6 +100,22 @@ describe('schemes', () => {
     await expect(schemes.redeem(s.ctx, e.id, { early: false } as any)).rejects.toMatchObject({ status: 409 });
   });
 
+  it('a payment racing a redeem is never saved-but-excluded (BUG-13)', async () => {
+    const s = await setup();
+    const scheme = await cashScheme(s.ctx, { tenureMonths: 1 });
+    const e = await schemes.enroll(s.ctx, { schemeId: scheme.id, partyId: s.party.id, assignId: 'A1', displayName: 'C', tokenAmount: 0 } as any);
+    const results = await Promise.allSettled([
+      schemes.addPayment(s.ctx, { enrollmentId: e.id, emiNo: 1, amount: 2000, medium: 'CASH' } as any),
+      schemes.redeem(s.ctx, e.id, { early: true } as any),
+    ]);
+    // redeem always succeeds (early); the payment either commits first (included) or is blocked out (409) — never silently excluded
+    const paymentOk = results[0].status === 'fulfilled';
+    if (!paymentOk) expect((results[0] as PromiseRejectedResult).reason).toMatchObject({ status: 409 });
+    const paidSum = (await db.schemePayment.findMany({ where: { enrollmentId: e.id, isReversed: false } })).reduce((a, p) => a + Number(p.amount), 0);
+    const closed = await db.schemeEnrollment.findUniqueOrThrow({ where: { id: e.id } });
+    expect(Number(closed.redeemValue)).toBeCloseTo(paidSum, 2); // credit == what is actually on the books
+  });
+
   it('group over its member limit → 409', async () => {
     const s = await setup();
     const scheme = await cashScheme(s.ctx);
