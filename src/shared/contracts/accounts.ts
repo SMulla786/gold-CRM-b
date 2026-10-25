@@ -76,8 +76,12 @@ export interface LedgerRowDto {
   net: string | null;
   fine: string | null;
   amount: string | null;
+  /** stock item touched by this row (item name + tag), for the Item column */
+  item: { id: number; label: string } | null;
   narration: string | null;
   isReversal: boolean;
+  /** true when a later row reverses this one — show struck-through */
+  reversed: boolean;
   /** running balance after this row, in the asset's main unit (MONEY: amount, metals: fine, stone/artificial/franchise: pcs) */
   balance: string;
   entryBy: string | null;
@@ -106,6 +110,8 @@ export interface AssetTotalsDto {
   in: string;
   out: string;
   closing: string;
+  /** Σ amount IN − OUT up to `to` (rupee value; for stone/artificial/franchise the Total Cost) */
+  value: string;
 }
 
 export interface DayBookDto {
