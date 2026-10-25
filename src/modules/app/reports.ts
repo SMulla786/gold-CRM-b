@@ -3,8 +3,8 @@ import { prisma } from '../../lib/prisma';
 import { scopedDb } from '../../lib/db';
 import { businessDate } from '../../lib/ledger';
 import type { TenantContext } from '../../middleware/context';
-import { ACTIVITY_ACTIONS } from '../../shared';
-import type { ActivityDto, DashboardDto, GstRegisterRowDto, GstSummaryRowDto, HsnSummaryRowDto, Paged } from '../../shared';
+import { ACTIVITY_ACTIONS, B2CL_LIMIT } from '../../shared';
+import type { ActivityDto, DashboardDto, Gstr1B2bRow, Gstr1B2csRow, Gstr1CdnrRow, Gstr1Dto, Gstr1HsnRow, Gstr1InvoiceRow, Gstr3bDto, GstRegisterRowDto, GstSummaryRowDto, HsnSummaryRowDto, Paged } from '../../shared';
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 // Phase 6 read-only reports (docs/api-phase6.md). Every total is a SQL aggregate/groupBy through scopedDb or a
@@ -251,4 +251,178 @@ export async function gstSummary(ctx: TenantContext, q: { from?: Date; to?: Date
   return [...map.entries()]
     .sort((a, b) => (a[0] < b[0] ? -1 : 1))
     .map(([period, e]) => ({ period, salesTaxable: money(e.salesTaxable), purchaseTaxable: money(e.purchaseTaxable), outputGst: money(e.outputGst), inputGst: money(e.inputGst), netPayable: money(e.outputGst.minus(e.inputGst)) }));
+}
+
+// ───────────── Phase 12: GSTR-1 / GSTR-3B (docs/api-phase12.md) ─────────────
+// Read-only; every figure is a SQL aggregate over STORED bill fields (never recomputed) so register, GSTR-1 and
+// GSTR-3B always reconcile. GST is bill-level (one rate per bill); HSN is line-level and pro-rated like gstHsn.
+
+interface InvRow { id: number; billNo: string; billDate: Date; final: Prisma.Decimal; gstPercent: Prisma.Decimal; interState: boolean; taxable: Prisma.Decimal; cgst: Prisma.Decimal; sgst: Prisma.Decimal; igst: Prisma.Decimal; gstin: string | null; party: string; stateId: number | null; deletedAt: Date | null }
+type Cols = { taxable: Prisma.Decimal; cgst: Prisma.Decimal; sgst: Prisma.Decimal; igst: Prisma.Decimal };
+
+const pos2 = (code: number | null): string => (code != null ? String(code).padStart(2, '0') : '');
+const ddmmyyyy = (iso: string): string => { const [y, m, d] = iso.split('-'); return `${d}-${m}-${y}`; };
+
+/** Shop GSTIN + state code: active branch override → business (as in /app/business-profile). */
+async function shopIdentity(ctx: TenantContext): Promise<{ gstin: string | null; stateCode: number | null }> {
+  const sdb = scopedDb(ctx);
+  const [branch, business] = await Promise.all([
+    ctx.activeBranchId != null ? sdb.branch.findUnique({ where: { id: ctx.activeBranchId }, select: { gstin: true, stateId: true } }) : Promise.resolve(null),
+    prisma.business.findUnique({ where: { id: ctx.businessId! }, select: { gstin: true, stateId: true } }),
+  ]);
+  return { gstin: branch?.gstin ?? business?.gstin ?? null, stateCode: branch?.stateId ?? business?.stateId ?? null };
+}
+
+export async function gstr1(ctx: TenantContext, q: { from: Date; to: Date }): Promise<Gstr1Dto> {
+  const branches = branchFilter(ctx);
+  const from = dateOnly(businessDate(q.from));
+  const to = dateOnly(businessDate(q.to));
+  const shop = await shopIdentity(ctx);
+  const posOf = (stateId: number | null) => pos2(stateId ?? shop.stateCode);
+  const scope = Prisma.sql`b."businessId" = ${ctx.businessId!} AND b."branchId" IN (${Prisma.join(branches)})`;
+
+  // One read of every ACTIVE GST sell bill in the period feeds B2B / B2CL / B2CS and the totals (reconciles with the register — no per-bill query).
+  const inv = await prisma.$queryRaw<InvRow[]>(Prisma.sql`
+    SELECT b.id, b."billNo", b."billDate", b.final, b."gstPercent", b."interState", b.taxable, b.cgst, b.sgst, b.igst, p.gstin, p.name AS party, p."stateId", b."deletedAt"
+    FROM "Bill" b JOIN "Party" p ON p.id = b."partyId"
+    WHERE ${scope} AND b.kind::text='SELL' AND b."billType"::text='GST' AND b.status::text='ACTIVE'
+      AND b."billDate" >= ${from}::date AND b."billDate" <= ${to}::date
+    ORDER BY b."billDate", b.id`);
+
+  const b2b: Gstr1B2bRow[] = [];
+  const b2cl: Gstr1InvoiceRow[] = [];
+  const b2csMap = new Map<string, Cols & { pos: string; rate: string; supplyType: 'INTRA' | 'INTER' }>();
+  const addB2cs = (pos: string, rate: string, inter: boolean, c: Cols, sign: 1 | -1) => {
+    const supplyType = inter ? 'INTER' : 'INTRA';
+    const key = `${pos}|${rate}|${supplyType}`;
+    const e = b2csMap.get(key) ?? { pos, rate, supplyType, taxable: D(0), cgst: D(0), sgst: D(0), igst: D(0) };
+    e.taxable = e.taxable.plus(c.taxable.times(sign)); e.cgst = e.cgst.plus(c.cgst.times(sign)); e.sgst = e.sgst.plus(c.sgst.times(sign)); e.igst = e.igst.plus(c.igst.times(sign));
+    b2csMap.set(key, e);
+  };
+  const totals = { taxable: D(0), cgst: D(0), sgst: D(0), igst: D(0) };
+  for (const r of inv) {
+    const rate = String(r.gstPercent);
+    const pos = posOf(r.stateId);
+    const c: Cols = { taxable: D(r.taxable), cgst: D(r.cgst), sgst: D(r.sgst), igst: D(r.igst) };
+    totals.taxable = totals.taxable.plus(c.taxable); totals.cgst = totals.cgst.plus(c.cgst); totals.sgst = totals.sgst.plus(c.sgst); totals.igst = totals.igst.plus(c.igst);
+    const cols = { taxable: money(c.taxable), cgst: money(c.cgst), sgst: money(c.sgst), igst: money(c.igst) };
+    if (r.gstin) b2b.push({ billId: r.id, invNo: r.billNo, invDate: dateOnly(r.billDate), invValue: money(D(r.final)), pos, rate, gstin: r.gstin, party: r.party, ...cols });
+    else if (r.interState && D(r.final).gt(B2CL_LIMIT)) b2cl.push({ billId: r.id, invNo: r.billNo, invDate: dateOnly(r.billDate), invValue: money(D(r.final)), pos, rate, ...cols });
+    else addB2cs(pos, rate, r.interState, c, 1);
+  }
+
+  // Credit notes: a GST sell bill filed in an earlier period (billDate < from) but deleted inside it (deletedAt in period).
+  const cnInv = await prisma.$queryRaw<InvRow[]>(Prisma.sql`
+    SELECT b.id, b."billNo", b."billDate", b.final, b."gstPercent", b."interState", b.taxable, b.cgst, b.sgst, b.igst, p.gstin, p.name AS party, p."stateId", b."deletedAt"
+    FROM "Bill" b JOIN "Party" p ON p.id = b."partyId"
+    WHERE ${scope} AND b.kind::text='SELL' AND b."billType"::text='GST' AND b.status::text='DELETED'
+      AND b."billDate" < ${from}::date AND (b."deletedAt" AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata')::date BETWEEN ${from}::date AND ${to}::date -- IST business date
+    ORDER BY b."deletedAt", b.id`);
+  const cdnr: Gstr1CdnrRow[] = [];
+  for (const r of cnInv) {
+    const rate = String(r.gstPercent);
+    const pos = posOf(r.stateId);
+    const c: Cols = { taxable: D(r.taxable), cgst: D(r.cgst), sgst: D(r.sgst), igst: D(r.igst) };
+    if (r.gstin) cdnr.push({ billId: r.id, invNo: r.billNo, invDate: dateOnly(r.billDate), noteDate: r.deletedAt ? dateOnly(new Date(r.deletedAt.getTime() + 330 * 60000)) : dateOnly(r.billDate) /* IST day */, invValue: money(D(r.final)), pos, rate, gstin: r.gstin, party: r.party, taxable: money(c.taxable), cgst: money(c.cgst), sgst: money(c.sgst), igst: money(c.igst) });
+    else addB2cs(pos, rate, r.interState, c, -1); // unregistered credit note → negative B2CS
+  }
+  const b2cs: Gstr1B2csRow[] = [...b2csMap.values()].map((e) => ({ pos: e.pos, rate: e.rate, supplyType: e.supplyType, taxable: money(e.taxable), cgst: money(e.cgst), sgst: money(e.sgst), igst: money(e.igst) }));
+
+  // HSN (line-level, pro-rated by the line's share of its bill total), grouped by HSN + rate + uqc, split B2B/B2C.
+  const hsnRaw = await prisma.$queryRaw<{ hsnCode: string; rate: Prisma.Decimal; isMetal: boolean; isB2b: boolean; qty: Prisma.Decimal; taxable: Prisma.Decimal; cgst: Prisma.Decimal; sgst: Prisma.Decimal; igst: Prisma.Decimal; total: Prisma.Decimal }[]>(Prisma.sql`
+    SELECT bi."hsnCode" AS "hsnCode", b."gstPercent" AS rate, (bi."stockClass" IN ('GOLD','SILVER')) AS "isMetal", (p.gstin IS NOT NULL) AS "isB2b",
+      COALESCE(SUM(CASE WHEN bi."stockClass" IN ('GOLD','SILVER') THEN bi.net ELSE bi.pcs END),0)::numeric AS qty,
+      COALESCE(SUM(bi.total / NULLIF(b.total,0) * b.taxable),0)::numeric AS taxable,
+      COALESCE(SUM(bi.total / NULLIF(b.total,0) * b.cgst),0)::numeric AS cgst,
+      COALESCE(SUM(bi.total / NULLIF(b.total,0) * b.sgst),0)::numeric AS sgst,
+      COALESCE(SUM(bi.total / NULLIF(b.total,0) * b.igst),0)::numeric AS igst,
+      COALESCE(SUM(bi.total / NULLIF(b.total,0) * b.final),0)::numeric AS total
+    FROM "BillItem" bi JOIN "Bill" b ON b.id = bi."billId" JOIN "Party" p ON p.id = b."partyId"
+    WHERE ${scope} AND b.kind::text='SELL' AND b."billType"::text='GST' AND b.status::text='ACTIVE'
+      AND b."billDate" >= ${from}::date AND b."billDate" <= ${to}::date AND bi."hsnCode" IS NOT NULL
+    GROUP BY bi."hsnCode", b."gstPercent", (bi."stockClass" IN ('GOLD','SILVER')), (p.gstin IS NOT NULL)
+    ORDER BY bi."hsnCode"`);
+  const hsnRow = (r: (typeof hsnRaw)[number]): Gstr1HsnRow => ({ hsnCode: r.hsnCode, uqc: r.isMetal ? 'GMS' : 'PCS', qty: r.isMetal ? wt(D(r.qty)) : String(Math.round(Number(r.qty))), rate: String(r.rate), taxable: money(D(r.taxable)), cgst: money(D(r.cgst)), sgst: money(D(r.sgst)), igst: money(D(r.igst)), total: money(D(r.total)) });
+  const hsnB2b = hsnRaw.filter((r) => r.isB2b).map(hsnRow);
+  const hsnB2c = hsnRaw.filter((r) => !r.isB2b).map(hsnRow);
+
+  // docIssue: issued GST sell documents in the period (active + cancelled), per series (prefix before the trailing number).
+  const di = await prisma.$queryRaw<{ series: string; from: string; to: string; total: number; cancelled: number }[]>(Prisma.sql`
+    SELECT regexp_replace(b."billNo", '[0-9]+$', '') AS series, MIN(b."billNo") AS "from", MAX(b."billNo") AS "to",
+      COUNT(*)::int AS total, COUNT(*) FILTER (WHERE b.status::text='DELETED')::int AS cancelled
+    FROM "Bill" b
+    WHERE ${scope} AND b.kind::text='SELL' AND b."billType"::text='GST'
+      AND b."billDate" >= ${from}::date AND b."billDate" <= ${to}::date AND b.status::text IN ('ACTIVE','DELETED')
+    GROUP BY 1 ORDER BY 1`);
+
+  return {
+    from, to, gstin: shop.gstin, b2b, b2cl, b2cs, hsnB2b, hsnB2c, cdnr,
+    docIssue: di.map((d) => ({ series: d.series, from: d.from, to: d.to, total: Number(d.total), cancelled: Number(d.cancelled) })),
+    totals: { taxable: money(totals.taxable), cgst: money(totals.cgst), sgst: money(totals.sgst), igst: money(totals.igst), invoices: inv.length },
+  };
+}
+
+export async function gstr3b(ctx: TenantContext, q: { from: Date; to: Date }): Promise<Gstr3bDto> {
+  const from = dateOnly(businessDate(q.from));
+  const to = dateOnly(businessDate(q.to));
+  const scope = sqlScope(ctx, branchFilter(ctx));
+  const shop = await shopIdentity(ctx);
+  const period = Prisma.sql`b."billDate" >= ${from}::date AND b."billDate" <= ${to}::date`;
+
+  const [outRow, nonRow, itcRow] = await Promise.all([
+    prisma.$queryRaw<Cols[]>(Prisma.sql`SELECT COALESCE(SUM(taxable),0)::numeric AS taxable, COALESCE(SUM(cgst),0)::numeric AS cgst, COALESCE(SUM(sgst),0)::numeric AS sgst, COALESCE(SUM(igst),0)::numeric AS igst FROM "Bill" b WHERE ${scope} AND b.kind::text='SELL' AND b."billType"::text='GST' AND b.status::text='ACTIVE' AND ${period}`),
+    prisma.$queryRaw<{ s: Prisma.Decimal }[]>(Prisma.sql`SELECT COALESCE(SUM(final),0)::numeric AS s FROM "Bill" b WHERE ${scope} AND b.kind::text='SELL' AND b."billType"::text='ROUGH' AND b.status::text='ACTIVE' AND ${period}`),
+    prisma.$queryRaw<{ cgst: Prisma.Decimal; sgst: Prisma.Decimal; igst: Prisma.Decimal }[]>(Prisma.sql`SELECT COALESCE(SUM(b.cgst),0)::numeric AS cgst, COALESCE(SUM(b.sgst),0)::numeric AS sgst, COALESCE(SUM(b.igst),0)::numeric AS igst FROM "Bill" b JOIN "Party" p ON p.id = b."partyId" WHERE b."businessId" = ${ctx.businessId!} AND b."branchId" IN (${Prisma.join(branchFilter(ctx))}) AND b.kind::text='PURCHASE' AND b."billType"::text='GST' AND b.status::text='ACTIVE' AND p.gstin IS NOT NULL AND ${period}`),
+  ]);
+  const out = outRow[0]!;
+  const itc = itcRow[0]!;
+  const outputTax = D(out.cgst).plus(out.sgst).plus(out.igst);
+  const itcTax = D(itc.cgst).plus(itc.sgst).plus(itc.igst);
+  const net = outputTax.minus(itcTax);
+  return {
+    from, to, gstin: shop.gstin,
+    outward: { taxable: money(D(out.taxable)), cgst: money(D(out.cgst)), sgst: money(D(out.sgst)), igst: money(D(out.igst)) },
+    nonGst: money(D(nonRow[0]!.s)),
+    itc: { cgst: money(D(itc.cgst)), sgst: money(D(itc.sgst)), igst: money(D(itc.igst)) },
+    netPayableIndicative: money(net.isNegative() ? D(0) : net),
+  };
+}
+
+/** GSTN offline-tool JSON (field names per the tool); amounts are 2-dp numbers. */
+export async function gstr1Json(ctx: TenantContext, q: { from: Date; to: Date }): Promise<Record<string, unknown>> {
+  const d = await gstr1(ctx, q);
+  const m = businessDate(q.from);
+  const fp = `${String(m.getUTCMonth() + 1).padStart(2, '0')}${m.getUTCFullYear()}`;
+  const n = (s: string) => Number(s);
+  const itms = (r: { rate: string; taxable: string; cgst: string; sgst: string; igst: string }) => [{ num: 1, itm_det: { rt: n(r.rate), txval: n(r.taxable), camt: n(r.cgst), samt: n(r.sgst), iamt: n(r.igst) } }];
+
+  const byCtin = new Map<string, any[]>();
+  for (const r of d.b2b) {
+    const inv = { inum: r.invNo, idt: ddmmyyyy(r.invDate), val: n(r.invValue), pos: r.pos, rchrg: 'N', inv_typ: 'R', itms: itms(r) };
+    (byCtin.get(r.gstin) ?? byCtin.set(r.gstin, []).get(r.gstin)!).push(inv);
+  }
+  const b2b = [...byCtin.entries()].map(([ctin, inv]) => ({ ctin, inv }));
+
+  const byPos = new Map<string, any[]>();
+  for (const r of d.b2cl) {
+    const inv = { inum: r.invNo, idt: ddmmyyyy(r.invDate), val: n(r.invValue), itms: itms(r) };
+    (byPos.get(r.pos) ?? byPos.set(r.pos, []).get(r.pos)!).push(inv);
+  }
+  const b2cl = [...byPos.entries()].map(([pos, inv]) => ({ pos, inv }));
+
+  const b2cs = d.b2cs.map((r) => ({ sply_ty: r.supplyType, pos: r.pos, typ: 'OE', rt: n(r.rate), txval: n(r.taxable), camt: n(r.cgst), samt: n(r.sgst), iamt: n(r.igst) }));
+
+  const hsnItem = (r: Gstr1HsnRow, i: number) => ({ num: i + 1, hsn_sc: r.hsnCode, uqc: r.uqc, qty: n(r.qty), rt: n(r.rate), txval: n(r.taxable), camt: n(r.cgst), samt: n(r.sgst), iamt: n(r.igst) });
+  const hsn = { hsn_b2b: d.hsnB2b.map(hsnItem), hsn_b2c: d.hsnB2c.map(hsnItem) };
+
+  const cnByCtin = new Map<string, any[]>();
+  for (const r of d.cdnr) {
+    const nt = { ntty: 'C', nt_num: r.invNo, nt_dt: ddmmyyyy(r.noteDate), val: n(r.invValue), pos: r.pos, rchrg: 'N', itms: itms(r) };
+    (cnByCtin.get(r.gstin) ?? cnByCtin.set(r.gstin, []).get(r.gstin)!).push(nt);
+  }
+  const cdnr = [...cnByCtin.entries()].map(([ctin, nt]) => ({ ctin, nt }));
+
+  const doc_issue = { doc_det: [{ doc_num: 1, docs: d.docIssue.map((s, i) => ({ num: i + 1, from: s.from, to: s.to, totnum: s.total, cancel: s.cancelled, net_issue: s.total - s.cancelled })) }] };
+
+  return { gstin: d.gstin, fp, b2b, b2cl, b2cs, hsn, cdnr, doc_issue };
 }
