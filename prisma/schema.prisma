@@ -1219,3 +1219,323 @@ model SalesDraftItem {
 
   @@index([draftId])
 }
+
+// ───────────── Phase 8: customer orders + karigar job work + repair ─────────────
+
+enum OrderStatus {
+  PENDING
+  IN_PROCESS
+  READY
+  DELIVERED
+  CANCELLED
+}
+
+enum OrderRateType {
+  FIXED
+  ON_DELIVERY
+}
+
+enum OrderItemStatus {
+  PENDING
+  ASSIGNED
+  RECEIVED
+  DELIVERED
+}
+
+model Order {
+  id           Int            @id @default(autoincrement())
+  businessId   Int
+  branchId     Int
+  orderNo      Int
+  partyId      Int
+  orderDate    DateTime       @db.Date
+  deliveryDate DateTime?      @db.Date
+  rateType     OrderRateType  @default(ON_DELIVERY)
+  /// FIXED: rate per settings unit locked at order time
+  goldRate     Decimal?       @db.Decimal(14, 2)
+  silverRate   Decimal?       @db.Decimal(14, 2)
+  isUrgent     Boolean        @default(false)
+  designUrl    String?
+  remark       String?
+  status       OrderStatus    @default(PENDING)
+  estTotal     Decimal        @default(0) @db.Decimal(14, 2)
+  /// money value of active advances
+  advance      Decimal        @default(0) @db.Decimal(14, 2)
+  billId       Int?
+  createdById  Int?
+  createdAt    DateTime       @default(now())
+  updatedAt    DateTime       @updatedAt
+  items        OrderItem[]
+  payments     OrderPayment[]
+
+  @@unique([businessId, branchId, orderNo])
+  @@index([businessId, branchId, status])
+  @@index([businessId, partyId])
+}
+
+model OrderItem {
+  id             Int             @id @default(autoincrement())
+  orderId        Int
+  itemNameId     Int
+  metal          MetalKind
+  karatCode      String?
+  touch          Decimal         @db.Decimal(6, 3)
+  size           String?
+  pcs            Int             @default(1)
+  gross          Decimal         @db.Decimal(14, 3)
+  less           Decimal         @default(0) @db.Decimal(14, 3)
+  net            Decimal         @db.Decimal(14, 3)
+  wastage        Decimal         @default(0) @db.Decimal(6, 3)
+  fine           Decimal         @db.Decimal(14, 3)
+  making         Decimal         @default(0) @db.Decimal(12, 2)
+  makingUnit     ChargeUnit      @default(PER_GRAM)
+  other          Decimal         @default(0) @db.Decimal(14, 2)
+  estTotal       Decimal         @default(0) @db.Decimal(14, 2)
+  remark         String?
+  status         OrderItemStatus @default(PENDING)
+  karigarIssueId Int?
+  /// finished piece created on karigar receive (StockItem RESERVED, source ORDER_RECEIVE)
+  stockItemId    Int?
+  returnedGross  Decimal?        @db.Decimal(14, 3)
+  returnedNet    Decimal?        @db.Decimal(14, 3)
+  returnedFine   Decimal?        @db.Decimal(14, 3)
+  /// fine weight the karigar is allowed to lose (ghat)
+  ghatAllowance  Decimal?        @db.Decimal(14, 3)
+  karigarLabour  Decimal?        @db.Decimal(12, 2)
+  receivedAt     DateTime?
+  order          Order           @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([orderId])
+  @@index([karigarIssueId])
+}
+
+model OrderPayment {
+  id            Int             @id @default(autoincrement())
+  orderId       Int
+  mode          BillPaymentMode
+  bankAccountId Int?
+  metal         MetalKind?
+  metalForm     MetalForm?
+  gross         Decimal?        @db.Decimal(14, 3)
+  net           Decimal?        @db.Decimal(14, 3)
+  tunch         Decimal?        @db.Decimal(6, 3)
+  fine          Decimal?        @db.Decimal(14, 3)
+  rate          Decimal?        @db.Decimal(14, 2)
+  amount        Decimal         @db.Decimal(14, 2)
+  remark        String?
+  txnDate       DateTime        @db.Date
+  isActive      Boolean         @default(true)
+  createdById   Int?
+  createdAt     DateTime        @default(now())
+  order         Order           @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([orderId])
+}
+
+enum KarigarIssueStatus {
+  OPEN
+  RECEIVED
+  CANCELLED
+}
+
+/// Work + material handed to a karigar (Party type KARIGAR) for one or more order items.
+model KarigarIssue {
+  id            Int                @id @default(autoincrement())
+  businessId    Int
+  branchId      Int
+  issueNo       Int
+  karigarId     Int
+  issueDate     DateTime           @db.Date
+  dueDate       DateTime?          @db.Date
+  goldFine      Decimal            @default(0) @db.Decimal(14, 3)
+  silverFine    Decimal            @default(0) @db.Decimal(14, 3)
+  cash          Decimal            @default(0) @db.Decimal(14, 2)
+  online        Decimal            @default(0) @db.Decimal(14, 2)
+  bankAccountId Int?
+  remark        String?
+  status        KarigarIssueStatus @default(OPEN)
+  createdById   Int?
+  createdAt     DateTime           @default(now())
+  updatedAt     DateTime           @updatedAt
+
+  @@unique([businessId, branchId, issueNo])
+  @@index([businessId, karigarId])
+}
+
+enum RepairStatus {
+  RECEIVED
+  IN_PROGRESS
+  IN_REVIEW
+  READY
+  DELIVERED
+  CANCELLED
+}
+
+enum RepairPriority {
+  NORMAL
+  URGENT
+  EXPRESS
+}
+
+/// Customer's own piece in for repair — never shop stock. Shop metal added (solder) is a shop GOLD/SILVER OUT.
+model RepairTicket {
+  id             Int            @id @default(autoincrement())
+  businessId     Int
+  branchId       Int
+  ticketNo       Int
+  partyId        Int
+  /// GOLD / SILVER / OTHER
+  metal          String
+  category       String
+  description    String
+  pcs            Int            @default(1)
+  gross          Decimal        @db.Decimal(14, 3)
+  net            Decimal?       @db.Decimal(14, 3)
+  karatCode      String?
+  hallmark       String?
+  photoUrl       String?
+  expectedDate   DateTime       @db.Date
+  priority       RepairPriority @default(NORMAL)
+  status         RepairStatus   @default(RECEIVED)
+  karigarId      Int?
+  labourCharge   Decimal        @default(0) @db.Decimal(12, 2)
+  otherCharge    Decimal        @default(0) @db.Decimal(12, 2)
+  advanceCash    Decimal        @default(0) @db.Decimal(14, 2)
+  advanceOnline  Decimal        @default(0) @db.Decimal(14, 2)
+  advanceBankId  Int?
+  finalWeight    Decimal?       @db.Decimal(14, 3)
+  remarks        String?
+  addedMetal     MetalKind?
+  addedFine      Decimal?       @db.Decimal(14, 3)
+  addedRate      Decimal?       @db.Decimal(14, 2)
+  deliveryCash   Decimal?       @db.Decimal(14, 2)
+  deliveryOnline Decimal?       @db.Decimal(14, 2)
+  deliveryBankId Int?
+  deliveredAt    DateTime?
+  createdById    Int?
+  createdAt      DateTime       @default(now())
+  updatedAt      DateTime       @updatedAt
+
+  @@unique([businessId, branchId, ticketNo])
+  @@index([businessId, branchId, status])
+}
+
+// ───────────── Phase 9: girvi (pledge loans) ─────────────
+
+enum InterestType {
+  SI
+  CI
+}
+
+enum InterestPeriod {
+  MONTHLY
+  ANNUAL
+}
+
+enum CiPeriod {
+  DAILY
+  MONTHLY
+  HALF_YEARLY
+  YEARLY
+}
+
+enum InterestMethod {
+  FULL_MONTH
+  DAY_WISE
+}
+
+enum GirviStatus {
+  ACTIVE
+  CLOSED
+}
+
+enum GirviItemStatus {
+  PLEDGED
+  RELEASED
+}
+
+enum GirviTxnType {
+  GRANT
+  TOPUP
+  INTEREST
+  RELEASE
+}
+
+/// One loan agreement with pledged items. Interest accrues on the outstanding principal from interestFrom.
+model GirviBatch {
+  id           Int            @id @default(autoincrement())
+  businessId   Int
+  branchId     Int
+  girviNo      Int
+  partyId      Int
+  issueDate    DateTime       @db.Date
+  tenureMonths Int            @default(12)
+  returnDate   DateTime       @db.Date
+  ratePercent  Decimal        @db.Decimal(6, 3)
+  ratePeriod   InterestPeriod @default(MONTHLY)
+  interestType InterestType   @default(SI)
+  ciPeriod     CiPeriod?
+  method       InterestMethod @default(DAY_WISE)
+  valuation    Decimal        @db.Decimal(14, 2)
+  /// outstanding principal (grant + top-ups − principal repaid)
+  principal    Decimal        @db.Decimal(14, 2)
+  /// interest is settled up to this date; accrues from here
+  interestFrom DateTime       @db.Date
+  status       GirviStatus    @default(ACTIVE)
+  docUrl       String?
+  remark       String?
+  closedAt     DateTime?
+  createdById  Int?
+  createdAt    DateTime       @default(now())
+  updatedAt    DateTime       @updatedAt
+  items        GirviItem[]
+  txns         GirviTxn[]
+
+  @@unique([businessId, branchId, girviNo])
+  @@index([businessId, branchId, status])
+  @@index([businessId, partyId])
+}
+
+model GirviItem {
+  id         Int             @id @default(autoincrement())
+  batchId    Int
+  category   String
+  name       String
+  photoUrl   String?
+  gross      Decimal         @db.Decimal(14, 3)
+  net        Decimal         @db.Decimal(14, 3)
+  purity     Decimal         @db.Decimal(6, 3)
+  fine       Decimal         @db.Decimal(14, 3)
+  /// valuation rate per gram of fine
+  rate       Decimal         @db.Decimal(14, 2)
+  valuation  Decimal         @db.Decimal(14, 2)
+  status     GirviItemStatus @default(PLEDGED)
+  releasedAt DateTime?
+  batch      GirviBatch      @relation(fields: [batchId], references: [id], onDelete: Cascade)
+
+  @@index([batchId])
+}
+
+model GirviTxn {
+  id            Int          @id @default(autoincrement())
+  batchId       Int
+  type          GirviTxnType
+  txnDate       DateTime     @db.Date
+  /// GRANT/TOPUP: paid out to the customer; RELEASE: principal received back
+  principal     Decimal      @default(0) @db.Decimal(14, 2)
+  /// interest received
+  interest      Decimal      @default(0) @db.Decimal(14, 2)
+  discount      Decimal      @default(0) @db.Decimal(14, 2)
+  cash          Decimal      @default(0) @db.Decimal(14, 2)
+  online        Decimal      @default(0) @db.Decimal(14, 2)
+  bankAccountId Int?
+  /// RELEASE: GirviItem ids released in this txn
+  itemIds       Int[]
+  remark        String?
+  isReversed    Boolean      @default(false)
+  createdById   Int?
+  createdAt     DateTime     @default(now())
+  batch         GirviBatch   @relation(fields: [batchId], references: [id], onDelete: Cascade)
+
+  @@index([batchId])
+}

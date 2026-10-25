@@ -1,6 +1,6 @@
 // Baseline self-check by lead (hand-computed with the fixture-verified formulas).
 import { describe, expect, it } from 'vitest';
-import { computeBill, computeJustLine, computeLine, metalToMoney, moneyToMetal } from './index';
+import { computeBill, computeJustLine, computeLine, girviInterest, metalToMoney, moneyToMetal } from './index';
 
 describe('computeLine', () => {
   it('22K ring: multiplicative wastage, per-gram labour on gross, % discount on metal', () => {
@@ -71,5 +71,26 @@ describe('computeJustLine', () => {
   });
   it('per-gram making on a PCS line is an error', () => {
     expect(() => computeJustLine({ quantity: 1, unit: 'PCS', rate: 100, making: 5, makingUnit: 'PER_GRAM' })).toThrow();
+  });
+});
+
+describe('girviInterest', () => {
+  const base = { principal: 100000, ratePercent: 2, ratePeriod: 'MONTHLY' as const, from: '2026-01-15' };
+  it('SI day-wise: 2%/month for 45 days = 1.5 months', () => {
+    expect(girviInterest({ ...base, interestType: 'SI', method: 'DAY_WISE', to: '2026-03-01' })).toMatchObject({ interest: '3000.00', days: 45 });
+  });
+  it('SI full-month: a started month counts whole (Jan 15 → Mar 1 = 2 months)', () => {
+    expect(girviInterest({ ...base, interestType: 'SI', method: 'FULL_MONTH', to: '2026-03-01' }).interest).toBe('4000.00');
+    expect(girviInterest({ ...base, interestType: 'SI', method: 'FULL_MONTH', to: '2026-01-16' }).interest).toBe('2000.00');
+  });
+  it('annual rate is divided by 12', () => {
+    expect(girviInterest({ ...base, ratePercent: 24, ratePeriod: 'ANNUAL', interestType: 'SI', method: 'DAY_WISE', to: '2026-02-14' }).interest).toBe('2000.00');
+  });
+  it('CI monthly over 12 full months = P((1.02)^12 − 1)', () => {
+    expect(girviInterest({ ...base, interestType: 'CI', ciPeriod: 'MONTHLY', method: 'FULL_MONTH', to: '2027-01-15' }).interest).toBe('26824.18');
+  });
+  it('same day or earlier → zero', () => {
+    expect(girviInterest({ ...base, interestType: 'SI', method: 'DAY_WISE', to: '2026-01-15' }).interest).toBe('0.00');
+    expect(girviInterest({ ...base, interestType: 'SI', method: 'DAY_WISE', to: '2026-01-01' }).interest).toBe('0.00');
   });
 });

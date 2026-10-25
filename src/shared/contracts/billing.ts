@@ -92,6 +92,8 @@ export const billBody = z
     remark: z.string().trim().max(300).optional(),
     /** SELL from an APPROVED showroom draft (Phase 7): draft → BILLED in the same tx */
     draftId: id.optional(),
+    /** SELL delivering a customer order (Phase 8): its RESERVED finished pieces may be sold; order → DELIVERED in the same tx */
+    orderId: id.optional(),
   })
   .refine((b) => b.items.every((r) => r.less <= r.gross), { message: 'less cannot exceed gross', path: ['items'] })
   .refine((b) => b.keepBalanceAs === 'MONEY' || (b.keepRate ?? 0) > 0, { message: 'Enter the rate to keep the balance in metal', path: ['keepRate'] });

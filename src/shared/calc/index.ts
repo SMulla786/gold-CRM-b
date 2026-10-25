@@ -169,3 +169,53 @@ export function computeJustLine(i: JustLineInput): { amount: string; making: str
   const making = mu === 'PER_GRAM' ? D(i.quantity).times(D(i.making)) : mu === 'PERCENT' ? amount.times(D(i.making)).div(100) : D(i.making);
   return { amount: M(amount), making: M(making), total: M(amount.plus(making).plus(D(i.other))) };
 }
+
+export interface GirviInterestInput {
+  principal: Num;
+  /** % per ratePeriod */
+  ratePercent: Num;
+  ratePeriod: 'MONTHLY' | 'ANNUAL';
+  interestType: 'SI' | 'CI';
+  ciPeriod?: 'DAILY' | 'MONTHLY' | 'HALF_YEARLY' | 'YEARLY';
+  /** FULL_MONTH: any started month counts whole; DAY_WISE: days / 30 */
+  method: 'FULL_MONTH' | 'DAY_WISE';
+  /** ISO dates (YYYY-MM-DD) — interest accrues from `from` up to `to` */
+  from: string;
+  to: string;
+}
+
+const dayMs = 86_400_000;
+const ymd = (s: string) => {
+  const [y, m, d] = s.slice(0, 10).split('-').map(Number) as [number, number, number];
+  return { y, m, d, t: Date.UTC(y, m - 1, d) };
+};
+
+/** Girvi interest on the outstanding principal between two dates. shortcut: DAY_WISE uses a 30-day month (common shop practice), switch to actual month lengths if a shop asks. */
+export function girviInterest(i: GirviInterestInput): { interest: string; months: string; days: number } {
+  const a = ymd(i.from);
+  const b = ymd(i.to);
+  const days = Math.max(0, Math.round((b.t - a.t) / dayMs));
+  if (days === 0) return { interest: '0.00', months: '0', days: 0 };
+  const months =
+    i.method === 'FULL_MONTH'
+      ? new Decimal(Math.max(1, (b.y - a.y) * 12 + (b.m - a.m) + (b.d > a.d ? 1 : 0)))
+      : new Decimal(days).div(30);
+  const monthlyRate = D(i.ratePercent).div(i.ratePeriod === 'ANNUAL' ? 12 : 1).div(100);
+  const p = D(i.principal);
+  let interest: Decimal;
+  if (i.interestType === 'SI') {
+    interest = p.times(monthlyRate).times(months);
+  } else {
+    const cp = i.ciPeriod ?? 'MONTHLY';
+    const [r, n] =
+      cp === 'DAILY'
+        ? [monthlyRate.times(12).div(365), new Decimal(days)]
+        : cp === 'MONTHLY'
+          ? [monthlyRate, months]
+          : cp === 'HALF_YEARLY'
+            ? [monthlyRate.times(6), months.div(6)]
+            : [monthlyRate.times(12), months.div(12)];
+    interest = p.times(r.plus(1).pow(n).minus(1));
+  }
+  return { interest: M(interest), months: months.toDecimalPlaces(4).toString(), days };
+}

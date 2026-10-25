@@ -269,6 +269,18 @@ export const SETTING_SCHEMAS = {
     justBillDisclaimer: z.string().max(1000).default(''),
     columns: z.array(z.string()).default([]),
   }),
+  /** Girvi defaults (docs/modules/06 §6.7) — prefilled on New Girvi, editable per loan */
+  'girvi.defaults': z.object({
+    ratePercent: z.number().min(0).max(100).default(2),
+    ratePeriod: z.enum(['MONTHLY', 'ANNUAL']).default('MONTHLY'),
+    interestType: z.enum(['SI', 'CI']).default('SI'),
+    ciPeriod: z.enum(['DAILY', 'MONTHLY', 'HALF_YEARLY', 'YEARLY']).default('MONTHLY'),
+    method: z.enum(['FULL_MONTH', 'DAY_WISE']).default('DAY_WISE'),
+    /** loan = stdPercent % of valuation by default */
+    stdPercent: z.number().min(1).max(100).default(60),
+    tenureMonths: z.number().int().min(1).max(120).default(12),
+    categories: z.array(z.string().trim().min(1).max(40)).default(['Gold', 'Silver']),
+  }),
 } as const;
 export type SettingKey = keyof typeof SETTING_SCHEMAS;
 export const SETTING_KEYS = Object.keys(SETTING_SCHEMAS) as SettingKey[];
