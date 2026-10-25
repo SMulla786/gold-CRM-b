@@ -286,6 +286,29 @@ describe('edit bill (TASK-50)', () => {
   });
 });
 
+describe('bill from an approved draft (TASK-56 hook)', () => {
+  const draft = (businessId: number, branchId: number, over: Record<string, unknown>) =>
+    db.salesDraft.create({ data: { businessId, branchId, draftNo: Math.floor(Math.random() * 1e9), createdById: 1, customerName: 'C', estTotal: 60000, status: 'APPROVED', expiresAt: new Date(Date.now() + 86400000), ...over } });
+
+  it('flips the approved draft to BILLED once; a second bill with the same draft → 409', async () => {
+    const s = await setup();
+    const d = await draft(s.business.id, s.root.id, {});
+    const bill = await billing.createBill(s.ctx, parse({ kind: 'SELL', billType: 'ROUGH', partyId: s.party.id, draftId: d.id, items: [{ stockItemId: await newTagItem(s.ctx, s.itemName.id), gross: 10, rate: 60000 }] }));
+    const after = await db.salesDraft.findUniqueOrThrow({ where: { id: d.id } });
+    expect(after.status).toBe('BILLED');
+    expect(after.billId).toBe(bill.id);
+    await expect(billing.createBill(s.ctx, parse({ kind: 'SELL', billType: 'ROUGH', partyId: s.party.id, draftId: d.id, items: [{ stockItemId: await newTagItem(s.ctx, s.itemName.id), gross: 10, rate: 60000 }] }))).rejects.toMatchObject({ status: 409 });
+  });
+
+  it('rejects a non-APPROVED draft (409) and a non-SELL bill with a draft (400)', async () => {
+    const s = await setup();
+    const pending = await draft(s.business.id, s.root.id, { status: 'PENDING' });
+    await expect(billing.createBill(s.ctx, parse({ kind: 'SELL', billType: 'ROUGH', partyId: s.party.id, draftId: pending.id, items: [{ stockItemId: await newTagItem(s.ctx, s.itemName.id), gross: 10, rate: 60000 }] }))).rejects.toMatchObject({ status: 409 });
+    const approved = await draft(s.business.id, s.root.id, {});
+    await expect(billing.createBill(s.ctx, parse({ kind: 'PURCHASE', billType: 'ROUGH', partyId: s.party.id, draftId: approved.id, items: [{ itemNameId: s.itemName.id, gross: 10, karatCode: '22K', rate: 5000 }] }))).rejects.toMatchObject({ status: 400 });
+  });
+});
+
 describe('add bill payments', () => {
   it('increments paid atomically and drops the balance + party udhar', async () => {
     const s = await setup();

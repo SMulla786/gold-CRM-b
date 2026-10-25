@@ -49,6 +49,9 @@ const TENANT_MODELS: Record<string, Scope> = {
   Bill: 'branch',
   UdharEntry: 'branch',
   UdharTxn: 'branch',
+  // Phase 7 Just Bill + showroom drafts:
+  JustBill: 'branch',
+  SalesDraft: 'branch',
   ActivityLog: 'branch',
   // BillItem/BillPayment have no businessId — always reached through a scoped Bill (handled in services).
   // JewelleryType omitted (nullable businessId: global + custom) — scoped in its service like Role.

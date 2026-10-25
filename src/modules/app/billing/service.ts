@@ -32,7 +32,7 @@ const metalUnitGrams = (metal: 'GOLD' | 'SILVER', s: Settings): number => RATE_U
 
 // ───────────── Payments (shared by create + add-payments) ─────────────
 
-interface PayCalc {
+export interface PayCalc {
   input: BillPaymentInput;
   amount: string;
   bankAccountId?: number;
@@ -45,7 +45,7 @@ interface PayCalc {
   rate?: number;
 }
 
-async function computePayments(ctx: TenantContext, payments: BillPaymentInput[], s: Settings): Promise<PayCalc[]> {
+export async function computePayments(ctx: TenantContext, payments: BillPaymentInput[], s: Settings): Promise<PayCalc[]> {
   const bankIds = [...new Set(payments.flatMap((p) => (p.mode === 'ONLINE' ? [p.bankAccountId] : [])))];
   if (bankIds.length) {
     const have = new Set((await scopedDb(ctx).bankAccount.findMany({ where: { id: { in: bankIds } }, select: { id: true } })).map((b) => b.id));
@@ -68,7 +68,7 @@ function paymentLedgerRow(pc: PayCalc, paymentId: number, billId: number, kind: 
   return { ...base, asset: 'MONEY', bankAccountId: pc.bankAccountId ?? null, amount: pc.amount, narration: 'Bill payment' };
 }
 
-const sumAmounts = (pcs: PayCalc[]) => pcs.reduce((a, pc) => a.plus(D(pc.amount)), new Prisma.Decimal(0));
+export const sumAmounts = (pcs: PayCalc[]) => pcs.reduce((a, pc) => a.plus(D(pc.amount)), new Prisma.Decimal(0));
 
 // ───────────── Line resolution ─────────────
 
@@ -303,6 +303,13 @@ export async function createBill(ctx: TenantContext, body: BillBody): Promise<Bi
   const prep = await prepareBill(ctx, body, branchId, s);
   const lctx = lctxOf(ctx);
 
+  // Phase 7: billing from an approved showroom draft — validate up-front (friendly 409), flip it atomically in the tx.
+  if (body.draftId != null) {
+    if (body.kind !== 'SELL') throw new HttpError(400, 'VALIDATION', 'A draft can only be billed as a sell bill');
+    const draft = await scopedDb(ctx).salesDraft.findFirst({ where: { id: body.draftId }, select: { status: true, branchId: true, expiresAt: true } });
+    if (!draft || draft.status !== 'APPROVED' || draft.branchId !== branchId || draft.expiresAt < new Date()) throw new HttpError(409, 'CONFLICT', 'Draft is not approved and active in this branch');
+  }
+
   const billId = await prisma.$transaction(async (tx) => {
     const key = docKey(body.kind, body.billType, numbering, prep.billDate);
     const start = seriesStart(body.billType, numbering);
@@ -322,6 +329,10 @@ export async function createBill(ctx: TenantContext, body: BillBody): Promise<Bi
       },
     });
     await writeBillContents(tx, ctx, bill, body, prep, lctx);
+    if (body.draftId != null) {
+      const flip = await tx.salesDraft.updateMany({ where: { id: body.draftId, status: 'APPROVED' }, data: { status: 'BILLED', billId: bill.id } });
+      if (flip.count !== 1) throw new HttpError(409, 'CONFLICT', 'Draft has already been billed');
+    }
     await logActivity(tx, ctx, { module: body.kind, action: 'CREATED', entity: 'BILL', entityId: String(bill.id), summary: `${body.kind === 'SELL' ? 'Sell' : 'Purchase'} bill ${billNo} ₹${prep.billCalc.final}`, partyName: prep.party.name });
     return bill.id;
   });
