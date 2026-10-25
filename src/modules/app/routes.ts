@@ -12,6 +12,7 @@ import {
   partyBody,
   partyListQuery,
   partySearchQuery,
+  permissionEnquiryBody,
   putSettingBody,
   rateHistoryQuery,
   rateLimitsBody,
@@ -28,6 +29,7 @@ import { inventoryRouter } from './inventory.routes';
 import { daybookRouter } from './daybook/routes';
 import { accountsRouter } from './accounts.routes';
 import { udharRouter } from './udhar.routes';
+import * as enquiry from '../admin/enquiry';
 import { billingRouter } from './billing/routes';
 import { reportsRouter } from './reports.routes';
 import { businessProfileRouter } from './business-profile.routes';
@@ -88,6 +90,11 @@ for (const kind of ['photo', 'shop-logo'] as const) {
     res.type(CONTENT_TYPE[path.extname(abs)] ?? 'application/octet-stream').sendFile(abs);
   });
 }
+
+// ───────────── Permission enquiries (staff side) ─────────────
+// Any signed-in store user may request access; no requirePermission. requireWrite still gates POST on read-only subs.
+appRouter.post('/permission-enquiries', async (req, res) => res.status(201).json(await enquiry.createEnquiry(req.ctx!, permissionEnquiryBody.parse(req.body))));
+appRouter.get('/permission-enquiries/mine', async (req, res) => res.json(await enquiry.myEnquiries(req.ctx!)));
 
 // ───────────── Bank accounts ─────────────
 appRouter.get('/bank-accounts', requirePermission(MISC, 'view'), async (req, res) => res.json(await svc.listBankAccounts(req.ctx!, typeof req.query.applyTo === 'string' ? req.query.applyTo : undefined)));

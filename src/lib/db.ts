@@ -38,6 +38,7 @@ const TENANT_MODELS: Record<string, Scope> = {
   MetalRate: 'business',
   RateLimit: 'business',
   BusinessHsn: 'business',
+  PermissionEnquiry: 'business',
   // Phase 2 inventory + ledger:
   ItemGroup: 'business',
   ItemName: 'business',

@@ -4,6 +4,8 @@ import {
   branchBody,
   counterBody,
   createUserBody,
+  enquiryListQuery,
+  enquiryRejectBody,
   id as idSchema,
   moveBranchBody,
   permissionsBody,
@@ -17,6 +19,7 @@ import {
 } from '../../shared';
 import * as svc from './service';
 import { adminOverview } from './overview';
+import * as enquiry from './enquiry';
 
 export const adminRouter = Router();
 
@@ -74,6 +77,10 @@ adminRouter.post('/users/:id/reset-password', async (req, res) => {
 adminRouter.get('/permissions', (_req, res) => res.json(svc.permissionCatalog()));
 adminRouter.get('/users/:id/permissions', async (req, res) => res.json(await svc.getUserPermissions(req.ctx!, idSchema.parse(req.params.id))));
 adminRouter.put('/users/:id/permissions', async (req, res) => res.json(await svc.putUserPermissions(req.ctx!, idSchema.parse(req.params.id), permissionsBody.parse(req.body).grants)));
+// TASK-87 permission enquiries (manager side): list + approve (merge grant) / reject, requester-branch-scoped in the service.
+adminRouter.get('/permission-enquiries', async (req, res) => res.json(await enquiry.listEnquiries(req.ctx!, enquiryListQuery.parse(req.query))));
+adminRouter.post('/permission-enquiries/:id/approve', async (req, res) => res.json(await enquiry.approveEnquiry(req.ctx!, idSchema.parse(req.params.id))));
+adminRouter.post('/permission-enquiries/:id/reject', async (req, res) => res.json(await enquiry.rejectEnquiry(req.ctx!, idSchema.parse(req.params.id), enquiryRejectBody.parse(req.body).note)));
 adminRouter.get('/roles', async (req, res) => res.json(await svc.listRoles(req.ctx!)));
 adminRouter.post('/roles', async (req, res) => res.status(201).json(await svc.createRole(req.ctx!, roleBody.parse(req.body).name)));
 adminRouter.put('/roles/:id/permissions', async (req, res) => res.json(await svc.putRolePermissions(req.ctx!, idSchema.parse(req.params.id), permissionsBody.parse(req.body).grants)));
