@@ -11,6 +11,7 @@ export const ERROR_CODES = [
   'MODULE_DISABLED', // 403 module not in plan
   'PLAN_LIMIT', // 403 branch/user limit reached
   'MPIN_REQUIRED', // 403 sensitive action without valid X-MPIN header
+  'DAY_CLOSED', // 403 posting onto a branch-day that has been closed in the Day-Book (TASK-80)
   'NOT_FOUND', // 404 also used for rows outside caller's tenant/subtree
   'CONFLICT', // 409 unique violations
   'INTERNAL', // 500

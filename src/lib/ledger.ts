@@ -51,6 +51,13 @@ export function businessDate(d: Date = new Date()): Date {
 /** Writes ledger rows for a document. Validates branch scope, source, and per-asset required fields. */
 export async function post(tx: Prisma.TransactionClient, ctx: LedgerContext, entries: LedgerEntryInput[]): Promise<void> {
   const today = businessDate();
+  // TASK-80: block new postings onto a CLOSED branch-day (all modules). Reversals bypass this —
+  // writeReversals always dates corrections to today, so a closed past day stays intact.
+  const dayKeys = [...new Map(entries.map((e) => [`${e.branchId}|${businessDate(e.txnDate ?? today).getTime()}`, { branchId: e.branchId, date: businessDate(e.txnDate ?? today) }])).values()];
+  if (dayKeys.length) {
+    const closed = await tx.dayBook.findFirst({ where: { businessId: ctx.businessId, status: 'CLOSED', OR: dayKeys } });
+    if (closed) throw new HttpError(403, 'DAY_CLOSED', `Day-Book is closed for ${closed.date.toISOString().slice(0, 10)} — reopen the day to post.`);
+  }
   const data: Prisma.LedgerEntryCreateManyInput[] = [];
   for (const e of entries) {
     if (!ctx.branchIds.includes(e.branchId)) throw new HttpError(404, 'NOT_FOUND', 'Ledger branch out of scope');

@@ -44,6 +44,7 @@ const TENANT_MODELS: Record<string, Scope> = {
   StockItem: 'branch',
   LedgerEntry: 'branch',
   IncomeExpense: 'branch',
+  DayBook: 'branch',
   StockTransfer: 'transfer',
   // Phase 4/5 billing + udhari:
   Bill: 'branch',
