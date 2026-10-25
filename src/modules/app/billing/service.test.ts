@@ -239,6 +239,53 @@ describe('list bills', () => {
   });
 });
 
+describe('edit bill (TASK-50)', () => {
+  const udharAmount = async (partyId: number) => (await db.udharEntry.findMany({ where: { partyId }, select: { amount: true } })).reduce((a, r) => a + Number(r.amount), 0);
+
+  it('recomputes totals and nets the ledger; keeps the same id/billNo', async () => {
+    const s = await setup();
+    const itemId = await newTagItem(s.ctx, s.itemName.id);
+    const bill = await billing.createBill(s.ctx, parse({ kind: 'SELL', billType: 'ROUGH', partyId: s.party.id, items: [{ stockItemId: itemId, gross: 10, rate: 60000 }], payments: [{ mode: 'CASH', amount: 10000 }] }));
+    const edited = await billing.editBill(s.ctx, bill.id, parse({ kind: 'SELL', billType: 'ROUGH', partyId: s.party.id, items: [{ stockItemId: itemId, gross: 10, rate: 70000 }], payments: [{ mode: 'CASH', amount: 10000 }] }));
+    expect(edited.id).toBe(bill.id);
+    expect(edited.billNo).toBe(bill.billNo);
+    expect(Number(edited.final)).toBe(70000);
+    expect(Number(edited.balance)).toBe(60000);
+
+    const led = await db.ledgerEntry.findMany({ where: { source: 'SELL_BILL' } });
+    const net = (asset: string, field: 'fine' | 'amount') => led.filter((r) => r.asset === asset).reduce((a, r) => a + (r.direction === 'IN' ? 1 : -1) * Number(r[field]), 0);
+    expect(net('GOLD', 'fine')).toBeCloseTo(-9.167, 3); // sold once (old OUT reversed, new OUT)
+    expect(net('MONEY', 'amount')).toBeCloseTo(10000, 2); // paid once
+    expect(await udharAmount(s.party.id)).toBe(60000); // new balance, old reversed
+    expect((await db.stockItem.findUniqueOrThrow({ where: { id: itemId } })).status).toBe('SOLD');
+  });
+
+  it('swapping the TAG item frees the old one and sells the new one', async () => {
+    const s = await setup();
+    const a = await newTagItem(s.ctx, s.itemName.id);
+    const b = await newTagItem(s.ctx, s.itemName.id);
+    const bill = await billing.createBill(s.ctx, parse({ kind: 'SELL', billType: 'ROUGH', partyId: s.party.id, items: [{ stockItemId: a, gross: 10, rate: 60000 }] }));
+    expect((await db.stockItem.findUniqueOrThrow({ where: { id: a } })).status).toBe('SOLD');
+    await billing.editBill(s.ctx, bill.id, parse({ kind: 'SELL', billType: 'ROUGH', partyId: s.party.id, items: [{ stockItemId: b, gross: 10, rate: 60000 }] }));
+    expect((await db.stockItem.findUniqueOrThrow({ where: { id: a } })).status).toBe('AVAILABLE');
+    expect((await db.stockItem.findUniqueOrThrow({ where: { id: b } })).status).toBe('SOLD');
+  });
+
+  it('rejects editing a past-day bill (400)', async () => {
+    const s = await setup();
+    const itemId = await newTagItem(s.ctx, s.itemName.id);
+    const bill = await billing.createBill(s.ctx, parse({ kind: 'SELL', billType: 'ROUGH', partyId: s.party.id, billDate: new Date(Date.now() - 86400000), items: [{ stockItemId: itemId, gross: 10, rate: 60000 }] }));
+    await expect(billing.editBill(s.ctx, bill.id, parse({ kind: 'SELL', billType: 'ROUGH', partyId: s.party.id, items: [{ stockItemId: itemId, gross: 10, rate: 65000 }] }))).rejects.toMatchObject({ status: 400 });
+  });
+
+  it('rejects changing billType (400)', async () => {
+    const s = await setup();
+    const itemId = await newTagItem(s.ctx, s.itemName.id);
+    const bill = await billing.createBill(s.ctx, parse({ kind: 'SELL', billType: 'GST', partyId: s.party.id, gstPercent: 3, items: [{ stockItemId: itemId, gross: 10, rate: 60000 }] }));
+    await expect(billing.editBill(s.ctx, bill.id, parse({ kind: 'SELL', billType: 'ROUGH', partyId: s.party.id, items: [{ stockItemId: itemId, gross: 10, rate: 60000 }] }))).rejects.toMatchObject({ status: 400 });
+  });
+});
+
 describe('add bill payments', () => {
   it('increments paid atomically and drops the balance + party udhar', async () => {
     const s = await setup();

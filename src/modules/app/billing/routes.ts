@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import { hasPermission, requireMpin } from '../../../middleware/guards';
 import { HttpError } from '../../../middleware/error';
-import { addBillPaymentsBody, billBody, billListQuery, deleteBillQuery, id as idSchema, nextBillNoQuery } from '../../../shared';
+import { addBillPaymentsBody, billBody, billListQuery, deleteBillQuery, editBillBody, id as idSchema, nextBillNoQuery } from '../../../shared';
 import type { BillKind } from '../../../shared';
 import type { TenantContext } from '../../../middleware/context';
 import * as billing from './service';
@@ -39,6 +39,12 @@ billingRouter.get('/bills/:id', async (req, res) => {
   const id = idSchema.parse(req.params.id);
   assertPerm(req.ctx!, await billing.billKind(req.ctx!, id), 'view');
   res.json(await billing.getBill(req.ctx!, id));
+});
+
+billingRouter.patch('/bills/:id', requireMpin, async (req, res) => {
+  const id = idSchema.parse(req.params.id);
+  assertPerm(req.ctx!, await billing.billKind(req.ctx!, id), 'edit');
+  res.json(await billing.editBill(req.ctx!, id, editBillBody.parse(req.body)));
 });
 
 billingRouter.post('/bills/:id/payments', async (req, res) => {

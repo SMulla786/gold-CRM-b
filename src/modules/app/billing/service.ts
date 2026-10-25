@@ -92,12 +92,13 @@ interface ResolvedLine {
   itemName?: any;
 }
 
-async function resolveLines(ctx: TenantContext, body: BillBody, branchId: number, s: Settings): Promise<ResolvedLine[]> {
+async function resolveLines(ctx: TenantContext, body: BillBody, branchId: number, s: Settings, allowSold: Set<number> = new Set()): Promise<ResolvedLine[]> {
   const sdb = scopedDb(ctx);
   const sellStockIds = body.kind === 'SELL' ? [...new Set(body.items.flatMap((l) => (l.stockItemId != null ? [l.stockItemId] : [])))] : [];
   const nameIds = [...new Set(body.items.flatMap((l) => (l.stockItemId == null && l.itemNameId != null ? [l.itemNameId] : [])))];
   const [stockItems, itemNames, karats] = await Promise.all([
-    sellStockIds.length ? sdb.stockItem.findMany({ where: { id: { in: sellStockIds }, status: 'AVAILABLE', branchId }, include: { itemName: true, group: true } }) : [],
+    // allowSold = the editing bill's own items (still SOLD/reduced until the in-tx undo frees them); the in-tx guards remain authoritative.
+    sellStockIds.length ? sdb.stockItem.findMany({ where: { id: { in: sellStockIds }, branchId, OR: [{ status: 'AVAILABLE' }, { id: { in: [...allowSold] } }] }, include: { itemName: true, group: true } }) : [],
     nameIds.length ? sdb.itemName.findMany({ where: { id: { in: nameIds } }, include: { group: true } }) : [],
     sdb.karatMapping.findMany({ select: { code: true, touch: true } }),
   ]);
@@ -118,7 +119,7 @@ async function resolveLines(ctx: TenantContext, body: BillBody, branchId: number
       const common = { stockClass: cls, description: item.itemName.name, hsnCode, tagNo: item.tagNo, karatCode: item.karatCode, groupId: item.groupId, itemNameId: item.itemNameId, tunch: Number(item.tunch), wastage: Number(item.wastage), stockItem: item };
       if (item.method === 'TAG') r = { input: line, action: 'SELL_TAG', pcs: item.pcs, gross: Number(item.gross), less: Number(item.less), ...common };
       else {
-        if (line.gross > Number(item.gross) || line.less > Number(item.less) || line.pcs > item.pcs) throw new HttpError(409, 'CONFLICT', `Stock item ${item.id} does not hold that much`);
+        if (!allowSold.has(item.id) && (line.gross > Number(item.gross) || line.less > Number(item.less) || line.pcs > item.pcs)) throw new HttpError(409, 'CONFLICT', `Stock item ${item.id} does not hold that much`);
         r = { input: line, action: 'SELL_LOOSE', pcs: line.pcs, gross: line.gross, less: line.less, ...common };
       }
     } else if (body.kind === 'PURCHASE') {
@@ -155,12 +156,22 @@ export async function nextBillNo(ctx: TenantContext, q: { kind: BillKind; billTy
   return { billNo: formatBillNo(seq, q.billType, numbering, date) };
 }
 
-export async function createBill(ctx: TenantContext, body: BillBody): Promise<BillDto> {
-  const branchId = activeBranch(ctx);
-  const sdb = scopedDb(ctx);
-  const s = await getSettings(ctx);
-  const numbering = s[body.kind === 'SELL' ? 'invoice.sale' : 'invoice.purchase'];
+interface Prepared {
+  party: any;
+  interState: boolean;
+  lines: ResolvedLine[];
+  payCalcs: PayCalc[];
+  paid: Prisma.Decimal;
+  billCalc: ReturnType<typeof computeBill>;
+  bal: Prisma.Decimal;
+  keepWeight: string | null;
+  billDate: Date;
+  dueDate: Date | null;
+}
 
+/** Pre-tx read + validation shared by create and edit: party, interState, recomputed lines/payments, PAN + rate-limit checks, totals, keep weight, dates. */
+async function prepareBill(ctx: TenantContext, body: BillBody, branchId: number, s: Settings, allowSold: Set<number> = new Set()): Promise<Prepared> {
+  const sdb = scopedDb(ctx);
   const party = await sdb.party.findUnique({ where: { id: body.partyId } });
   if (!party) throw new HttpError(404, 'NOT_FOUND', 'Party not found');
   const branch = await sdb.branch.findUnique({ where: { id: branchId }, select: { stateId: true } });
@@ -168,17 +179,15 @@ export async function createBill(ctx: TenantContext, body: BillBody): Promise<Bi
   const branchState = branch?.stateId ?? business?.stateId ?? null;
   const interState = party.stateId != null && branchState != null && party.stateId !== branchState;
 
-  const lines = await resolveLines(ctx, body, branchId, s);
+  const lines = await resolveLines(ctx, body, branchId, s, allowSold);
   const payCalcs = await computePayments(ctx, body.payments, s);
   const paid = sumAmounts(payCalcs);
 
-  // PAN rule (SELL): big cash receipt needs the party's PAN.
   if (body.kind === 'SELL') {
+    // PAN rule: a big cash receipt needs the party's PAN.
     const cash = payCalcs.filter((p) => p.input.mode === 'CASH').reduce((a, p) => a.plus(D(p.amount)), new Prisma.Decimal(0));
     if (cash.gte(PAN_CASH_LIMIT) && !party.pan && !body.pan) throw new HttpError(400, 'VALIDATION', 'PAN required for this cash amount', { code: 'PAN_REQUIRED' });
-  }
-  // Rate limits (SELL GOLD/SILVER lines with a rate).
-  if (body.kind === 'SELL') {
+    // Rate limits on GOLD/SILVER lines.
     const limits = await sdb.rateLimit.findMany({});
     lines.forEach((r, i) => {
       if ((r.stockClass === 'GOLD' || r.stockClass === 'SILVER') && Number(r.input.rate) > 0) {
@@ -189,99 +198,171 @@ export async function createBill(ctx: TenantContext, body: BillBody): Promise<Bi
     });
   }
 
+  const numbering = s[body.kind === 'SELL' ? 'invoice.sale' : 'invoice.purchase'];
   const gstExempt = numbering.gstOnRemainingMetal ? payCalcs.filter((p) => p.input.mode === 'METAL').reduce((a, p) => a.plus(D(p.amount)), new Prisma.Decimal(0)) : new Prisma.Decimal(0);
   const billCalc = computeBill({ lineTotals: lines.map((r) => r.calc.total), discount: body.discount, discountUnit: body.discountUnit, gstPercent: body.billType === 'ROUGH' ? 0 : body.gstPercent, interState, gstExemptAmount: gstExempt, roundTo: 1 });
-
   const bal = D(billCalc.final).minus(paid);
-  let keepWeight: string | null = null;
-  if (bal.gt(0) && body.keepBalanceAs !== 'MONEY') keepWeight = moneyToMetal(bal, body.keepRate!, metalUnitGrams(body.keepBalanceAs, s));
+  const keepWeight = bal.gt(0) && body.keepBalanceAs !== 'MONEY' ? moneyToMetal(bal, body.keepRate!, metalUnitGrams(body.keepBalanceAs, s)) : null;
+  return { party, interState, lines, payCalcs, paid, billCalc, bal, keepWeight, billDate: ledger.businessDate(body.billDate ?? new Date()), dueDate: body.dueDate ? ledger.businessDate(body.dueDate) : null };
+}
 
-  const billDate = ledger.businessDate(body.billDate ?? new Date());
+/** The line/stock/ledger/payment/udhar writes applied onto an existing Bill row (no numbering) — shared by create and edit. Carries the TASK-30b in-tx concurrency guards. */
+async function writeBillContents(tx: Prisma.TransactionClient, ctx: TenantContext, bill: { id: number; branchId: number; billNo: string; billDate: Date }, body: BillBody, prep: Prepared, lctx: ledger.LedgerContext): Promise<void> {
+  const { id: billId, branchId, billNo, billDate } = bill;
+  if (body.pan && !prep.party.pan) await tx.party.update({ where: { id: prep.party.id }, data: { pan: body.pan } });
+
+  const stockLedger: ledger.LedgerEntryInput[] = [];
+  for (const r of prep.lines) {
+    let stockItemId: number | null = null;
+    if (r.action === 'SELL_TAG') {
+      const sold = await tx.stockItem.updateMany({ where: { id: r.stockItem.id, status: 'AVAILABLE', branchId }, data: { status: 'SOLD' } });
+      if (sold.count !== 1) throw new HttpError(409, 'CONFLICT', `Stock item ${r.stockItem.id} is no longer AVAILABLE`);
+      stockItemId = r.stockItem.id;
+    } else if (r.action === 'SELL_LOOSE') {
+      const taken = await tx.stockItem.updateMany({ where: { id: r.stockItem.id, status: 'AVAILABLE', gross: { gte: r.gross }, less: { gte: r.less }, pcs: { gte: r.pcs } }, data: { gross: { decrement: r.gross }, less: { decrement: r.less }, pcs: { decrement: r.pcs } } });
+      if (taken.count !== 1) throw new HttpError(409, 'CONFLICT', `Stock item ${r.stockItem.id} does not hold that much`);
+      const it = await tx.stockItem.findUniqueOrThrow({ where: { id: r.stockItem.id } });
+      const net = Prisma.Decimal.max(D(it.gross).minus(it.less), 0);
+      const fine = net.times(D(it.tunch)).div(100).times(D(it.wastage).div(100).plus(1));
+      await tx.stockItem.update({ where: { id: it.id }, data: { net, fine, status: D(it.gross).lte(0) ? 'SOLD' : 'AVAILABLE' } });
+      stockItemId = it.id;
+    } else if (r.action === 'PURCHASE') {
+      const method = r.input.tagNo || r.itemName.method === 'TAG' ? 'TAG' : 'LOOSE';
+      const tagNo = method === 'TAG' ? (r.input.tagNo ?? (r.itemName.tagPrefix && r.itemName.tagDigits ? await nextTagNo(tx, ctx.businessId!, r.itemName.tagPrefix, r.itemName.tagDigits) : null)) : null;
+      const created = await tx.stockItem.create({
+        data: {
+          businessId: ctx.businessId!, branchId, stockClass: r.stockClass, groupId: r.itemName.groupId, itemNameId: r.itemName.id, method, tagNo, huid: null, karatCode: r.karatCode,
+          pcs: r.pcs, gross: r.gross, less: r.less, net: r.calc.net, tunch: r.tunch, wastage: r.wastage, fine: r.calc.fine, stoneCharge: r.input.stoneCharge, labour: r.input.labour,
+          labourUnit: r.input.labourUnit, other: r.input.other, rate: r.input.rate || null, purchaseCost: r.calc.total, status: 'AVAILABLE', source: 'PURCHASE_BILL', sourceId: String(billId), createdById: ctx.userId,
+        },
+      });
+      stockItemId = created.id;
+    }
+    await tx.billItem.create({
+      data: {
+        billId, stockItemId, itemNameId: r.itemNameId, groupId: r.groupId, stockClass: r.stockClass, description: r.description, hsnCode: r.hsnCode, tagNo: r.tagNo, karatCode: r.karatCode,
+        pcs: r.pcs, gross: r.gross, less: r.less, net: r.calc.net, tunch: r.tunch, wastage: r.wastage, fine: r.calc.fine, stoneCharge: r.input.stoneCharge, rate: r.input.rate, labour: r.input.labour,
+        labourUnit: r.input.labourUnit, other: r.input.other, discount: r.input.discount, discountUnit: r.input.discountUnit, metalAmount: r.calc.metalAmount, labourAmount: r.calc.labourAmount, total: r.calc.total,
+      },
+    });
+    if (stockItemId != null) {
+      stockLedger.push({ branchId, txnDate: billDate, asset: ledger.assetForStockClass(r.stockClass), direction: body.kind === 'SELL' ? 'OUT' : 'IN', karatCode: r.karatCode, pcs: r.pcs, gross: r.gross, net: r.calc.net, fine: r.calc.fine, amount: r.calc.total, source: billSource(body.kind), sourceId: String(billId), stockItemId, narration: `${body.kind === 'SELL' ? 'Sold on' : 'Purchased on'} ${billNo}` });
+    }
+  }
+  if (stockLedger.length) await ledger.post(tx, lctx, stockLedger);
+
+  for (const pc of prep.payCalcs) {
+    const pay = await tx.billPayment.create({ data: { billId, mode: pc.input.mode, bankAccountId: pc.bankAccountId ?? null, metal: pc.metal ?? null, metalForm: pc.metalForm ?? null, gross: pc.gross ?? null, net: pc.net ?? null, tunch: pc.tunch ?? null, fine: pc.fine ?? null, rate: pc.rate ?? null, amount: pc.amount, remark: pc.input.remark ?? null, txnDate: billDate, isActive: true, createdById: ctx.userId } });
+    await ledger.post(tx, lctx, [paymentLedgerRow(pc, pay.id, billId, body.kind, branchId, billDate)]);
+  }
+
+  if (!prep.bal.isZero()) {
+    const sign = body.kind === 'SELL' ? 1 : -1;
+    const entry: udhar.UdharEntryInput = { branchId, partyId: prep.party.id, txnDate: billDate, source: billSource(body.kind), sourceId: String(billId), narration: billNo };
+    if (prep.keepWeight != null) {
+      if (body.keepBalanceAs === 'GOLD') entry.gold = D(prep.keepWeight).times(sign);
+      else entry.silver = D(prep.keepWeight).times(sign);
+    } else entry.amount = prep.bal.times(sign);
+    await udhar.post(tx, lctx, [entry]);
+  }
+}
+
+/** Reverse a bill's effects, keeping the Bill row: payment ledger + udhar always; stock ledger + stock restore only when returnStock. Shared by delete and edit. */
+async function undoBill(tx: Prisma.TransactionClient, ctx: TenantContext, bill: any, lctx: ledger.LedgerContext, returnStock: boolean): Promise<void> {
+  await tx.billPayment.updateMany({ where: { billId: bill.id }, data: { isActive: false } });
+  for (const p of bill.payments) await ledger.reverse(tx, lctx, { source: billSource(bill.kind), sourceId: `${bill.id}-P${p.id}` });
+  await udhar.reverse(tx, lctx, { source: billSource(bill.kind), sourceId: String(bill.id) });
+  if (!returnStock) return;
+  await ledger.reverse(tx, lctx, { source: billSource(bill.kind), sourceId: String(bill.id) }); // stock rows
+  if (bill.kind === 'PURCHASE') {
+    const ids = bill.items.map((i: any) => i.stockItemId).filter((x: any): x is number => x != null);
+    if (ids.length) {
+      const del = await tx.stockItem.updateMany({ where: { id: { in: ids }, status: 'AVAILABLE' }, data: { status: 'DELETED' } });
+      if (del.count !== ids.length) throw new HttpError(409, 'CONFLICT', 'A purchased item is no longer available — cannot return stock');
+    }
+    return;
+  }
+  for (const it of bill.items) {
+    if (it.stockItemId == null) continue;
+    const stock = await tx.stockItem.findUnique({ where: { id: it.stockItemId } });
+    if (!stock) continue;
+    if (stock.method === 'LOOSE') {
+      const g = D(stock.gross).plus(it.gross);
+      const l = D(stock.less).plus(it.less);
+      const net = Prisma.Decimal.max(g.minus(l), 0);
+      const fine = net.times(D(stock.tunch)).div(100).times(D(stock.wastage).div(100).plus(1));
+      await tx.stockItem.update({ where: { id: stock.id }, data: { gross: g, less: l, pcs: stock.pcs + it.pcs, net, fine, status: 'AVAILABLE' } });
+    } else await tx.stockItem.update({ where: { id: stock.id }, data: { status: 'AVAILABLE' } });
+  }
+}
+
+export async function createBill(ctx: TenantContext, body: BillBody): Promise<BillDto> {
+  const branchId = activeBranch(ctx);
+  const s = await getSettings(ctx);
+  const numbering = s[body.kind === 'SELL' ? 'invoice.sale' : 'invoice.purchase'];
+  const prep = await prepareBill(ctx, body, branchId, s);
   const lctx = lctxOf(ctx);
 
   const billId = await prisma.$transaction(async (tx) => {
-    const key = docKey(body.kind, body.billType, numbering, billDate);
+    const key = docKey(body.kind, body.billType, numbering, prep.billDate);
     const start = seriesStart(body.billType, numbering);
     const seqRow = await tx.$queryRaw<{ next: number }[]>`
       INSERT INTO "DocSequence" ("businessId","branchId","key","next") VALUES (${ctx.businessId!}, ${branchId}, ${key}, ${start + 1})
       ON CONFLICT ("businessId","branchId","key") DO UPDATE SET "next" = "DocSequence"."next" + 1 RETURNING "next"`;
     const seq = Number(seqRow[0]!.next) - 1;
-    const billNo = formatBillNo(seq, body.billType, numbering, billDate);
-    if (body.pan && !party.pan) await tx.party.update({ where: { id: party.id }, data: { pan: body.pan } });
-
+    const billNo = formatBillNo(seq, body.billType, numbering, prep.billDate);
     const bill = await tx.bill.create({
       data: {
-        businessId: ctx.businessId!, branchId, kind: body.kind, billType: body.billType, billNo, seq, partyId: party.id, billDate,
-        dueDate: body.dueDate ? ledger.businessDate(body.dueDate) : null, interState,
-        sub: billCalc.sub, discount: body.discount, discountUnit: body.discountUnit, discountAmount: billCalc.discountAmount,
-        gstPercent: body.billType === 'ROUGH' ? 0 : body.gstPercent, taxable: billCalc.taxable, cgst: billCalc.cgst, sgst: billCalc.sgst, igst: billCalc.igst,
-        total: billCalc.total, round: billCalc.round, final: billCalc.final, paid, keepBalanceAs: body.keepBalanceAs,
-        keepRate: body.keepBalanceAs !== 'MONEY' ? (body.keepRate ?? null) : null, keepWeight, remark: body.remark ?? null, status: 'ACTIVE', createdById: ctx.userId,
+        businessId: ctx.businessId!, branchId, kind: body.kind, billType: body.billType, billNo, seq, partyId: prep.party.id, billDate: prep.billDate,
+        dueDate: prep.dueDate, interState: prep.interState,
+        sub: prep.billCalc.sub, discount: body.discount, discountUnit: body.discountUnit, discountAmount: prep.billCalc.discountAmount,
+        gstPercent: body.billType === 'ROUGH' ? 0 : body.gstPercent, taxable: prep.billCalc.taxable, cgst: prep.billCalc.cgst, sgst: prep.billCalc.sgst, igst: prep.billCalc.igst,
+        total: prep.billCalc.total, round: prep.billCalc.round, final: prep.billCalc.final, paid: prep.paid, keepBalanceAs: body.keepBalanceAs,
+        keepRate: body.keepBalanceAs !== 'MONEY' ? (body.keepRate ?? null) : null, keepWeight: prep.keepWeight, remark: body.remark ?? null, status: 'ACTIVE', createdById: ctx.userId,
       },
     });
-
-    const stockLedger: ledger.LedgerEntryInput[] = [];
-    for (const r of lines) {
-      let stockItemId: number | null = null;
-      if (r.action === 'SELL_TAG') {
-        // Atomic claim: only an AVAILABLE item in this branch flips to SOLD, so two concurrent bills can't both sell it.
-        const sold = await tx.stockItem.updateMany({ where: { id: r.stockItem.id, status: 'AVAILABLE', branchId }, data: { status: 'SOLD' } });
-        if (sold.count !== 1) throw new HttpError(409, 'CONFLICT', `Stock item ${r.stockItem.id} is no longer AVAILABLE`);
-        stockItemId = r.stockItem.id;
-      } else if (r.action === 'SELL_LOOSE') {
-        // Atomic take with a gross/less/pcs guard — no lost update when two bills draw from the same loose item.
-        const taken = await tx.stockItem.updateMany({ where: { id: r.stockItem.id, status: 'AVAILABLE', gross: { gte: r.gross }, less: { gte: r.less }, pcs: { gte: r.pcs } }, data: { gross: { decrement: r.gross }, less: { decrement: r.less }, pcs: { decrement: r.pcs } } });
-        if (taken.count !== 1) throw new HttpError(409, 'CONFLICT', `Stock item ${r.stockItem.id} does not hold that much`);
-        const it = await tx.stockItem.findUniqueOrThrow({ where: { id: r.stockItem.id } });
-        const net = Prisma.Decimal.max(D(it.gross).minus(it.less), 0);
-        const fine = net.times(D(it.tunch)).div(100).times(D(it.wastage).div(100).plus(1));
-        await tx.stockItem.update({ where: { id: it.id }, data: { net, fine, status: D(it.gross).lte(0) ? 'SOLD' : 'AVAILABLE' } });
-        stockItemId = it.id;
-      } else if (r.action === 'PURCHASE') {
-        const method = r.input.tagNo || r.itemName.method === 'TAG' ? 'TAG' : 'LOOSE';
-        const tagNo = method === 'TAG' ? (r.input.tagNo ?? (r.itemName.tagPrefix && r.itemName.tagDigits ? await nextTagNo(tx, ctx.businessId!, r.itemName.tagPrefix, r.itemName.tagDigits) : null)) : null;
-        const created = await tx.stockItem.create({
-          data: {
-            businessId: ctx.businessId!, branchId, stockClass: r.stockClass, groupId: r.itemName.groupId, itemNameId: r.itemName.id, method, tagNo, huid: null, karatCode: r.karatCode,
-            pcs: r.pcs, gross: r.gross, less: r.less, net: r.calc.net, tunch: r.tunch, wastage: r.wastage, fine: r.calc.fine, stoneCharge: r.input.stoneCharge, labour: r.input.labour,
-            labourUnit: r.input.labourUnit, other: r.input.other, rate: r.input.rate || null, purchaseCost: r.calc.total, status: 'AVAILABLE', source: 'PURCHASE_BILL', sourceId: String(bill.id), createdById: ctx.userId,
-          },
-        });
-        stockItemId = created.id;
-      }
-      await tx.billItem.create({
-        data: {
-          billId: bill.id, stockItemId, itemNameId: r.itemNameId, groupId: r.groupId, stockClass: r.stockClass, description: r.description, hsnCode: r.hsnCode, tagNo: r.tagNo, karatCode: r.karatCode,
-          pcs: r.pcs, gross: r.gross, less: r.less, net: r.calc.net, tunch: r.tunch, wastage: r.wastage, fine: r.calc.fine, stoneCharge: r.input.stoneCharge, rate: r.input.rate, labour: r.input.labour,
-          labourUnit: r.input.labourUnit, other: r.input.other, discount: r.input.discount, discountUnit: r.input.discountUnit, metalAmount: r.calc.metalAmount, labourAmount: r.calc.labourAmount, total: r.calc.total,
-        },
-      });
-      if (stockItemId != null) {
-        stockLedger.push({ branchId, txnDate: billDate, asset: ledger.assetForStockClass(r.stockClass), direction: body.kind === 'SELL' ? 'OUT' : 'IN', karatCode: r.karatCode, pcs: r.pcs, gross: r.gross, net: r.calc.net, fine: r.calc.fine, amount: r.calc.total, source: billSource(body.kind), sourceId: String(bill.id), stockItemId, narration: `${body.kind === 'SELL' ? 'Sold on' : 'Purchased on'} ${billNo}` });
-      }
-    }
-    if (stockLedger.length) await ledger.post(tx, lctx, stockLedger);
-
-    for (const pc of payCalcs) {
-      const pay = await tx.billPayment.create({ data: { billId: bill.id, mode: pc.input.mode, bankAccountId: pc.bankAccountId ?? null, metal: pc.metal ?? null, metalForm: pc.metalForm ?? null, gross: pc.gross ?? null, net: pc.net ?? null, tunch: pc.tunch ?? null, fine: pc.fine ?? null, rate: pc.rate ?? null, amount: pc.amount, remark: pc.input.remark ?? null, txnDate: billDate, isActive: true, createdById: ctx.userId } });
-      await ledger.post(tx, lctx, [paymentLedgerRow(pc, pay.id, bill.id, body.kind, branchId, billDate)]);
-    }
-
-    if (!bal.isZero()) {
-      const sign = body.kind === 'SELL' ? 1 : -1;
-      const entry: udhar.UdharEntryInput = { branchId, partyId: party.id, txnDate: billDate, source: billSource(body.kind), sourceId: String(bill.id), narration: billNo };
-      if (keepWeight != null) {
-        if (body.keepBalanceAs === 'GOLD') entry.gold = D(keepWeight).times(sign);
-        else entry.silver = D(keepWeight).times(sign);
-      } else entry.amount = bal.times(sign);
-      await udhar.post(tx, lctx, [entry]);
-    }
-
-    await logActivity(tx, ctx, { module: body.kind, action: 'CREATED', entity: 'BILL', entityId: String(bill.id), summary: `${body.kind === 'SELL' ? 'Sell' : 'Purchase'} bill ${billNo} ₹${billCalc.final}`, partyName: party.name });
+    await writeBillContents(tx, ctx, bill, body, prep, lctx);
+    await logActivity(tx, ctx, { module: body.kind, action: 'CREATED', entity: 'BILL', entityId: String(bill.id), summary: `${body.kind === 'SELL' ? 'Sell' : 'Purchase'} bill ${billNo} ₹${prep.billCalc.final}`, partyName: prep.party.name });
     return bill.id;
   });
 
   return getBill(ctx, billId);
+}
+
+/** Edit a saved bill (today only): undo it like delete-with-return but keep the row, then re-apply the body onto the same id/billNo/seq. */
+export async function editBill(ctx: TenantContext, id: number, body: BillBody): Promise<BillDto> {
+  const sdb = scopedDb(ctx);
+  const bill = await sdb.bill.findFirst({ where: { id }, include: { items: true, payments: true } });
+  if (!bill) throw new HttpError(404, 'NOT_FOUND', 'Bill not found');
+  if (bill.status !== 'ACTIVE') throw new HttpError(409, 'CONFLICT', 'Bill is not active');
+  if (bill.kind !== body.kind || bill.billType !== body.billType) throw new HttpError(400, 'VALIDATION', 'Cannot change a bill’s kind or type on edit');
+  if (bill.billDate.getTime() !== ledger.businessDate().getTime()) throw new HttpError(400, 'VALIDATION', "Only today's bill can be edited — delete and re-create for a past day");
+  const s = await getSettings(ctx);
+  // This bill's own stock items are still SOLD/reduced until the in-tx undo; allow them when re-resolving the new lines.
+  const ownStockIds = new Set(bill.items.map((i) => i.stockItemId).filter((x): x is number => x != null));
+  const prep = await prepareBill(ctx, body, bill.branchId, s, ownStockIds);
+  const lctx = lctxOf(ctx);
+
+  await prisma.$transaction(async (tx) => {
+    // Lock the row + confirm still ACTIVE (TASK-30b-style guard against a concurrent edit/delete).
+    const locked = await tx.bill.updateMany({ where: { id, status: 'ACTIVE' }, data: { status: 'ACTIVE' } });
+    if (locked.count !== 1) throw new HttpError(409, 'CONFLICT', 'Bill is not active');
+    await undoBill(tx, ctx, bill, lctx, true); // undo old effects (always returns stock) before re-applying
+    await tx.billItem.deleteMany({ where: { billId: id } });
+    await tx.bill.update({
+      where: { id },
+      data: {
+        partyId: prep.party.id, interState: prep.interState, dueDate: prep.dueDate,
+        sub: prep.billCalc.sub, discount: body.discount, discountUnit: body.discountUnit, discountAmount: prep.billCalc.discountAmount,
+        gstPercent: body.billType === 'ROUGH' ? 0 : body.gstPercent, taxable: prep.billCalc.taxable, cgst: prep.billCalc.cgst, sgst: prep.billCalc.sgst, igst: prep.billCalc.igst,
+        total: prep.billCalc.total, round: prep.billCalc.round, final: prep.billCalc.final, paid: prep.paid, keepBalanceAs: body.keepBalanceAs,
+        keepRate: body.keepBalanceAs !== 'MONEY' ? (body.keepRate ?? null) : null, keepWeight: prep.keepWeight, remark: body.remark ?? null,
+      },
+    });
+    await writeBillContents(tx, ctx, { id: bill.id, branchId: bill.branchId, billNo: bill.billNo, billDate: bill.billDate }, body, prep, lctx);
+    await logActivity(tx, ctx, { module: bill.kind, action: 'EDITED', entity: 'BILL', entityId: String(id), summary: `Edited ${bill.kind === 'SELL' ? 'sell' : 'purchase'} bill ${bill.billNo} ₹${prep.billCalc.final}`, partyName: prep.party.name });
+  });
+  return getBill(ctx, id);
 }
 
 // ───────────── Add payments ─────────────
