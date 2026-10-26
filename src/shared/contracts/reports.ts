@@ -58,6 +58,8 @@ export interface GstRegisterRowDto {
   sgst: string;
   igst: string;
   total: string;
+  /** TASK-97: effective GST % of the bill ((cgst+sgst+igst)/taxable×100, 2 dp); service fills it */
+  gstPercent?: string;
 }
 export interface HsnSummaryRowDto {
   hsnCode: string;

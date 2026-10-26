@@ -294,6 +294,32 @@ export const SETTING_SCHEMAS = {
     stdPercent: z.number().min(1).max(100).default(60),
     tenureMonths: z.number().int().min(1).max(120).default(12),
     categories: z.array(z.string().trim().min(1).max(40)).default(['Gold', 'Silver']),
+    /** categories kept for old loans but hidden on New Girvi (Manage Item Categories: Activate/Deactivate) */
+    inactiveCategories: z.array(z.string().trim().min(1).max(40)).default([]),
+  }),
+  /** Girvi receipt layout (original: Receipt Customization & Layout Preview) — presentation only */
+  'girvi.receipt': z.object({
+    format: z.enum(['A4', 'THERMAL']).default('A4'),
+    showShopName: z.boolean().default(true),
+    showShopAddress: z.boolean().default(true),
+    showShopMobile: z.boolean().default(true),
+    showShopGst: z.boolean().default(true),
+    showCustomerName: z.boolean().default(true),
+    showCustomerMobile: z.boolean().default(true),
+    showCustomerAddress: z.boolean().default(true),
+    showCustomerPhoto: z.boolean().default(false),
+    showGirviQr: z.boolean().default(true),
+    showItemPhoto: z.boolean().default(false),
+    showItemValuation: z.boolean().default(true),
+    showItemWeights: z.boolean().default(true),
+    showMonthlyInterest: z.boolean().default(true),
+    showTotalInterest: z.boolean().default(true),
+    showCalculations: z.boolean().default(true),
+    showPaymentMode: z.boolean().default(true),
+    showItemHistory: z.boolean().default(false),
+    showRemarks: z.boolean().default(true),
+    showSignatures: z.boolean().default(true),
+    terms: z.string().max(1000).default(''),
   }),
 } as const;
 export type SettingKey = keyof typeof SETTING_SCHEMAS;
