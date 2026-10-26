@@ -227,3 +227,46 @@ describe('TASK-29 — /ledgers stockItemId filter', () => {
     expect(page.items[0]!.item?.id).toBe(target.id);
   });
 });
+
+describe('TASK-98 — shortage pcs limits + item group delete', () => {
+  it('flags SHORTAGE/WARNING by pcs when minPcs/maxPcs are set; weight rule unchanged when pcs limits are null', async () => {
+    const s = await setup();
+    // pcs-only limits: min 3, max 5
+    const [pcsGroup] = await inv.createItemGroups(s.ctx, { stockClass: 'GOLD', names: ['Pcs Group'], gstRate: 3, minPcs: 3, maxPcs: 5 });
+    const pcsName = await inv.createItemName(s.ctx, { groupId: pcsGroup!.id, name: 'Pcs Ring', method: 'TAG', tagPrefix: 'PR', tagDigits: 4 });
+    const statusOf = async (id: number) => (await inv.shortage(s.ctx, {})).find((r) => r.id === id)!.status;
+    const add = (n: number) => inv.createStockEntry(s.ctx, { stockClass: 'GOLD', method: 'TAG', rows: Array.from({ length: n }, () => row({ itemNameId: pcsName.id, karatCode: '22K' })) });
+
+    expect(await statusOf(pcsGroup!.id)).toBe('SHORTAGE'); // 0 < 3
+    await add(3);
+    expect(await statusOf(pcsGroup!.id)).toBe('WARNING'); // 3 < 3.6
+    await add(1);
+    expect(await statusOf(pcsGroup!.id)).toBe('OK'); // 4 within 3..5
+    await add(2);
+    expect(await statusOf(pcsGroup!.id)).toBe('WARNING'); // 6 > maxPcs 5 (overstock)
+
+    // weight-only limits (pcs null): 10 g on hand vs min 5 g → OK, vs min 9 g → WARNING, vs min 20 g → SHORTAGE
+    await inv.createStockEntry(s.ctx, { stockClass: 'GOLD', method: 'TAG', rows: [row({ itemNameId: s.itemName.id, karatCode: '22K' })] });
+    await inv.updateItemGroup(s.ctx, s.group.id, { minWeight: 5 });
+    expect(await statusOf(s.group.id)).toBe('OK');
+    await inv.updateItemGroup(s.ctx, s.group.id, { minWeight: 9 });
+    expect(await statusOf(s.group.id)).toBe('WARNING');
+    await inv.updateItemGroup(s.ctx, s.group.id, { minWeight: 20 });
+    expect(await statusOf(s.group.id)).toBe('SHORTAGE');
+
+    // pure helper: worse of weight and pcs wins
+    expect(inv.shortageStatus({ net: 100, pcs: 0, minWeight: 5, minPcs: 1, maxPcs: null })).toBe('SHORTAGE');
+    expect(inv.shortageStatus({ net: 1, pcs: 10, minWeight: 5, minPcs: 1, maxPcs: null })).toBe('SHORTAGE');
+    expect(inv.shortageStatus({ net: 1, pcs: 10, minWeight: null, minPcs: null, maxPcs: null })).toBe('OK');
+  });
+
+  it('deletes an unused group; 409 while an item name references it; 404 cross-tenant', async () => {
+    const s = await setup();
+    const [empty] = await inv.createItemGroups(s.ctx, { stockClass: 'GOLD', names: ['Empty'], gstRate: 3 });
+    await inv.deleteItemGroup(s.ctx, empty!.id);
+    expect(await db.itemGroup.findUnique({ where: { id: empty!.id } })).toBeNull();
+    await expect(inv.deleteItemGroup(s.ctx, s.group.id)).rejects.toMatchObject({ status: 409 });
+    const other = await createBusiness({ name: 'B' });
+    await expect(inv.deleteItemGroup(ctxFor(other.business.id, other.root.id), s.group.id)).rejects.toMatchObject({ status: 404 });
+  });
+});

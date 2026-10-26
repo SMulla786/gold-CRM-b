@@ -114,6 +114,24 @@ export async function updateItemGroup(ctx: TenantContext, groupId: number, body:
   return groupDto({ ...g, hsn: g.hsnId != null ? hsn.get(g.hsnId) : null });
 }
 
+/** TASK-98: hard-delete an unused group (scoped). 409 while any item name or stock item (any status) still points at it. */
+export async function deleteItemGroup(ctx: TenantContext, groupId: number): Promise<void> {
+  const sdb = scopedDb(ctx);
+  const g = await sdb.itemGroup.findUnique({ where: { id: groupId } });
+  if (!g) throw new HttpError(404, 'NOT_FOUND', 'Item group not found');
+  const [names, stock] = await Promise.all([sdb.itemName.count({ where: { groupId } }), sdb.stockItem.count({ where: { groupId } })]);
+  if (names > 0 || stock > 0) {
+    throw new HttpError(409, 'CONFLICT', `Group "${g.name}" is in use (${names} item name(s), ${stock} stock item(s)) — deactivate it instead`);
+  }
+  try {
+    await sdb.itemGroup.delete({ where: { id: groupId } });
+  } catch (e) {
+    // A row created between the count and the delete still blocks it via the FK.
+    if ((e as { code?: string }).code === 'P2003') throw new HttpError(409, 'CONFLICT', `Group "${g.name}" is in use — deactivate it instead`);
+    throw e;
+  }
+}
+
 // ───────────── Item names ─────────────
 
 const itemNameDto = (n: any, hsn: { id: number; code: string } | null): ItemNameDto => ({
@@ -138,11 +156,12 @@ const itemNameDto = (n: any, hsn: { id: number; code: string } | null): ItemName
   isActive: n.isActive,
 });
 
-export async function listItemNames(ctx: TenantContext, query: { page: number; pageSize: number; q?: string; stockClass?: StockClass; groupId?: number }): Promise<Paged<ItemNameDto>> {
+export async function listItemNames(ctx: TenantContext, query: { page: number; pageSize: number; q?: string; stockClass?: StockClass; groupId?: number; jewelleryTypeId?: number }): Promise<Paged<ItemNameDto>> {
   const sdb = scopedDb(ctx);
+  const groupWhere = { ...(query.stockClass ? { stockClass: query.stockClass } : {}), ...(query.jewelleryTypeId ? { jewelleryTypeId: query.jewelleryTypeId } : {}) };
   const where = {
     ...(query.groupId ? { groupId: query.groupId } : {}),
-    ...(query.stockClass ? { group: { stockClass: query.stockClass } } : {}),
+    ...(Object.keys(groupWhere).length ? { group: groupWhere } : {}),
     ...(query.q ? { name: { contains: query.q, mode: 'insensitive' as const } } : {}),
   };
   const [rows, total] = await Promise.all([
@@ -572,6 +591,17 @@ export async function getStockTransfer(ctx: TenantContext, id: number): Promise<
 
 // ───────────── Shortage ─────────────
 
+const SEVERITY = { OK: 0, WARNING: 1, SHORTAGE: 2 } as const;
+type ShortageStatus = ShortageRowDto['status'];
+/** below min → SHORTAGE; under min × 1.2 → WARNING. Weight rule unchanged; pcs rule only when minPcs/maxPcs are set (pcs > maxPcs = WARNING). Worse result wins. */
+export function shortageStatus(s: { net: number; pcs: number; minWeight: number | null; minPcs: number | null; maxPcs: number | null }): ShortageStatus {
+  const byMin = (cur: number, min: number | null): ShortageStatus => (min != null && cur < min ? 'SHORTAGE' : min != null && cur < min * 1.2 ? 'WARNING' : 'OK');
+  const weight = byMin(s.net, s.minWeight);
+  let pcs = byMin(s.pcs, s.minPcs);
+  if (pcs === 'OK' && s.maxPcs != null && s.pcs > s.maxPcs) pcs = 'WARNING';
+  return SEVERITY[pcs] > SEVERITY[weight] ? pcs : weight;
+}
+
 export async function shortage(ctx: TenantContext, query: { stockClass?: StockClass; jewelleryTypeId?: number; status?: 'SHORTAGE' | 'WARNING' | 'OK'; q?: string }): Promise<ShortageRowDto[]> {
   const sdb = scopedDb(ctx);
   const groups = await sdb.itemGroup.findMany({
@@ -585,8 +615,7 @@ export async function shortage(ctx: TenantContext, query: { stockClass?: StockCl
     const t = byGroup.get(g.id);
     const net = t?._sum.net != null ? Number(t._sum.net) : 0;
     const pcs = t?._sum.pcs ?? 0;
-    const min = g.minWeight != null ? Number(g.minWeight) : null;
-    const status: ShortageRowDto['status'] = min != null && net < min ? 'SHORTAGE' : min != null && net < min * 1.2 ? 'WARNING' : 'OK';
+    const status = shortageStatus({ net, pcs, minWeight: g.minWeight != null ? Number(g.minWeight) : null, minPcs: g.minPcs, maxPcs: g.maxPcs });
     if (query.status && status !== query.status) continue;
     rows.push({ level: 'GROUP', id: g.id, name: g.name, stockClass: g.stockClass, jewelleryType: g.jewelleryType?.name ?? null, currentWeight: net.toFixed(3), currentPcs: pcs, minWeight: g.minWeight != null ? num(g.minWeight) : null, maxWeight: g.maxWeight != null ? num(g.maxWeight) : null, minPcs: g.minPcs, maxPcs: g.maxPcs, status });
   }

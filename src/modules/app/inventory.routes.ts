@@ -44,6 +44,11 @@ inventoryRouter.post('/jewellery-types', requirePermission(MASTERS, 'edit'), asy
 inventoryRouter.get('/item-groups', requirePermission(MASTERS, 'view'), async (req, res) => res.json(await inv.listItemGroups(req.ctx!, itemGroupListQuery.parse(req.query))));
 inventoryRouter.post('/item-groups', requirePermission(MASTERS, 'edit'), async (req, res) => res.status(201).json(await inv.createItemGroups(req.ctx!, itemGroupBody.parse(req.body))));
 inventoryRouter.patch('/item-groups/:id', requirePermission(MASTERS, 'edit'), async (req, res) => res.json(await inv.updateItemGroup(req.ctx!, idSchema.parse(req.params.id), updateItemGroupBody.parse(req.body))));
+// TASK-98: delete an unused group (409 while item names / stock reference it)
+inventoryRouter.delete('/item-groups/:id', requirePermission(MASTERS, 'delete'), async (req, res) => {
+  await inv.deleteItemGroup(req.ctx!, idSchema.parse(req.params.id));
+  res.status(204).end();
+});
 inventoryRouter.get('/item-names', requirePermission(MASTERS, 'view'), async (req, res) => res.json(await inv.listItemNames(req.ctx!, itemNameListQuery.parse(req.query))));
 inventoryRouter.post('/item-names', requirePermission(MASTERS, 'edit'), async (req, res) => res.status(201).json(await inv.createItemName(req.ctx!, itemNameBody.parse(req.body))));
 inventoryRouter.patch('/item-names/:id', requirePermission(MASTERS, 'edit'), async (req, res) => res.json(await inv.updateItemName(req.ctx!, idSchema.parse(req.params.id), updateItemNameBody.parse(req.body))));
