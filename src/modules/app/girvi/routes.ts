@@ -8,6 +8,7 @@ import {
   girviBody,
   girviImportFields,
   girviInterestBody,
+  girviItemReplaceBody,
   girviListQuery,
   girviReleaseBody,
   girviTopupBody,
@@ -46,6 +47,9 @@ girviRouter.get('/girvi/items/:itemId/photo', requirePermission(LEDGER, 'view'),
   const abs = await girviItemPhotoPath(req.ctx!, idSchema.parse(req.params.itemId));
   res.type({ '.jpg': 'image/jpeg', '.png': 'image/png', '.webp': 'image/webp' }[path.extname(abs)] ?? 'application/octet-stream').sendFile(abs);
 });
+girviRouter.patch('/girvi/:id/items/:itemId', requirePermission(ENTRY, 'edit'), requireMpin, async (req, res) =>
+  res.json(await girvi.replaceGirviItem(req.ctx!, idSchema.parse(req.params.id), idSchema.parse(req.params.itemId), girviItemReplaceBody.parse(req.body))),
+);
 // Phase 9b — transfers (re-pledge to a lender); registered before /girvi/:id
 girviRouter.get('/girvi/transfers', requirePermission(TRANSFER, 'view'), async (req, res) => res.json(await transfer.listTransfers(req.ctx!, girviTransferListQuery.parse(req.query))));
 girviRouter.post('/girvi/transfers', requirePermission(TRANSFER, 'edit'), async (req, res) => res.status(201).json(await transfer.createTransfer(req.ctx!, girviTransferBody.parse(req.body))));

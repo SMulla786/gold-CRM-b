@@ -5,7 +5,7 @@ import * as ledger from '../../../lib/ledger';
 import { logActivity } from '../../../lib/activity';
 import { HttpError } from '../../../middleware/error';
 import type { z } from 'zod';
-import { girviBody, girviInterest, girviReleaseBody } from '../../../shared';
+import { girviBody, girviInterest, girviItemReplaceBody, girviReleaseBody } from '../../../shared';
 import type { GirviBatchDto, GirviItemDto, GirviListItemDto, GirviTxnDto, Paged, PartyRefDto } from '../../../shared';
 import type { TenantContext } from '../../../middleware/context';
 
@@ -163,6 +163,33 @@ export async function releaseGirvi(ctx: TenantContext, id: number, body: GirviRe
     await logActivity(tx, ctx, { module: 'GIRVI', action: isLast ? 'DELETED' : 'EDITED', entity: 'GIRVI', entityId: String(id), summary: `Girvi #${fresh.girviNo} release` });
   });
   return getGirvi(ctx, id, new Date());
+}
+
+/** Replace or revalue one pledged item (original: Item Replace / Dismantle). Batch valuation is recomputed; the outstanding loan must not exceed it. */
+export async function replaceGirviItem(ctx: TenantContext, batchId: number, itemId: number, body: z.infer<typeof girviItemReplaceBody>): Promise<GirviBatchDto> {
+  const batch = await scopedDb(ctx).girviBatch.findFirst({ where: { id: batchId } });
+  if (!batch) throw new HttpError(404, 'NOT_FOUND', 'Girvi not found');
+  const fine = D(body.net).times(body.purity).div(100);
+  const valuation = fine.times(body.rate);
+  await prisma.$transaction(async (tx) => {
+    await tx.$queryRaw`SELECT id FROM "GirviItem" WHERE id = ${itemId} FOR UPDATE`;
+    const fresh = await tx.girviBatch.findUniqueOrThrow({ where: { id: batchId } });
+    if (fresh.status !== 'ACTIVE') throw new HttpError(409, 'CONFLICT', 'Girvi is not active');
+    const old = await tx.girviItem.findFirst({ where: { id: itemId, batchId, status: 'PLEDGED' } });
+    if (!old) throw new HttpError(409, 'CONFLICT', 'Item is not pledged in this girvi');
+    if (await tx.girviTransferItem.count({ where: { girviItemId: itemId, transfer: { status: 'ACTIVE' } } })) {
+      throw new HttpError(409, 'CONFLICT', 'Item is with a lender (girvi transfer); receive it back first');
+    }
+    await tx.girviItem.update({ where: { id: itemId }, data: { category: body.category, name: body.name, gross: body.gross, net: body.net, purity: body.purity, fine, rate: body.rate, valuation } });
+    const total = (await tx.girviItem.aggregate({ where: { batchId }, _sum: { valuation: true } }))._sum.valuation ?? new Prisma.Decimal(0);
+    if (D(fresh.principal).gt(total)) throw new HttpError(400, 'VALIDATION', 'The outstanding loan would exceed the new valuation', { valuation: money(total) });
+    await tx.girviBatch.update({ where: { id: batchId }, data: { valuation: total } });
+    await logActivity(tx, ctx, {
+      module: 'GIRVI', action: 'EDITED', entity: 'GIRVI', entityId: String(batchId),
+      summary: `Girvi #${fresh.girviNo} item replaced: ${old.name} ${wt(old.net)}g ₹${money(old.valuation)} → ${body.name} ${wt(body.net)}g ₹${money(valuation)} (${body.remark})`,
+    });
+  });
+  return getGirvi(ctx, batchId, new Date());
 }
 
 export async function deleteGirvi(ctx: TenantContext, id: number): Promise<void> {

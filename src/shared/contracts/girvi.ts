@@ -66,6 +66,9 @@ export const girviReleaseBody = z
   })
   .refine(bankRule, { message: 'Select a bank account', path: ['bankAccountId'] });
 
+/** Replace / revalue (dismantle) one pledged item on an active girvi; the loan must stay within the new valuation. MPIN-gated. */
+export const girviItemReplaceBody = girviItemInput.extend({ remark: z.string().trim().min(2).max(200) });
+
 export const girviListQuery = pageQuery.extend({
   status: z.enum(['ACTIVE', 'CLOSED']).optional(),
   partyId: id.optional(),
