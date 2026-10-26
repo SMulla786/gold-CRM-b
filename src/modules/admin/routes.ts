@@ -14,6 +14,7 @@ import {
   recordPaymentBody,
   resetUserPasswordBody,
   roleBody,
+  setMpinBody,
   updateBranchBody,
   updateBusinessBody,
   updateUserBody,
@@ -78,6 +79,19 @@ adminRouter.post('/users/:id/reset-password', async (req, res) => {
   await svc.resetUserPassword(req.ctx!, idSchema.parse(req.params.id), resetUserPasswordBody.parse(req.body).password);
   res.status(204).end();
 });
+adminRouter.post('/users/:id/reset-mpin', async (req, res) => {
+  await svc.resetUserMpin(req.ctx!, idSchema.parse(req.params.id), setMpinBody.pick({ mpin: true }).parse(req.body).mpin);
+  res.status(204).end();
+});
+// Trash (soft delete) + restore: status DELETED <-> ACTIVE.
+adminRouter.delete('/users/:id', async (req, res) => {
+  await svc.setUserStatus(req.ctx!, idSchema.parse(req.params.id), 'DELETED');
+  res.status(204).end();
+});
+adminRouter.post('/users/:id/restore', async (req, res) => {
+  await svc.setUserStatus(req.ctx!, idSchema.parse(req.params.id), 'ACTIVE');
+  res.status(204).end();
+});
 
 // Permissions & roles
 adminRouter.get('/permissions', (_req, res) => res.json(svc.permissionCatalog()));
@@ -89,6 +103,11 @@ adminRouter.post('/permission-enquiries/:id/approve', async (req, res) => res.js
 adminRouter.post('/permission-enquiries/:id/reject', async (req, res) => res.json(await enquiry.rejectEnquiry(req.ctx!, idSchema.parse(req.params.id), enquiryRejectBody.parse(req.body).note)));
 adminRouter.get('/roles', async (req, res) => res.json(await svc.listRoles(req.ctx!)));
 adminRouter.post('/roles', async (req, res) => res.status(201).json(await svc.createRole(req.ctx!, roleBody.parse(req.body).name)));
+adminRouter.patch('/roles/:id', async (req, res) => res.json(await svc.renameRole(req.ctx!, idSchema.parse(req.params.id), roleBody.parse(req.body).name)));
+adminRouter.delete('/roles/:id', async (req, res) => {
+  await svc.deleteRole(req.ctx!, idSchema.parse(req.params.id));
+  res.status(204).end();
+});
 adminRouter.put('/roles/:id/permissions', async (req, res) => res.json(await svc.putRolePermissions(req.ctx!, idSchema.parse(req.params.id), permissionsBody.parse(req.body).grants)));
 
 // Business profile & subscription (owner only)

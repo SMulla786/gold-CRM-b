@@ -107,7 +107,7 @@ export async function listExchange(ctx: TenantContext, query: z.infer<typeof exc
   if (query.q) {
     const parties = await sdb.party.findMany({ where: { OR: [{ name: { contains: query.q, mode: 'insensitive' } }, { mobile: { contains: query.q } }] }, select: { id: true } });
     const asNo = Number(query.q);
-    where.OR = [...(Number.isInteger(asNo) ? [{ exchangeNo: asNo }] : []), { partyId: { in: parties.map((p) => p.id) } }];
+    where.OR = [...(Number.isInteger(asNo) && asNo > 0 && asNo <= 2_147_483_647 ? [{ exchangeNo: asNo }] : []), { partyId: { in: parties.map((p) => p.id) } }];
   }
   const [rows, total] = await Promise.all([
     sdb.exchange.findMany({ where, include: { lines: { orderBy: { id: 'asc' } } }, orderBy: { id: 'desc' }, skip: (query.page - 1) * query.pageSize, take: query.pageSize }),

@@ -92,6 +92,12 @@ export async function listBhav(ctx: TenantContext, query: z.infer<typeof bhavLis
     ...(query.side ? { side: query.side } : {}), ...(query.status ? { status: query.status } : {}), ...(query.partyId ? { partyId: query.partyId } : {}), ...(query.metal ? { metal: query.metal } : {}),
     ...(query.open === 'true' ? { status: { in: ['PENDING', 'PARTIAL'] } } : {}),
   };
+  if (query.q) {
+    // Same as listExchange: match party name/mobile, or the booking number.
+    const parties = await sdb.party.findMany({ where: { OR: [{ name: { contains: query.q, mode: 'insensitive' } }, { mobile: { contains: query.q } }] }, select: { id: true } });
+    const asNo = Number(query.q);
+    where.OR = [...(Number.isInteger(asNo) && asNo > 0 && asNo <= 2_147_483_647 ? [{ bookingNo: asNo }] : []), { partyId: { in: parties.map((p) => p.id) } }];
+  }
   const [rows, total] = await Promise.all([
     sdb.bhavBooking.findMany({ where, orderBy: { id: 'desc' }, skip: (query.page - 1) * query.pageSize, take: query.pageSize }),
     sdb.bhavBooking.count({ where }),

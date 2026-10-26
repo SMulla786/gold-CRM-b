@@ -205,7 +205,8 @@ export async function listUsers(ctx: TenantContext, query: { page: number; pageS
   const sdb = scopedDb(ctx);
   const where = {
     ...(query.branchId != null ? { branchId: query.branchId } : {}),
-    ...(query.status ? { status: query.status } : {}),
+    // No status = everyone except trashed users (the Trash tab asks for DELETED explicitly).
+    status: query.status ?? { not: 'DELETED' as const },
     ...(query.q ? { OR: [{ name: { contains: query.q, mode: 'insensitive' as const } }, { username: { contains: query.q, mode: 'insensitive' as const } }] } : {}),
   };
   const [rows, total] = await Promise.all([
@@ -319,11 +320,13 @@ export async function updateUser(ctx: TenantContext, userId: number, body: {
   return getUser(ctx, userId);
 }
 
-export async function setUserStatus(ctx: TenantContext, userId: number, status: 'ACTIVE' | 'BLOCKED'): Promise<void> {
+/** BLOCKED / DELETED (trash, soft) both revoke sessions; ACTIVE = unblock or restore from trash. */
+export async function setUserStatus(ctx: TenantContext, userId: number, status: 'ACTIVE' | 'BLOCKED' | 'DELETED'): Promise<void> {
   const target = await scopedDb(ctx).user.findUnique({ where: { id: userId } });
   if (!target) throw new HttpError(404, 'NOT_FOUND', 'User not found');
+  if (status === 'DELETED' && target.isOwner) throw new HttpError(403, 'FORBIDDEN', 'The owner cannot be deleted');
   if (target.isOwner && !ctx.isOwner) throw new HttpError(403, 'FORBIDDEN', 'Only the owner can block the owner');
-  if (status !== 'ACTIVE' && target.id === ctx.userId) throw new HttpError(403, 'FORBIDDEN', 'You cannot block yourself');
+  if (status !== 'ACTIVE' && target.id === ctx.userId) throw new HttpError(403, 'FORBIDDEN', 'You cannot block or delete yourself');
   await scopedDb(ctx).user.update({ where: { id: userId }, data: { status } });
   if (status !== 'ACTIVE') await prisma.session.updateMany({ where: { userId, revokedAt: null }, data: { revokedAt: new Date() } });
 }
@@ -334,6 +337,14 @@ export async function resetUserPassword(ctx: TenantContext, userId: number, pass
   if (target.isOwner && !ctx.isOwner) throw new HttpError(403, 'FORBIDDEN', 'Only the owner can reset the owner');
   await scopedDb(ctx).user.update({ where: { id: userId }, data: { passwordHash: await argon2.hash(password) } });
   await prisma.session.updateMany({ where: { userId, revokedAt: null }, data: { revokedAt: new Date() } });
+}
+
+/** Admin sets/resets a user's MPIN (staff otherwise can't pass MPIN-gated actions until they set one themselves). */
+export async function resetUserMpin(ctx: TenantContext, userId: number, mpin: string): Promise<void> {
+  const target = await scopedDb(ctx).user.findUnique({ where: { id: userId } });
+  if (!target) throw new HttpError(404, 'NOT_FOUND', 'User not found');
+  if (target.isOwner && !ctx.isOwner) throw new HttpError(403, 'FORBIDDEN', 'Only the owner can reset the owner');
+  await scopedDb(ctx).user.update({ where: { id: userId }, data: { mpinHash: await argon2.hash(mpin) } });
 }
 
 // ───────────── Permissions & Roles ─────────────
@@ -390,6 +401,30 @@ export async function createRole(ctx: TenantContext, name: string): Promise<Role
   await assertRoleManager(ctx);
   const role = await prisma.role.create({ data: { businessId: ctx.businessId!, name } });
   return { id: role.id, name: role.name, isSystem: false, userCount: 0, grants: [] };
+}
+
+/** Business-owned (non-system) role of the caller's business, or 404/403. */
+async function ownRole(ctx: TenantContext, roleId: number) {
+  await assertRoleManager(ctx);
+  const role = await prisma.role.findFirst({ where: { id: roleId, OR: [{ businessId: null }, { businessId: ctx.businessId! }] } });
+  if (!role) throw new HttpError(404, 'NOT_FOUND', 'Role not found');
+  if (role.isSystem) throw new HttpError(403, 'FORBIDDEN', 'System roles cannot be renamed or deleted');
+  return role;
+}
+
+export async function renameRole(ctx: TenantContext, roleId: number, name: string): Promise<RoleDto> {
+  await ownRole(ctx, roleId);
+  const clash = await prisma.role.findFirst({ where: { businessId: ctx.businessId!, name, NOT: { id: roleId } } });
+  if (clash) throw new HttpError(409, 'CONFLICT', 'A role with this name already exists');
+  await prisma.role.update({ where: { id: roleId }, data: { name } });
+  return (await listRoles(ctx)).find((r) => r.id === roleId)!;
+}
+
+export async function deleteRole(ctx: TenantContext, roleId: number): Promise<void> {
+  await ownRole(ctx, roleId);
+  const users = await prisma.user.count({ where: { roleId } });
+  if (users) throw new HttpError(409, 'CONFLICT', `Role is assigned to ${users} user(s); move them to another role first`);
+  await prisma.$transaction([prisma.rolePermission.deleteMany({ where: { roleId } }), prisma.role.delete({ where: { id: roleId } })]);
 }
 
 export async function putRolePermissions(ctx: TenantContext, roleId: number, grants: PermissionGrantDto[]): Promise<RoleDto> {

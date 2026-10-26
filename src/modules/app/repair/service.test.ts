@@ -86,6 +86,37 @@ describe('repair', () => {
     expect(moneyIn.reduce((a, r) => a + Number(r.amount), 0)).toBe(1000); // delivery charged once, not twice
   });
 
+  it('list q matches ticket no, party name/mobile, description', async () => {
+    const s = await setup();
+    const a = await repair.createRepair(s.ctx, base({ partyId: s.customer.id, description: 'Bent prong' }) as any);
+    const other = await db.party.create({ data: { businessId: s.business.id, type: 'CUSTOMER', name: 'Zed', mobile: '9222222222', countryCode: '+91' } });
+    await repair.createRepair(s.ctx, base({ partyId: other.id, description: 'Loose clasp' }) as any);
+    const page = { page: 1, pageSize: 20 };
+    expect((await repair.listRepairs(s.ctx, { ...page, q: 'cust' })).items.map((t) => t.id)).toEqual([a.id]);
+    expect((await repair.listRepairs(s.ctx, { ...page, q: '922222' })).total).toBe(1);
+    expect((await repair.listRepairs(s.ctx, { ...page, q: '9222222222' })).total).toBe(1); // full 10-digit mobile: no Int4 overflow
+    expect((await repair.listRepairs(s.ctx, { ...page, q: '99999999999999' })).total).toBe(0);
+    expect((await repair.listRepairs(s.ctx, { ...page, q: 'prong' })).items.map((t) => t.id)).toEqual([a.id]);
+    expect((await repair.listRepairs(s.ctx, { ...page, q: `#${a.ticketNo}` })).items.map((t) => t.id)).toContain(a.id);
+    expect((await repair.listRepairs(s.ctx, { ...page, q: 'nomatch-xyz' })).total).toBe(0);
+  });
+
+  it('karigar: assign on the way forward, reassign in place; non-karigar / foreign → rejected', async () => {
+    const s = await setup();
+    const k1 = await db.party.create({ data: { businessId: s.business.id, type: 'KARIGAR', name: 'K1', mobile: '9333333331', countryCode: '+91' } });
+    const k2 = await db.party.create({ data: { businessId: s.business.id, type: 'KARIGAR', name: 'K2', mobile: '9333333332', countryCode: '+91' } });
+    const t = await repair.createRepair(s.ctx, base({ partyId: s.customer.id }) as any);
+    expect((await repair.updateRepairStatus(s.ctx, t.id, { status: 'IN_PROGRESS', karigarId: k1.id })).karigar?.id).toBe(k1.id);
+    const re = await repair.updateRepairStatus(s.ctx, t.id, { status: 'IN_PROGRESS', karigarId: k2.id });
+    expect(re.status).toBe('IN_PROGRESS');
+    expect(re.karigar?.id).toBe(k2.id);
+    await expect(repair.updateRepairStatus(s.ctx, t.id, { status: 'IN_PROGRESS' })).rejects.toMatchObject({ status: 409 }); // same status, nothing to change
+    await expect(repair.updateRepairStatus(s.ctx, t.id, { status: 'IN_PROGRESS', karigarId: s.customer.id })).rejects.toMatchObject({ status: 400 });
+    const other = await createBusiness({ name: 'B' });
+    const bK = await db.party.create({ data: { businessId: other.business.id, type: 'KARIGAR', name: 'BK', mobile: '9444444444', countryCode: '+91' } });
+    await expect(repair.updateRepairStatus(s.ctx, t.id, { status: 'IN_PROGRESS', karigarId: bK.id })).rejects.toMatchObject({ status: 404 });
+  });
+
   it('cross-tenant party → 404', async () => {
     const s = await setup();
     const other = await createBusiness({ name: 'B' });

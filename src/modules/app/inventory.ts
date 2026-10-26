@@ -1,3 +1,4 @@
+import { rm } from 'node:fs/promises';
 import type { Prisma } from '@prisma/client';
 import { prisma } from '../../lib/prisma';
 import { scopedDb } from '../../lib/db';
@@ -6,6 +7,7 @@ import { logActivity } from '../../lib/activity';
 import { HttpError } from '../../middleware/error';
 import type { TenantContext } from '../../middleware/context';
 import { computeLine, stockRowInput } from '../../shared';
+import { stockImagePath } from './uploads';
 import type {
   BulkResultDto,
   GroupStockDto,
@@ -298,9 +300,9 @@ export async function createStockEntry(ctx: TenantContext, body: { stockClass: S
 
 // ───────────── Stock list / get / by-tag / summary / groups ─────────────
 
-export async function listStock(ctx: TenantContext, query: any): Promise<Paged<StockItemDto>> {
-  const sdb = scopedDb(ctx);
-  const where: any = {
+/** Shared stockListQuery → where (item list + group-wise roll-up). q matches tag no, HUID or item name. */
+function stockWhere(query: any): any {
+  return {
     status: query.status,
     ...(query.stockClass ? { stockClass: query.stockClass } : {}),
     ...(query.method ? { method: query.method } : {}),
@@ -308,9 +310,14 @@ export async function listStock(ctx: TenantContext, query: any): Promise<Paged<S
     ...(query.itemNameId ? { itemNameId: query.itemNameId } : {}),
     ...(query.karatCode ? { karatCode: query.karatCode } : {}),
     ...(query.branchId ? { branchId: query.branchId } : {}),
-    ...(query.q ? { OR: [{ tagNo: { contains: query.q, mode: 'insensitive' } }, { huid: { contains: query.q, mode: 'insensitive' } }] } : {}),
+    ...(query.q ? { OR: [{ tagNo: { contains: query.q, mode: 'insensitive' } }, { huid: { contains: query.q, mode: 'insensitive' } }, { itemName: { name: { contains: query.q, mode: 'insensitive' } } }] } : {}),
     ...(query.minWeight != null || query.maxWeight != null ? { net: { ...(query.minWeight != null ? { gte: query.minWeight } : {}), ...(query.maxWeight != null ? { lte: query.maxWeight } : {}) } } : {}),
   };
+}
+
+export async function listStock(ctx: TenantContext, query: any): Promise<Paged<StockItemDto>> {
+  const sdb = scopedDb(ctx);
+  const where = stockWhere(query);
   const [rows, total] = await Promise.all([
     sdb.stockItem.findMany({ where, include: { group: true, itemName: true }, skip: (query.page - 1) * query.pageSize, take: query.pageSize, orderBy: { id: 'desc' } }),
     sdb.stockItem.count({ where }),
@@ -338,7 +345,8 @@ export async function stockSummary(ctx: TenantContext): Promise<StockSummaryDto[
 
 export async function stockGroups(ctx: TenantContext, query: any): Promise<GroupStockDto[]> {
   const sdb = scopedDb(ctx);
-  const where: any = { status: 'AVAILABLE', ...(query.stockClass ? { stockClass: query.stockClass } : {}), ...(query.groupId ? { groupId: query.groupId } : {}) };
+  // Same filters as the item list; status comes from stockListQuery (defaults to AVAILABLE, the previous hard-coded value).
+  const where = stockWhere({ ...query, status: query.status ?? 'AVAILABLE' });
   const grouped = await sdb.stockItem.groupBy({ by: ['groupId', 'karatCode'], where, _count: { _all: true }, _sum: { pcs: true, gross: true, net: true, fine: true, purchaseCost: true } });
   const groups = await sdb.itemGroup.findMany({ where: { id: { in: [...new Set(grouped.map((g) => g.groupId))] } } });
   const byId = new Map(groups.map((g) => [g.id, g]));
@@ -416,6 +424,16 @@ export async function updateStock(ctx: TenantContext, id: number, body: any): Pr
 
 export async function deleteStock(ctx: TenantContext, id: number): Promise<void> {
   await deleteStockItems(ctx, [id]);
+}
+
+/** Clears a stock item's photo (scoped lookup) and deletes the stored file; no-op when it has none. */
+export async function removeStockPhoto(ctx: TenantContext, id: number): Promise<void> {
+  const item = await scopedDb(ctx).stockItem.findUnique({ where: { id } });
+  if (!item) throw new HttpError(404, 'NOT_FOUND', 'Stock item not found');
+  if (!item.photoUrl) return;
+  const abs = await stockImagePath(ctx, id).catch(() => null);
+  await scopedDb(ctx).stockItem.update({ where: { id }, data: { photoUrl: null } });
+  if (abs) await rm(abs, { force: true }).catch(() => {});
 }
 
 // ───────────── Bulk edit / delete (one tx, reuse the single-item path) ─────────────

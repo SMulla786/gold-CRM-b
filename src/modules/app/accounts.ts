@@ -76,6 +76,7 @@ async function decorateIE(ctx: TenantContext, rows: any[]): Promise<IncomeExpens
     remark: r.remark,
     createdBy: r.createdById != null ? (uName.get(r.createdById) ?? null) : null,
     createdAt: r.createdAt.toISOString(),
+    sourceType: 'DIRECT' as const,
   }));
 }
 
@@ -98,13 +99,23 @@ export async function createIncomeExpense(ctx: TenantContext, body: IeBody): Pro
   return (await decorateIE(ctx, [header]))[0]!;
 }
 
-type IeListQuery = { page: number; pageSize: number; type?: 'INCOME' | 'EXPENSE'; from?: Date; to?: Date; sourceType?: IeSourceType };
+type IeListQuery = { page: number; pageSize: number; q?: string; type?: 'INCOME' | 'EXPENSE'; from?: Date; to?: Date; sourceType?: IeSourceType };
+
+const AUTO_SOURCE_TYPES = (Object.keys(IE_SOURCE_MAP) as IeSourceType[]).filter((s): s is Exclude<IeSourceType, 'DIRECT'> => s !== 'DIRECT');
 
 export async function listIncomeExpense(ctx: TenantContext, query: IeListQuery): Promise<Paged<IncomeExpenseDto>> {
-  const sourceType = query.sourceType ?? 'DIRECT';
-  if (sourceType !== 'DIRECT') return autoEntryList(ctx, sourceType, query); // cross-module auto-entries, aggregated per document
+  const page = (all: IncomeExpenseDto[]): Paged<IncomeExpenseDto> =>
+    ({ items: all.slice((query.page - 1) * query.pageSize, query.page * query.pageSize), total: all.length, page: query.page, pageSize: query.pageSize });
+  if (query.sourceType && query.sourceType !== 'DIRECT') return page(await autoEntries(ctx, query.sourceType, query)); // cross-module auto-entries, aggregated per document
+  if (!query.sourceType) {
+    // All sources: manual + every auto source, newest first.
+    // shortcut: merged and paged in memory (like autoEntries) — fine at pilot scale; move to a SQL UNION if ledgers grow large.
+    const [direct, ...auto] = await Promise.all([directEntries(ctx, query), ...AUTO_SOURCE_TYPES.map((st) => autoEntries(ctx, st, query))]);
+    const all = [...direct, ...auto.flat()].sort((a, b) => b.txnDate.localeCompare(a.txnDate) || b.createdAt.localeCompare(a.createdAt) || b.id - a.id);
+    return page(all);
+  }
   const sdb = scopedDb(ctx);
-  const where: any = { isDeleted: false, branchId: { in: branchFilter(ctx) }, ...(query.type ? { type: query.type } : {}), ...dateWhere(query.from, query.to) };
+  const where = directWhere(ctx, query);
   const [rows, total] = await Promise.all([
     sdb.incomeExpense.findMany({ where, orderBy: [{ txnDate: 'desc' }, { id: 'desc' }], skip: (query.page - 1) * query.pageSize, take: query.pageSize }),
     sdb.incomeExpense.count({ where }),
@@ -112,12 +123,24 @@ export async function listIncomeExpense(ctx: TenantContext, query: IeListQuery):
   return { items: await decorateIE(ctx, rows), total, page: query.page, pageSize: query.pageSize };
 }
 
+function directWhere(ctx: TenantContext, query: IeListQuery): any {
+  return {
+    isDeleted: false, branchId: { in: branchFilter(ctx) }, ...(query.type ? { type: query.type } : {}), ...dateWhere(query.from, query.to),
+    ...(query.q ? { OR: [{ reason: { contains: query.q, mode: 'insensitive' } }, { remark: { contains: query.q, mode: 'insensitive' } }] } : {}),
+  };
+}
+
+async function directEntries(ctx: TenantContext, query: IeListQuery): Promise<IncomeExpenseDto[]> {
+  const rows = await scopedDb(ctx).incomeExpense.findMany({ where: directWhere(ctx, query), orderBy: [{ txnDate: 'desc' }, { id: 'desc' }] });
+  return decorateIE(ctx, rows);
+}
+
 const toDec = (x: Prisma.Decimal | null): Prisma.Decimal => new Prisma.Decimal(x ?? 0);
 const IE_SOURCE_LABEL: Record<Exclude<IeSourceType, 'DIRECT'>, string> = { SELL_BILL: 'Sale', PURCHASE_BILL: 'Purchase', GIRVI: 'Girvi', UDHAR: 'Udhar' };
 
-/** TASK-81: auto-entries from another module, one IncomeExpenseDto per source document (money net in `cash`, metals in gold/silver).
- *  shortcut: aggregates + paginates in memory — fine at pilot scale; move to a SQL rollup if a shop's ledger grows large. */
-async function autoEntryList(ctx: TenantContext, sourceType: Exclude<IeSourceType, 'DIRECT'>, query: IeListQuery): Promise<Paged<IncomeExpenseDto>> {
+/** TASK-81: auto-entries from another module, one IncomeExpenseDto per source document (money net in `cash`, metals in gold/silver), newest first.
+ *  shortcut: aggregates in memory (caller pages) — fine at pilot scale; move to a SQL rollup if a shop's ledger grows large. */
+async function autoEntries(ctx: TenantContext, sourceType: Exclude<IeSourceType, 'DIRECT'>, query: IeListQuery): Promise<IncomeExpenseDto[]> {
   const base = { branchId: { in: branchFilter(ctx) }, source: { in: IE_SOURCE_MAP[sourceType] }, reversalOfId: null, ...dateWhere(query.from, query.to) };
   const rows = await scopedDb(ctx).ledgerEntry.groupBy({ by: ['sourceId', 'txnDate', 'asset', 'direction'], where: base, _sum: { amount: true, fine: true } });
   const docs = new Map<string, { sourceId: string; txnDate: Date; moneyIn: Prisma.Decimal; moneyOut: Prisma.Decimal; gold: Prisma.Decimal; silver: Prisma.Decimal }>();
@@ -131,8 +154,7 @@ async function autoEntryList(ctx: TenantContext, sourceType: Exclude<IeSourceTyp
   let list = [...docs.values()].map((d) => ({ d, net: d.moneyIn.minus(d.moneyOut) }));
   if (query.type) list = list.filter(({ net }) => (query.type === 'INCOME' ? net.gte(0) : net.lt(0)));
   list.sort((a, b) => b.d.txnDate.getTime() - a.d.txnDate.getTime() || Number(b.d.sourceId) - Number(a.d.sourceId));
-  const total = list.length;
-  const items: IncomeExpenseDto[] = list.slice((query.page - 1) * query.pageSize, query.page * query.pageSize).map(({ d, net }) => ({
+  const items: IncomeExpenseDto[] = list.map(({ d, net }) => ({
     id: Number(d.sourceId),
     txnDate: dateOnly(d.txnDate),
     type: net.gte(0) ? 'INCOME' : 'EXPENSE',
@@ -145,8 +167,10 @@ async function autoEntryList(ctx: TenantContext, sourceType: Exclude<IeSourceTyp
     remark: null,
     createdBy: null,
     createdAt: dateOnly(d.txnDate),
+    sourceType,
   }));
-  return { items, total, page: query.page, pageSize: query.pageSize };
+  const kw = query.q?.toLowerCase();
+  return kw ? items.filter((i) => i.reason.toLowerCase().includes(kw)) : items;
 }
 
 /** TASK-81: per-day Cash In/Out, Profit (money IN−OUT) and Gold/Silver net, across all sources or one sourceType. */
@@ -216,6 +240,7 @@ interface LedgerQ {
   metalForm?: 'USUAL' | 'BULLION' | 'KACHA';
   partyId?: number;
   stockItemId?: number;
+  q?: string;
 }
 
 interface RawRow {
@@ -255,6 +280,8 @@ function ledgerConds(ctx: TenantContext, q: LedgerQ, branches: number[]): Prisma
   if (q.partyId) c.push(Prisma.sql`"partyId" = ${q.partyId}`);
   if (q.stockItemId) c.push(Prisma.sql`"stockItemId" = ${q.stockItemId}`);
   if (q.bankAccountId != null) c.push(q.bankAccountId === 0 ? Prisma.sql`"bankAccountId" IS NULL` : Prisma.sql`"bankAccountId" = ${q.bankAccountId}`);
+  // keyword: Ref / ID (source id) or narration — like the other filters it also scopes the opening balance
+  if (q.q) c.push(Prisma.sql`("sourceId" = ${q.q} OR narration ILIKE ${`%${q.q}%`})`);
   return c;
 }
 

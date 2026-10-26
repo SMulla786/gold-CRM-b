@@ -78,6 +78,10 @@ inventoryRouter.post('/stock/:id/photo', requirePermission('inventory.all_stock'
   const rel = await saveStockImage(req.ctx!, id, req.file.buffer);
   res.status(201).json({ url: `/api/app/files/stock/${id}/photo`, path: rel });
 });
+inventoryRouter.delete('/stock/:id/photo', requirePermission('inventory.all_stock', 'edit'), async (req, res) => {
+  await inv.removeStockPhoto(req.ctx!, idSchema.parse(req.params.id));
+  res.status(204).end();
+});
 inventoryRouter.get('/files/stock/:id/photo', requirePermission('inventory.all_stock', 'view'), async (req, res) => {
   const abs = await stockImagePath(req.ctx!, idSchema.parse(req.params.id));
   res.type(CONTENT_TYPE[path.extname(abs)] ?? 'application/octet-stream').sendFile(abs);

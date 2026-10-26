@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-explicit-any -- service inputs are zod-parsed upstream; tests pass partial bodies */
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { db, truncateAll } from '../../../../test/helpers/db';
 import { createBusiness } from '../../../../test/helpers/factory';
@@ -146,6 +147,34 @@ describe('schemes', () => {
     const scheme = await cashScheme(s.ctx);
     await schemes.enroll(s.ctx, { schemeId: scheme.id, partyId: s.party.id, assignId: 'DUP', displayName: 'C', tokenAmount: 0 } as any);
     await expect(schemes.enroll(s.ctx, { schemeId: scheme.id, partyId: s.party.id, assignId: 'DUP', displayName: 'C', tokenAmount: 0 } as any)).rejects.toMatchObject({ status: 409 });
+  });
+
+  it('member list q matches assign id, display name, party name and party mobile (case-insensitive)', async () => {
+    const s = await setup();
+    const scheme = await cashScheme(s.ctx);
+    const other = await db.party.create({ data: { businessId: s.business.id, type: 'CUSTOMER', name: 'Zubair Khan', mobile: '9876543210', countryCode: '+91' } });
+    await schemes.enroll(s.ctx, { schemeId: scheme.id, partyId: s.party.id, assignId: 'AX1', displayName: 'Alpha', tokenAmount: 0 } as any);
+    await schemes.enroll(s.ctx, { schemeId: scheme.id, partyId: other.id, assignId: 'BY2', displayName: 'Beta', tokenAmount: 0 } as any);
+    const list = (q: string) => schemes.listEnrollments(s.ctx, { page: 1, pageSize: 20, q });
+    expect((await list('ax')).items.map((e) => e.assignId)).toEqual(['AX1']);
+    expect((await list('beta')).items.map((e) => e.assignId)).toEqual(['BY2']);
+    expect((await list('zubair')).items.map((e) => e.assignId)).toEqual(['BY2']);
+    expect((await list('98765')).items.map((e) => e.assignId)).toEqual(['BY2']);
+    expect((await list('nomatch')).total).toBe(0);
+  });
+
+  it("'due today' filters before paging, so total and pages count only due members", async () => {
+    const s = await setup();
+    const scheme = await cashScheme(s.ctx);
+    const enrol = (assignId: string) => schemes.enroll(s.ctx, { schemeId: scheme.id, partyId: s.party.id, assignId, displayName: 'C', tokenAmount: 0, startDate: new Date() } as any);
+    const a = await enrol('D1');
+    await enrol('D2');
+    await enrol('D3');
+    await schemes.addPayment(s.ctx, { enrollmentId: a.id, emiNo: 1, amount: 2000, medium: 'CASH' } as any); // D1 now has nothing due today
+    const p1 = await schemes.listEnrollments(s.ctx, { page: 1, pageSize: 1, due: 'true' });
+    const p2 = await schemes.listEnrollments(s.ctx, { page: 2, pageSize: 1, due: 'true' });
+    expect(p1.total).toBe(2);
+    expect([...p1.items, ...p2.items].map((e) => e.assignId).sort()).toEqual(['D2', 'D3']);
   });
 
   it('cross-tenant party / scheme → 404', async () => {

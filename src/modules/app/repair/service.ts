@@ -67,6 +67,19 @@ export async function updateRepairStatus(ctx: TenantContext, id: number, body: {
   const t = await sdb.repairTicket.findUnique({ where: { id } });
   if (!t) throw new HttpError(404, 'NOT_FOUND', 'Repair ticket not found');
   if (t.status === 'DELIVERED' || t.status === 'CANCELLED') throw new HttpError(409, 'CONFLICT', `A ${t.status.toLowerCase()} ticket cannot change status`);
+  if (body.karigarId != null) {
+    // same tenant + KARIGAR check as createRepair (a foreign/non-karigar id must never be persisted)
+    const k = await sdb.party.findUnique({ where: { id: body.karigarId } });
+    if (!k) throw new HttpError(404, 'NOT_FOUND', 'Karigar not found');
+    if (k.type !== 'KARIGAR') throw new HttpError(400, 'VALIDATION', 'That party is not a karigar');
+  }
+  if (body.status === t.status) {
+    // same status = karigar (re)assignment only; status itself never moves backward or sideways
+    if (body.karigarId == null) throw new HttpError(409, 'CONFLICT', `Ticket is already ${t.status}`);
+    const c = await sdb.repairTicket.updateMany({ where: { id, status: t.status }, data: { karigarId: body.karigarId } });
+    if (c.count !== 1) throw new HttpError(409, 'CONFLICT', 'Ticket status just changed');
+    return getRepair(ctx, id);
+  }
   if (body.status === 'CANCELLED') {
     // guard on the current status so a concurrent move can't flip it out from under us
     const c = await sdb.repairTicket.updateMany({ where: { id, status: t.status }, data: { status: 'CANCELLED', ...(body.karigarId != null ? { karigarId: body.karigarId } : {}) } });
@@ -114,9 +127,24 @@ export async function deliverRepair(ctx: TenantContext, id: number, body: Delive
   return getRepair(ctx, id);
 }
 
-export async function listRepairs(ctx: TenantContext, q: { page: number; pageSize: number; status?: string; partyId?: number }): Promise<{ items: RepairTicketDto[]; total: number; page: number; pageSize: number }> {
+export async function listRepairs(ctx: TenantContext, q: { page: number; pageSize: number; q?: string; status?: string; partyId?: number }): Promise<{ items: RepairTicketDto[]; total: number; page: number; pageSize: number }> {
   const sdb = scopedDb(ctx);
-  const where = { ...(q.status ? { status: q.status as any } : {}), ...(q.partyId ? { partyId: q.partyId } : {}) };
+  // q: ticket no (with or without '#'), party name / mobile, description or category
+  const kw = q.q?.trim();
+  let kwWhere: Prisma.RepairTicketWhereInput = {};
+  if (kw) {
+    const parties = await sdb.party.findMany({ where: { OR: [{ name: { contains: kw, mode: 'insensitive' } }, { mobile: { contains: kw } }] }, select: { id: true } });
+    // ticketNo is Int4: only digits that fit (a 10-digit mobile must not reach it, it would overflow → 500)
+    const num = /^#?\d+$/.test(kw) ? Number(kw.replace('#', '')) : NaN;
+    const ticketNo = Number.isInteger(num) && num > 0 && num <= 2_147_483_647 ? num : null;
+    kwWhere = { OR: [
+      ...(ticketNo != null ? [{ ticketNo }] : []),
+      { partyId: { in: parties.map((p) => p.id) } },
+      { description: { contains: kw, mode: 'insensitive' } },
+      { category: { contains: kw, mode: 'insensitive' } },
+    ] };
+  }
+  const where: Prisma.RepairTicketWhereInput = { ...(q.status ? { status: q.status as any } : {}), ...(q.partyId ? { partyId: q.partyId } : {}), ...kwWhere };
   const [rows, total] = await Promise.all([
     sdb.repairTicket.findMany({ where, orderBy: { id: 'desc' }, skip: (q.page - 1) * q.pageSize, take: q.pageSize, select: { id: true } }),
     sdb.repairTicket.count({ where }),

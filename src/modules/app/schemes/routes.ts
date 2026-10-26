@@ -1,10 +1,14 @@
 import { Router } from 'express';
+import { z } from 'zod';
 import { requireMpin, requirePermission } from '../../../middleware/guards';
 import {
   id as idSchema, schemeBody, schemeListQuery, schemePatchBody, schemeGroupBody, schemeGroupListQuery,
-  enrollmentBody, enrollmentListQuery, enrollmentWonBody, redeemBody, addSchemePaymentBody, schemeTxnListQuery, schemeDayBookQuery,
+  enrollmentBody, enrollmentListQuery, redeemBody, addSchemePaymentBody, schemeTxnListQuery, schemeDayBookQuery, SCHEME_KINDS,
 } from '../../../shared';
 import * as schemes from './service';
+
+/** GET /schemes/dues — no shared contract yet, so parse locally (string ids would otherwise hit Prisma Int filters). */
+const duesQuery = z.object({ schemeId: idSchema.optional(), groupId: idSchema.optional(), kind: z.enum(SCHEME_KINDS).optional() });
 
 export const schemesRouter = Router();
 const ALL = 'schemes.all';
@@ -28,7 +32,7 @@ schemesRouter.post('/schemes/enrollments/:id/redeem', requirePermission(ALL, 'ed
 schemesRouter.post('/schemes/payments', requirePermission(ADD, 'edit'), async (req, res) => res.status(201).json(await schemes.addPayment(req.ctx!, addSchemePaymentBody.parse(req.body))));
 schemesRouter.post('/schemes/payments/:id/reverse', requirePermission(ADD, 'delete'), requireMpin, async (req, res) => res.json(await schemes.reversePayment(req.ctx!, idSchema.parse(req.params.id))));
 
-schemesRouter.get('/schemes/dues', requirePermission(DUES, 'view'), async (req, res) => res.json(await schemes.dues(req.ctx!, req.query)));
+schemesRouter.get('/schemes/dues', requirePermission(DUES, 'view'), async (req, res) => res.json(await schemes.dues(req.ctx!, duesQuery.parse(req.query))));
 schemesRouter.get('/schemes/transactions', requirePermission(TXN, 'view'), async (req, res) => res.json(await schemes.transactions(req.ctx!, schemeTxnListQuery.parse(req.query))));
 schemesRouter.get('/schemes/day-book', requirePermission(DAYBOOK, 'view'), async (req, res) => res.json(await schemes.dayBook(req.ctx!, schemeDayBookQuery.parse(req.query))));
 

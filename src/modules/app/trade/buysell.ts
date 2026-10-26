@@ -109,6 +109,12 @@ export async function getBuySell(ctx: TenantContext, id: number): Promise<BuySel
 export async function listBuySell(ctx: TenantContext, query: z.infer<typeof buySellListQuery>): Promise<Paged<BuySellDto>> {
   const sdb = scopedDb(ctx);
   const where: any = { ...(query.side ? { side: query.side } : {}), ...(query.metal ? { metal: query.metal } : {}), ...(query.partyId ? { partyId: query.partyId } : {}) };
+  if (query.q) {
+    // Same as listExchange: match party name/mobile, or the trade number.
+    const parties = await sdb.party.findMany({ where: { OR: [{ name: { contains: query.q, mode: 'insensitive' } }, { mobile: { contains: query.q } }] }, select: { id: true } });
+    const asNo = Number(query.q);
+    where.OR = [...(Number.isInteger(asNo) && asNo > 0 && asNo <= 2_147_483_647 ? [{ buySellNo: asNo }] : []), { partyId: { in: parties.map((p) => p.id) } }];
+  }
   const [rows, total] = await Promise.all([
     sdb.buySell.findMany({ where, include: { lines: { orderBy: { id: 'asc' } } }, orderBy: { id: 'desc' }, skip: (query.page - 1) * query.pageSize, take: query.pageSize }),
     sdb.buySell.count({ where }),

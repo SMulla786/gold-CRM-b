@@ -246,12 +246,16 @@ export async function deleteUdharTxn(ctx: TenantContext, id: number): Promise<vo
 // ───────────── Lists ─────────────
 
 /** Udhar List: one row per UdharEntry across sources. */
-export async function listEntries(ctx: TenantContext, q: { page: number; pageSize: number; partyId?: number; source?: string; from?: Date; to?: Date }): Promise<Paged<UdharEntryRowDto>> {
+export async function listEntries(ctx: TenantContext, q: { page: number; pageSize: number; q?: string; partyId?: number; source?: string; from?: Date; to?: Date }): Promise<Paged<UdharEntryRowDto>> {
   const sdb = scopedDb(ctx);
+  // keyword: party name/mobile, narration or the raw source id.
+  // shortcut: bill numbers are resolved after paging (referenceLabels), so they aren't searchable here; add a join if users ask.
+  const kwParties = q.q ? (await sdb.party.findMany({ where: { OR: [{ name: { contains: q.q, mode: 'insensitive' } }, { mobile: { contains: q.q } }] }, select: { id: true } })).map((p) => p.id) : [];
   const where: any = {
     ...(q.partyId ? { partyId: q.partyId } : {}),
     ...(q.source ? { source: q.source } : {}),
     ...(q.from || q.to ? { txnDate: { ...(q.from ? { gte: ledger.businessDate(q.from) } : {}), ...(q.to ? { lte: ledger.businessDate(q.to) } : {}) } } : {}),
+    ...(q.q ? { OR: [{ partyId: { in: kwParties } }, { narration: { contains: q.q, mode: 'insensitive' } }, { sourceId: q.q }] } : {}),
   };
   const [rows, total] = await Promise.all([
     sdb.udharEntry.findMany({ where, orderBy: [{ txnDate: 'desc' }, { id: 'desc' }], skip: (q.page - 1) * q.pageSize, take: q.pageSize }),
@@ -288,7 +292,7 @@ export async function listLedger(ctx: TenantContext, q: { page: number; pageSize
     select: PARTY_SELECT,
   });
   const pMap = new Map(parties.map((p) => [p.id, p]));
-  let rows = grouped
+  const rows = grouped
     .filter((g) => pMap.has(g.partyId))
     .map((g) => {
       const amount = D(g._sum.amount);
@@ -396,7 +400,7 @@ function summarizeItems(items: { description: string; pcs: number }[]): string {
 }
 
 /** Pending bills (balance ≠ 0), both kinds. Reads Bill (empty until billing lands). */
-export async function pendingBills(ctx: TenantContext, q: { page: number; pageSize: number; partyId?: number; type?: PartyType }): Promise<Paged<BillListItemDto>> {
+export async function pendingBills(ctx: TenantContext, q: { page: number; pageSize: number; q?: string; partyId?: number; type?: PartyType }): Promise<Paged<BillListItemDto>> {
   const sdb = scopedDb(ctx);
   if (ctx.branchIds.length === 0) return { items: [], total: 0, page: q.page, pageSize: q.pageSize };
   // Pending = ACTIVE bill with final ≠ paid (a column-vs-column comparison Prisma can't express through the scoped client),
@@ -409,7 +413,11 @@ export async function pendingBills(ctx: TenantContext, q: { page: number; pageSi
   ];
   if (q.partyId) conds.push(Prisma.sql`b."partyId" = ${q.partyId}`);
   if (q.type) conds.push(Prisma.sql`p.type::text = ${q.type}`);
-  const join = q.type ? Prisma.sql`JOIN "Party" p ON p.id = b."partyId"` : Prisma.empty;
+  if (q.q) {
+    const kw = `%${q.q}%`;
+    conds.push(Prisma.sql`(b."billNo" ILIKE ${kw} OR p.name ILIKE ${kw} OR p.mobile ILIKE ${kw})`);
+  }
+  const join = q.type || q.q ? Prisma.sql`JOIN "Party" p ON p.id = b."partyId"` : Prisma.empty;
   const ids = (await prisma.$queryRaw<{ id: number }[]>(Prisma.sql`SELECT b.id FROM "Bill" b ${join} WHERE ${Prisma.join(conds, ' AND ')}`)).map((r) => r.id);
   if (ids.length === 0) return { items: [], total: 0, page: q.page, pageSize: q.pageSize };
 

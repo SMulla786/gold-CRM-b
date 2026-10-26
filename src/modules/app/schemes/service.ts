@@ -28,6 +28,17 @@ const dateOnly = (d: Date) => ledger.businessDate(d);
 function emiDateFor(start: Date, emiNo: number): Date {
   return new Date(Date.UTC(start.getUTCFullYear(), start.getUTCMonth() + (emiNo - 1), start.getUTCDate()));
 }
+/** Unpaid installments due on/before `today` + the next unpaid slot. Shared by buildEnrollment and the 'due' list filter. */
+function emiSchedule(start: Date, tenure: number, paidSlots: Set<number | null>, today: Date) {
+  let emisDue = 0, nextEmiNo: number | null = null, nextEmiDate: string | null = null;
+  for (let m = 1; m <= tenure; m++) {
+    if (paidSlots.has(m)) continue;
+    const d = emiDateFor(start, m);
+    if (nextEmiNo == null) { nextEmiNo = m; nextEmiDate = d.toISOString().slice(0, 10); }
+    if (d.getTime() <= today.getTime()) emisDue++;
+  }
+  return { emisDue, nextEmiNo, nextEmiDate };
+}
 const todayGoldRate = async (ctx: TenantContext) => Number((await currentRates(ctx)).gold.rows[0]?.sellRate ?? 0);
 const isP2002 = (e: unknown) => e instanceof Prisma.PrismaClientKnownRequestError && e.code === 'P2002';
 
@@ -54,7 +65,10 @@ export async function createScheme(ctx: TenantContext, body: any): Promise<Schem
 
 export async function listSchemes(ctx: TenantContext, q: any): Promise<{ items: SchemeDto[]; total: number; page: number; pageSize: number }> {
   const sdb = scopedDb(ctx);
-  const where = { ...(q.kind ? { kind: q.kind } : {}), ...(q.type ? { type: q.type } : {}), ...(q.active ? { isActive: q.active === 'true' } : {}) };
+  const where = {
+    ...(q.kind ? { kind: q.kind } : {}), ...(q.type ? { type: q.type } : {}), ...(q.active ? { isActive: q.active === 'true' } : {}),
+    ...(q.q ? { name: { contains: q.q, mode: 'insensitive' as const } } : {}),
+  };
   const [rows, total] = await Promise.all([
     sdb.scheme.findMany({ where, orderBy: { id: 'desc' }, skip: (q.page - 1) * q.pageSize, take: q.pageSize, select: { id: true } }),
     sdb.scheme.count({ where }),
@@ -199,7 +213,6 @@ export async function addPayment(ctx: TenantContext, body: any): Promise<Enrollm
 }
 
 export async function reversePayment(ctx: TenantContext, paymentId: number): Promise<EnrollmentDetailDto> {
-  const sdb = scopedDb(ctx);
   // reach the payment through its scoped enrollment
   const pay = await prisma.schemePayment.findFirst({ where: { id: paymentId, enrollment: { businessId: ctx.businessId!, branchId: { in: branchScope(ctx) } } }, include: { enrollment: true } });
   if (!pay) throw new HttpError(404, 'NOT_FOUND', 'Payment not found');
@@ -256,14 +269,32 @@ export async function redeem(ctx: TenantContext, id: number, body: any): Promise
 }
 
 export async function listEnrollments(ctx: TenantContext, q: any): Promise<{ items: EnrollmentDto[]; total: number; page: number; pageSize: number }> {
-  const where = enrollmentWhere(ctx, q);
+  const build = async (ids: number[]) => (await Promise.all(ids.map((id) => buildEnrollment(ctx, id, false)))).filter((e): e is EnrollmentDto => !!e);
+  if (q.due === 'true') {
+    // 'Due today' depends on startDate + tenure + paid slots (and emiDateFor's JS month roll-over), which has no clean SQL form.
+    // So filter the FULL matching set on a light projection first, then page in memory: total and page count stay correct.
+    // Contract: only ACTIVE/WON are "due" unless the caller picked a status.
+    const where = await enrollmentWhere(ctx, q.status ? q : { ...q, status: { in: ['ACTIVE', 'WON'] } });
+    const all = await prisma.schemeEnrollment.findMany({ where, orderBy: { id: 'desc' }, select: { id: true, startDate: true, scheme: { select: { tenureMonths: true } } } });
+    const paid = all.length
+      ? await prisma.schemePayment.findMany({ where: { enrollmentId: { in: all.map((e) => e.id) }, emiNo: { not: null }, isReversed: false }, select: { enrollmentId: true, emiNo: true } })
+      : [];
+    const slots = new Map<number, Set<number | null>>();
+    for (const p of paid) {
+      if (!slots.has(p.enrollmentId)) slots.set(p.enrollmentId, new Set());
+      slots.get(p.enrollmentId)!.add(p.emiNo);
+    }
+    const today = ledger.businessDate();
+    const dueIds = all.filter((e) => emiSchedule(e.startDate, e.scheme.tenureMonths, slots.get(e.id) ?? new Set(), today).emisDue > 0).map((e) => e.id);
+    const items = await build(dueIds.slice((q.page - 1) * q.pageSize, q.page * q.pageSize));
+    return { items, total: dueIds.length, page: q.page, pageSize: q.pageSize };
+  }
+  const where = await enrollmentWhere(ctx, q);
   const [rows, total] = await Promise.all([
     prisma.schemeEnrollment.findMany({ where, orderBy: { id: 'desc' }, skip: (q.page - 1) * q.pageSize, take: q.pageSize, select: { id: true } }),
     prisma.schemeEnrollment.count({ where }),
   ]);
-  let items = (await Promise.all(rows.map((r) => buildEnrollment(ctx, r.id, false)))).filter((e): e is EnrollmentDto => !!e);
-  if (q.due === 'true') items = items.filter((e) => e.emisDue > 0);
-  return { items, total, page: q.page, pageSize: q.pageSize };
+  return { items: await build(rows.map((r) => r.id)), total, page: q.page, pageSize: q.pageSize };
 }
 
 export async function getEnrollment(ctx: TenantContext, id: number): Promise<EnrollmentDetailDto> {
@@ -283,7 +314,8 @@ export async function dues(ctx: TenantContext, q: any): Promise<SchemeDueRowDto[
 }
 
 export async function transactions(ctx: TenantContext, q: any): Promise<{ items: SchemeTxnRowDto[]; total: number; page: number; pageSize: number }> {
-  const where = txnWhere(ctx, q);
+  const kw = typeof q.q === 'string' ? q.q.trim() : '';
+  const where = txnWhere(ctx, q, kw ? enrollmentKeyword(kw, await partyIdsMatching(ctx, kw)) : undefined);
   const [rows, total] = await Promise.all([
     prisma.schemePayment.findMany({ where, orderBy: { id: 'desc' }, skip: (q.page - 1) * q.pageSize, take: q.pageSize, include: txnInclude }),
     prisma.schemePayment.count({ where }),
@@ -327,11 +359,24 @@ async function buildSchemes(ctx: TenantContext, ids: number[]): Promise<SchemeDt
   }));
 }
 
-const enrollmentWhere = (ctx: TenantContext, q: any) => ({
-  businessId: ctx.businessId!, branchId: { in: branchScope(ctx) },
-  ...(q.schemeId ? { schemeId: q.schemeId } : {}), ...(q.groupId ? { groupId: q.groupId } : {}), ...(q.partyId ? { partyId: q.partyId } : {}),
-  ...(q.status ? { status: q.status } : {}), ...(q.kind ? { scheme: { kind: q.kind } } : {}),
+/** Party ids (this business) whose name or mobile contains `kw`, case-insensitive. */
+async function partyIdsMatching(ctx: TenantContext, kw: string): Promise<number[]> {
+  return (await scopedDb(ctx).party.findMany({ where: { OR: [{ name: { contains: kw, mode: 'insensitive' } }, { mobile: { contains: kw } }] }, select: { id: true } })).map((p) => p.id);
+}
+/** `q` keyword → assign id / display name / party name / party mobile (SchemeEnrollment has no party relation, so parties are resolved first). */
+const enrollmentKeyword = (kw: string, kwParties: number[]): Prisma.SchemeEnrollmentWhereInput => ({
+  OR: [{ assignId: { contains: kw, mode: 'insensitive' } }, { displayName: { contains: kw, mode: 'insensitive' } }, { partyId: { in: kwParties } }],
 });
+
+async function enrollmentWhere(ctx: TenantContext, q: any): Promise<Prisma.SchemeEnrollmentWhereInput> {
+  const kw = typeof q.q === 'string' ? q.q.trim() : '';
+  return {
+    businessId: ctx.businessId!, branchId: { in: branchScope(ctx) },
+    ...(q.schemeId ? { schemeId: q.schemeId } : {}), ...(q.groupId ? { groupId: q.groupId } : {}), ...(q.partyId ? { partyId: q.partyId } : {}),
+    ...(q.status ? { status: q.status } : {}), ...(q.kind ? { scheme: { kind: q.kind } } : {}),
+    ...(kw ? enrollmentKeyword(kw, await partyIdsMatching(ctx, kw)) : {}),
+  };
+}
 
 async function buildEnrollment(ctx: TenantContext, id: number, withPayments: boolean): Promise<EnrollmentDto | EnrollmentDetailDto | null> {
   const e = await prisma.schemeEnrollment.findFirst({ where: { id, businessId: ctx.businessId!, branchId: { in: branchScope(ctx) } }, include: { scheme: true, group: true } });
@@ -341,14 +386,7 @@ async function buildEnrollment(ctx: TenantContext, id: number, withPayments: boo
   const paidSlots = new Set(active.filter((p) => p.emiNo != null).map((p) => p.emiNo));
   const emisPaid = paidSlots.size;
   const tenure = e.scheme.tenureMonths;
-  const today = ledger.businessDate();
-  let emisDue = 0, nextEmiNo: number | null = null, nextEmiDate: string | null = null;
-  for (let m = 1; m <= tenure; m++) {
-    if (paidSlots.has(m)) continue;
-    const d = emiDateFor(e.startDate, m);
-    if (nextEmiNo == null) { nextEmiNo = m; nextEmiDate = d.toISOString().slice(0, 10); }
-    if (d.getTime() <= today.getTime()) emisDue++;
-  }
+  const { emisDue, nextEmiNo, nextEmiDate } = emiSchedule(e.startDate, tenure, paidSlots, ledger.businessDate());
   const gold = e.scheme.type === 'GOLD';
   const redeemRate = gold ? await todayGoldRate(ctx) : 0;
   const maturity = schemeMaturity({ type: e.scheme.type, payments: active.map((p) => ({ amount: p.amount, fine: p.fine })), bonusType: e.scheme.bonusType, bonusValue: e.scheme.bonusValue, emiAmount: e.emiAmount, redeemRate, rateUnitGrams: GOLD_UNIT });
@@ -382,8 +420,8 @@ function paymentDto(p: any, bankMap: Map<number, string>, userMap: Map<number, s
 }
 
 const txnInclude = { enrollment: { include: { scheme: true, group: true } } } as const;
-const txnWhere = (ctx: TenantContext, q: any) => ({
-  enrollment: { businessId: ctx.businessId!, branchId: { in: branchScope(ctx) }, ...(q?.schemeId ? { schemeId: q.schemeId } : {}), ...(q?.groupId ? { groupId: q.groupId } : {}), ...(q?.kind ? { scheme: { kind: q.kind } } : {}) },
+const txnWhere = (ctx: TenantContext, q: any, keyword?: Prisma.SchemeEnrollmentWhereInput) => ({
+  enrollment: { businessId: ctx.businessId!, branchId: { in: branchScope(ctx) }, ...(q?.schemeId ? { schemeId: q.schemeId } : {}), ...(q?.groupId ? { groupId: q.groupId } : {}), ...(q?.kind ? { scheme: { kind: q.kind } } : {}), ...(keyword ?? {}) },
   ...(q?.medium ? { medium: q.medium } : {}),
   ...(q?.from || q?.to ? { txnDate: { ...(q.from ? { gte: dateOnly(q.from) } : {}), ...(q.to ? { lte: dateOnly(q.to) } : {}) } } : {}),
 });

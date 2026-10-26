@@ -91,8 +91,22 @@ export async function createDraft(ctx: TenantContext, body: DraftBody): Promise<
 export async function listDrafts(ctx: TenantContext, query: ListQuery): Promise<{ items: SalesDraftDto[]; total: number; page: number; pageSize: number }> {
   const sdb = scopedDb(ctx);
   const now = new Date();
-  // EXPIRED is derived: query the stored PENDING/APPROVED rows already past expiry.
-  const where = query.status === 'EXPIRED' ? { status: { in: ['PENDING', 'APPROVED'] as any }, expiresAt: { lt: now } } : query.status ? { status: query.status as any } : {};
+  // EXPIRED is derived: query the stored PENDING/APPROVED rows already past expiry,
+  // and keep those expired rows out of a PENDING/APPROVED filter (an expired card can't be approved: 409).
+  const byStatus = query.status === 'EXPIRED' ? { status: { in: ['PENDING', 'APPROVED'] as any }, expiresAt: { lt: now } }
+    : query.status === 'PENDING' || query.status === 'APPROVED' ? { status: query.status as any, expiresAt: { gte: now } }
+    : query.status ? { status: query.status as any } : {};
+  // keyword: draft no., walk-in name/mobile, linked party name/mobile, note
+  const kw = query.q;
+  const draftNo = kw && /^\d+$/.test(kw) ? Number(kw) : undefined;
+  const kwParties = kw ? (await sdb.party.findMany({ where: { OR: [{ name: { contains: kw, mode: 'insensitive' } }, { mobile: { contains: kw } }] }, select: { id: true } })).map((p) => p.id) : [];
+  const where = kw ? { ...byStatus, OR: [
+    ...(draftNo ? [{ draftNo }] : []),
+    { customerName: { contains: kw, mode: 'insensitive' as const } },
+    { mobile: { contains: kw } },
+    { note: { contains: kw, mode: 'insensitive' as const } },
+    { partyId: { in: kwParties } },
+  ] } : byStatus;
   const [rows, total] = await Promise.all([
     sdb.salesDraft.findMany({ where, orderBy: { id: 'desc' }, skip: (query.page - 1) * query.pageSize, take: query.pageSize, select: { id: true } }),
     sdb.salesDraft.count({ where }),

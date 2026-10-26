@@ -119,9 +119,16 @@ describe('TASK-81 income/expense daily summary + sourceType', () => {
     await acc.createIncomeExpense(s.ctx, ie({ cash: 1000, reason: 'Manual' }));
     await autoRow(s.business.id, s.root.id, { amount: 5000, sourceId: '42' }); // a sale bill posting money IN
 
-    const direct = await acc.listIncomeExpense(s.ctx, { page: 1, pageSize: 20 }); // default DIRECT
+    const direct = await acc.listIncomeExpense(s.ctx, { page: 1, pageSize: 20, sourceType: 'DIRECT' });
     expect(direct.total).toBe(1);
     expect(direct.items[0]!.reason).toBe('Manual');
+    expect(direct.items[0]!.sourceType).toBe('DIRECT');
+
+    // no sourceType = All sources: manual + auto rows, each tagged (TASK-97: used to silently mean DIRECT)
+    const all = await acc.listIncomeExpense(s.ctx, { page: 1, pageSize: 20 });
+    expect(all.total).toBe(2);
+    expect(all.items.map((i) => i.sourceType).sort()).toEqual(['DIRECT', 'SELL_BILL']);
+    expect((await acc.listIncomeExpense(s.ctx, { page: 1, pageSize: 20, q: 'manu' })).items.map((i) => i.reason)).toEqual(['Manual']);
 
     const sales = await acc.listIncomeExpense(s.ctx, { page: 1, pageSize: 20, sourceType: 'SELL_BILL' });
     expect(sales.total).toBe(1);

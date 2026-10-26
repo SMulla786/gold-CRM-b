@@ -158,9 +158,14 @@ export async function activity(ctx: TenantContext, q: { page: number; pageSize: 
 
 const gstDateWhere = (from?: Date, to?: Date) => (from || to ? { billDate: { ...(from ? { gte: businessDate(from) } : {}), ...(to ? { lte: businessDate(to) } : {}) } } : {});
 
-export async function gstRegister(ctx: TenantContext, q: { page: number; pageSize: number; from?: Date; to?: Date; kind: 'SELL' | 'PURCHASE' }): Promise<Paged<GstRegisterRowDto>> {
+export async function gstRegister(ctx: TenantContext, q: { page: number; pageSize: number; q?: string; from?: Date; to?: Date; kind: 'SELL' | 'PURCHASE' }): Promise<Paged<GstRegisterRowDto>> {
   const sdb = scopedDb(ctx);
-  const where: any = { kind: q.kind, billType: 'GST', status: 'ACTIVE', branchId: { in: branchFilter(ctx) }, ...gstDateWhere(q.from, q.to) };
+  // keyword: bill no. or party name / mobile / GSTIN
+  const kwParties = q.q ? (await sdb.party.findMany({ where: { OR: [{ name: { contains: q.q, mode: 'insensitive' } }, { mobile: { contains: q.q } }, { gstin: { contains: q.q, mode: 'insensitive' } }] }, select: { id: true } })).map((p) => p.id) : [];
+  const where: any = {
+    kind: q.kind, billType: 'GST', status: 'ACTIVE', branchId: { in: branchFilter(ctx) }, ...gstDateWhere(q.from, q.to),
+    ...(q.q ? { OR: [{ billNo: { contains: q.q, mode: 'insensitive' } }, { partyId: { in: kwParties } }] } : {}),
+  };
   const [bills, total] = await Promise.all([
     sdb.bill.findMany({ where, include: { items: { select: { hsnCode: true } } }, orderBy: [{ billDate: 'asc' }, { id: 'asc' }], skip: (q.page - 1) * q.pageSize, take: q.pageSize }),
     sdb.bill.count({ where }),

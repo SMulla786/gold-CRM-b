@@ -153,9 +153,28 @@ export async function cancelOrder(ctx: TenantContext, id: number): Promise<void>
   });
 }
 
-export async function listOrders(ctx: TenantContext, q: { page: number; pageSize: number; status?: string; partyId?: number }): Promise<{ items: OrderDto[]; total: number; page: number; pageSize: number }> {
+/**
+ * Keyword → a document number ("12" or "#12"), or null when the keyword isn't a plain Int4-safe number
+ * (a 10-digit mobile typed in search must never reach an Int column — it's matched via party `contains` instead).
+ */
+function docNoOf(kw: string): number | null {
+  const m = /^#?(\d+)$/.exec(kw);
+  if (!m) return null;
+  const n = Number(m[1]);
+  return Number.isInteger(n) && n > 0 && n <= 2_147_483_647 ? n : null;
+}
+
+export async function listOrders(ctx: TenantContext, q: { page: number; pageSize: number; q?: string; status?: string; partyId?: number }): Promise<{ items: OrderDto[]; total: number; page: number; pageSize: number }> {
   const sdb = scopedDb(ctx);
-  const where = { ...(q.status ? { status: q.status as any } : {}), ...(q.partyId ? { partyId: q.partyId } : {}) };
+  // keyword: order no / party name / party mobile
+  const kw = q.q?.trim();
+  let kwWhere = {};
+  if (kw) {
+    const partyIds = (await sdb.party.findMany({ where: { OR: [{ name: { contains: kw, mode: 'insensitive' } }, { mobile: { contains: kw } }] }, select: { id: true } })).map((p) => p.id);
+    const no = docNoOf(kw);
+    kwWhere = { OR: [{ partyId: { in: partyIds } }, ...(no != null ? [{ orderNo: no }] : [])] };
+  }
+  const where = { ...(q.status ? { status: q.status as any } : {}), ...(q.partyId ? { partyId: q.partyId } : {}), ...kwWhere };
   const [rows, total] = await Promise.all([
     sdb.order.findMany({ where, orderBy: { id: 'desc' }, skip: (q.page - 1) * q.pageSize, take: q.pageSize, select: { id: true } }),
     sdb.order.count({ where }),
@@ -277,9 +296,28 @@ export async function receiveKarigar(ctx: TenantContext, issueId: number, body: 
   return getKarigarIssue(ctx, issueId);
 }
 
-export async function listKarigarIssues(ctx: TenantContext, q: { page: number; pageSize: number; karigarId?: number; status?: string }): Promise<{ items: KarigarIssueDto[]; total: number; page: number; pageSize: number }> {
+export async function listKarigarIssues(ctx: TenantContext, q: { page: number; pageSize: number; q?: string; karigarId?: number; status?: string }): Promise<{ items: KarigarIssueDto[]; total: number; page: number; pageSize: number }> {
   const sdb = scopedDb(ctx);
-  const where = { ...(q.karigarId ? { karigarId: q.karigarId } : {}), ...(q.status ? { status: q.status as any } : {}) };
+  // keyword: karigar name / issue no / order no / item name
+  const kw = q.q?.trim();
+  let kwWhere = {};
+  if (kw) {
+    const no = docNoOf(kw);
+    const [karigars, itemNames] = await Promise.all([
+      sdb.party.findMany({ where: { name: { contains: kw, mode: 'insensitive' } }, select: { id: true } }),
+      sdb.itemName.findMany({ where: { name: { contains: kw, mode: 'insensitive' } }, select: { id: true } }),
+    ]);
+    const itemOr = [
+      ...(itemNames.length ? [{ itemNameId: { in: itemNames.map((n) => n.id) } }] : []),
+      ...(no != null ? [{ order: { orderNo: no } }] : []),
+    ];
+    const issueIds = itemOr.length
+      ? (await prisma.orderItem.findMany({ where: { karigarIssueId: { not: null }, order: { businessId: ctx.businessId! }, OR: itemOr }, select: { karigarIssueId: true }, distinct: ['karigarIssueId'] }))
+          .map((r) => r.karigarIssueId).filter((x): x is number => x != null)
+      : [];
+    kwWhere = { OR: [{ karigarId: { in: karigars.map((p) => p.id) } }, { id: { in: issueIds } }, ...(no != null ? [{ issueNo: no }] : [])] };
+  }
+  const where = { ...(q.karigarId ? { karigarId: q.karigarId } : {}), ...(q.status ? { status: q.status as any } : {}), ...kwWhere };
   const [rows, total] = await Promise.all([
     sdb.karigarIssue.findMany({ where, orderBy: { id: 'desc' }, skip: (q.page - 1) * q.pageSize, take: q.pageSize, select: { id: true } }),
     sdb.karigarIssue.count({ where }),
