@@ -13,6 +13,7 @@ import type {
   Paged,
   PermissionGrantDto,
   RoleDto,
+  SubscriptionPaymentRowDto,
   SubscriptionViewDto,
   UserDto,
   UserPermissionsDto,
@@ -433,15 +434,29 @@ export async function subscriptionView(ctx: TenantContext): Promise<Subscription
     usedBranches,
     usedUsers,
     modules: sub.modules,
+    payments: (await prisma.subscriptionPayment.findMany({ where: { businessId: ctx.businessId! }, orderBy: { createdAt: 'desc' }, take: 50 })).map((p) => ({
+      id: p.id,
+      amount: p.amount.toString(),
+      method: p.method as SubscriptionPaymentRowDto['method'],
+      utr: p.utr,
+      status: p.status,
+      paidAt: p.paidAt ? p.paidAt.toISOString() : null,
+      createdAt: p.createdAt.toISOString(),
+      hasProof: p.screenshotUrl != null,
+    })),
   };
 }
 
-export async function recordSubscriptionPayment(ctx: TenantContext, body: { amount: number; method: 'UPI' | 'CASH' | 'BANK' | 'GATEWAY'; utr?: string; paidAt?: Date; subscriptionId?: number }): Promise<void> {
-  const sub = await prisma.subscription.findFirst({ where: { businessId: ctx.businessId! }, orderBy: { endsAt: 'desc' } });
-  await prisma.subscriptionPayment.create({
+export async function recordSubscriptionPayment(ctx: TenantContext, body: { amount: number; method: 'UPI' | 'CASH' | 'BANK' | 'GATEWAY'; utr?: string; paidAt?: Date; subscriptionId?: number }): Promise<{ id: number }> {
+  // Only this business's own subscription may be referenced (a foreign subscriptionId is ignored).
+  const sub = await prisma.subscription.findFirst({
+    where: { businessId: ctx.businessId!, ...(body.subscriptionId ? { id: body.subscriptionId } : {}) },
+    orderBy: { endsAt: 'desc' },
+  });
+  const p = await prisma.subscriptionPayment.create({
     data: {
       businessId: ctx.businessId!,
-      subscriptionId: body.subscriptionId ?? sub?.id ?? null,
+      subscriptionId: sub?.id ?? null,
       amount: body.amount,
       method: body.method,
       utr: body.utr ?? null,
@@ -450,4 +465,5 @@ export async function recordSubscriptionPayment(ctx: TenantContext, body: { amou
       recordedById: ctx.userId,
     },
   });
+  return { id: p.id };
 }

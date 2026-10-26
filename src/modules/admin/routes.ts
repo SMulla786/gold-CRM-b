@@ -1,4 +1,6 @@
+import path from 'node:path';
 import { Router } from 'express';
+import multer from 'multer';
 import { HttpError } from '../../middleware/error';
 import {
   branchBody,
@@ -20,6 +22,10 @@ import {
 import * as svc from './service';
 import { adminOverview } from './overview';
 import * as enquiry from './enquiry';
+import { paymentProofPath, savePaymentProof } from '../app/uploads';
+
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 2 * 1024 * 1024 } });
+const IMAGE_TYPE: Record<string, string> = { '.jpg': 'image/jpeg', '.png': 'image/png', '.webp': 'image/webp' };
 
 export const adminRouter = Router();
 
@@ -100,6 +106,17 @@ adminRouter.get('/subscription', async (req, res) => {
 });
 adminRouter.post('/subscription/payments', async (req, res) => {
   ownerOnly(req);
-  await svc.recordSubscriptionPayment(req.ctx!, recordPaymentBody.parse(req.body));
-  res.status(201).json({ ok: true });
+  res.status(201).json({ ok: true, ...(await svc.recordSubscriptionPayment(req.ctx!, recordPaymentBody.parse(req.body))) });
+});
+// TASK-95: payment screenshot (JPEG/PNG/WebP, magic-byte checked; only while PENDING)
+adminRouter.post('/subscription/payments/:id/proof', upload.single('file'), async (req, res) => {
+  ownerOnly(req);
+  if (!req.file) throw new HttpError(400, 'VALIDATION', 'No file uploaded (field "file")');
+  await savePaymentProof(req.ctx!, idSchema.parse(req.params.id), req.file.buffer);
+  res.status(201).json({ url: `/api/admin/subscription/payments/${idSchema.parse(req.params.id)}/proof` });
+});
+adminRouter.get('/subscription/payments/:id/proof', async (req, res) => {
+  ownerOnly(req);
+  const abs = await paymentProofPath(req.ctx!, idSchema.parse(req.params.id));
+  res.type(IMAGE_TYPE[path.extname(abs)] ?? 'application/octet-stream').sendFile(abs);
 });

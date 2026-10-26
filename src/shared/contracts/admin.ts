@@ -96,6 +96,19 @@ export interface SubscriptionViewDto {
   usedBranches: number;
   usedUsers: number;
   modules: string[];
+  /** TASK-95: this business's payment submissions, newest first */
+  payments?: SubscriptionPaymentRowDto[];
+}
+
+export interface SubscriptionPaymentRowDto {
+  id: number;
+  amount: string;
+  method: 'UPI' | 'CASH' | 'BANK' | 'GATEWAY';
+  utr: string | null;
+  status: 'PENDING' | 'CONFIRMED' | 'REJECTED';
+  paidAt: string | null;
+  createdAt: string;
+  hasProof: boolean;
 }
 
 export interface CounterDto {

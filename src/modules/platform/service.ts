@@ -84,6 +84,7 @@ const paymentDto = (p: any): PaymentDto => ({
   status: p.status,
   paidAt: p.paidAt ? p.paidAt.toISOString() : null,
   createdAt: p.createdAt.toISOString(),
+  hasProof: p.screenshotUrl != null,
 });
 const signupDto = (s: any, stateName: string, districtName: string | null): SignupRequestDto => ({
   id: s.id,
@@ -358,6 +359,19 @@ export async function recordPayment(businessId: number, body: RecordPaymentInput
     include: { business: true },
   });
   return paymentDto(p);
+}
+
+/** TASK-95: confirm or reject a PENDING payment exactly once (guarded update — a second decision is a 409). */
+export async function reviewPayment(paymentId: number, status: 'CONFIRMED' | 'REJECTED'): Promise<PaymentDto> {
+  const { count } = await prisma.subscriptionPayment.updateMany({
+    where: { id: paymentId, status: 'PENDING' },
+    data: { status, ...(status === 'CONFIRMED' ? { paidAt: new Date() } : {}) },
+  });
+  if (count === 0) {
+    const exists = await prisma.subscriptionPayment.findUnique({ where: { id: paymentId }, select: { id: true } });
+    throw exists ? new HttpError(409, 'CONFLICT', 'Payment already reviewed') : new HttpError(404, 'NOT_FOUND', 'Payment not found');
+  }
+  return paymentDto(await prisma.subscriptionPayment.findUniqueOrThrow({ where: { id: paymentId }, include: { business: true } }));
 }
 
 // ───────────── Impersonation ─────────────

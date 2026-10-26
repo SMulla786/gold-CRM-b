@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { mkdir, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { scopedDb } from '../../lib/db';
+import { prisma } from '../../lib/prisma';
 import { HttpError } from '../../middleware/error';
 import type { TenantContext } from '../../middleware/context';
 
@@ -86,3 +87,14 @@ export function saveInvoiceImage(ctx: TenantContext, field: InvoiceImageField, b
 }
 
 export const invoiceImagePath = (ctx: TenantContext, field: InvoiceImageField): Promise<string> => imagePath(() => readInvoiceMedia(ctx), field);
+
+// TASK-95 — subscription payment proof. SubscriptionPayment is not branch data, so lookups pin businessId explicitly;
+// a proof can only be attached while the payment is still PENDING.
+const pendingPayment = (ctx: TenantContext, id: number) => prisma.subscriptionPayment.findFirst({ where: { id, businessId: ctx.businessId!, status: 'PENDING' } });
+export const savePaymentProof = (ctx: TenantContext, paymentId: number, buffer: Buffer): Promise<string> =>
+  saveImage(ctx, () => pendingPayment(ctx, paymentId), (rel) => prisma.subscriptionPayment.update({ where: { id: paymentId }, data: { screenshotUrl: rel } }), 'payments', 'screenshotUrl', buffer, 'Pending payment not found');
+export const paymentProofPath = (ctx: TenantContext, paymentId: number): Promise<string> =>
+  imagePath(() => prisma.subscriptionPayment.findFirst({ where: { id: paymentId, businessId: ctx.businessId! } }), 'screenshotUrl');
+/** Super Admin (no tenant) — any business's proof. */
+export const platformPaymentProofPath = (paymentId: number): Promise<string> =>
+  imagePath(() => prisma.subscriptionPayment.findUnique({ where: { id: paymentId } }), 'screenshotUrl');

@@ -1,3 +1,4 @@
+import path from 'node:path';
 import { Router } from 'express';
 import type { Request } from 'express';
 import { HttpError } from '../../middleware/error';
@@ -12,11 +13,13 @@ import {
   planBody,
   recordPaymentBody,
   rejectSignupBody,
+  reviewPaymentBody,
   signupListQuery,
   updateBusinessBody,
   updateSubscriptionBody,
 } from '../../shared';
 import * as svc from './service';
+import { platformPaymentProofPath } from '../app/uploads';
 
 export const platformRouter = Router();
 
@@ -60,6 +63,11 @@ platformRouter.patch('/subscriptions/:id', async (req, res) => res.json(await sv
 
 // Payments
 platformRouter.get('/payments', async (req, res) => res.json(await svc.listPayments(pageQuery.parse(req.query))));
+platformRouter.patch('/payments/:id', async (req, res) => res.json(await svc.reviewPayment(idSchema.parse(req.params.id), reviewPaymentBody.parse(req.body).status)));
+platformRouter.get('/payments/:id/proof', async (req, res) => {
+  const abs = await platformPaymentProofPath(idSchema.parse(req.params.id));
+  res.type({ '.jpg': 'image/jpeg', '.png': 'image/png', '.webp': 'image/webp' }[path.extname(abs)] ?? 'application/octet-stream').sendFile(abs);
+});
 platformRouter.post('/businesses/:id/payments', async (req, res) => res.status(201).json(await svc.recordPayment(idSchema.parse(req.params.id), recordPaymentBody.parse(req.body))));
 
 // Impersonation

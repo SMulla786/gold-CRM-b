@@ -84,6 +84,9 @@ export const recordPaymentBody = z.object({
   status: z.enum(['PENDING', 'CONFIRMED', 'REJECTED']).default('CONFIRMED'),
 });
 
+/** TASK-95: Super Admin decides a business-submitted payment (only while PENDING). */
+export const reviewPaymentBody = z.object({ status: z.enum(['CONFIRMED', 'REJECTED']) });
+
 export const impersonateBody = z.object({ reason: z.string().trim().min(3).max(300) });
 
 export const businessListQuery = pageQuery.extend({
@@ -158,6 +161,8 @@ export interface PaymentDto {
   status: 'PENDING' | 'CONFIRMED' | 'REJECTED';
   paidAt: string | null;
   createdAt: string;
+  /** TASK-95: a payment screenshot was uploaded (GET /platform/payments/:id/proof) */
+  hasProof: boolean;
 }
 
 /** Row in /platform/businesses. subscriptionState: active | expiring (≤15 days) | expired | none */
