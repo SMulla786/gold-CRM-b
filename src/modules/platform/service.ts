@@ -73,8 +73,8 @@ const subDto = (s: any): SubscriptionDto => ({
   notes: s.notes,
   createdAt: s.createdAt.toISOString(),
 });
-/** business name + the linked subscription's plan name for PaymentDto */
-const PAYMENT_INCLUDE = { business: true, subscription: { select: { plan: { select: { name: true } } } } } satisfies Prisma.SubscriptionPaymentInclude;
+/** business name + requested plan + the linked subscription's plan name for PaymentDto */
+const PAYMENT_INCLUDE = { business: true, plan: { select: { name: true } }, subscription: { select: { plan: { select: { name: true } } } } } satisfies Prisma.SubscriptionPaymentInclude;
 const paymentDto = (p: any): PaymentDto => ({
   id: p.id,
   businessId: p.businessId,
@@ -87,8 +87,8 @@ const paymentDto = (p: any): PaymentDto => ({
   paidAt: p.paidAt ? p.paidAt.toISOString() : null,
   createdAt: p.createdAt.toISOString(),
   hasProof: p.screenshotUrl != null,
-  // PENDING-MIGRATION (subscription_payment_plan): prefer the requested plan (p.plan) once SubscriptionPayment.planId exists.
-  planName: p.subscription?.plan?.name ?? null,
+  // the plan the business asked for, else the linked subscription's plan
+  planName: p.plan?.name ?? p.subscription?.plan?.name ?? null,
 });
 const signupDto = (s: any, stateName: string, districtName: string | null): SignupRequestDto => ({
   id: s.id,

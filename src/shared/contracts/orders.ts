@@ -69,6 +69,17 @@ export const orderListQuery = pageQuery.extend({
     .pipe(z.array(z.enum(ORDER_STATUSES)).optional()),
 });
 
+/** TASK-98: GET /orders/next-no — the order no. the next create in the active branch would get (peek, not reserved). */
+export interface OrderNextNoDto {
+  nextNo: number;
+}
+/** TASK-98: POST /orders/bulk-cancel ('delete' in the UI = cancel; same rules as POST /orders/:id/cancel, one tx per order). */
+export const bulkCancelOrdersBody = z.object({ ids: z.array(id).min(1).max(100) });
+export interface BulkCancelOrdersResultDto {
+  cancelled: number[];
+  failed: Array<{ id: number; reason: string }>;
+}
+
 export interface OrderItemDto {
   id: number;
   itemName: { id: number; name: string };

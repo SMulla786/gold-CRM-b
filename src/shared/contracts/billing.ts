@@ -15,7 +15,7 @@ export const BILL_TYPES = ['GST', 'ROUGH'] as const;
 export type BillType = (typeof BILL_TYPES)[number];
 export const KEEP_BALANCE_AS = ['MONEY', 'GOLD', 'SILVER'] as const;
 export const DISCOUNT_UNITS = ['FIXED', 'PERCENT'] as const;
-export const BILL_PAYMENT_MODES = ['CASH', 'ONLINE', 'METAL'] as const;
+export const BILL_PAYMENT_MODES = ['CASH', 'ONLINE', 'METAL', 'SCHEME', 'UDHAR_ADVANCE'] as const;
 /** Cash received on one sell bill at or above this needs the party's PAN (Income-tax 269ST / PAN rule). */
 export const PAN_CASH_LIMIT = 200000;
 /** TASK-97 GST: purchase ITC eligibility (GSTR-3B 4(A)/4(B)(1) 17(5) reversal/4(D)(2)) */
@@ -70,6 +70,18 @@ export const billPaymentInput = z.discriminatedUnion('mode', [
 ]);
 export type BillPaymentInput = z.infer<typeof billPaymentInput>;
 
+/**
+ * TASK-98: sell/purchase bill payments = billPaymentInput + two no-cash modes (SELL bills only; Just Bill / order advances keep billPaymentInput).
+ * SCHEME redeems the party's enrollment (credit = maturity value) and uses `amount` of it (409 if more);
+ * UDHAR_ADVANCE uses `amount` of the party's existing udhar credit (409 if more). Neither moves cash/bank.
+ */
+export const billPayInput = z.discriminatedUnion('mode', [
+  ...billPaymentInput.options,
+  z.object({ mode: z.literal('SCHEME'), enrollmentId: id, amount: decimalInput.positive(), remark: z.string().max(200).optional() }),
+  z.object({ mode: z.literal('UDHAR_ADVANCE'), amount: decimalInput.positive(), remark: z.string().max(200).optional() }),
+]);
+export type BillPayInput = z.infer<typeof billPayInput>;
+
 export const billBody = z
   .object({
     kind: z.enum(BILL_KINDS),
@@ -82,7 +94,7 @@ export const billBody = z
     discountUnit: z.enum(DISCOUNT_UNITS).default('FIXED'),
     /** ignored (0) for ROUGH */
     gstPercent: z.coerce.number().min(0).max(28).default(3),
-    payments: z.array(billPaymentInput).max(20).default([]),
+    payments: z.array(billPayInput).max(20).default([]),
     keepBalanceAs: z.enum(KEEP_BALANCE_AS).default('MONEY'),
     /** required when keepBalanceAs is GOLD/SILVER; per settings rate unit */
     keepRate: decimalInput.optional(),
@@ -114,7 +126,7 @@ export type BillBody = z.infer<typeof billBody>;
 /** PATCH /app/bills/:id — edit a bill dated TODAY (X-MPIN). Same body as create; kind + billType must not change (number series). */
 export const editBillBody = billBody;
 
-export const addBillPaymentsBody =z.object({ payments: z.array(billPaymentInput).min(1).max(20), txnDate: z.coerce.date().optional() });
+export const addBillPaymentsBody = z.object({ payments: z.array(billPayInput).min(1).max(20), txnDate: z.coerce.date().optional() });
 /** DELETE /app/bills/:id?returnStock=true → items back to stock; false → record only */
 export const deleteBillQuery = z.object({ returnStock: z.enum(['true', 'false']).default('true') });
 
@@ -173,6 +185,8 @@ export interface BillPaymentDto {
   rate: string | null;
   amount: string;
   remark: string | null;
+  /** TASK-98: SCHEME payments — the redeemed enrollment */
+  schemeEnrollmentId?: number | null;
   txnDate: string;
   isActive: boolean;
   createdAt: string;

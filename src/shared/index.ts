@@ -17,5 +17,6 @@ export * from './contracts/orders';
 export * from './contracts/girvi';
 export * from './contracts/trade';
 export * from './contracts/schemes';
+export * from './contracts/samples';
 export * from './calc';
 export * from './date';

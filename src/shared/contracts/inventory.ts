@@ -133,6 +133,15 @@ export interface ItemNameDto {
 
 // ───────────── Stock entry ─────────────
 
+/** TASK-98: what the printed tag encodes. RFID = EPC code stored on the item (no reader hardware). */
+export const STOCK_CODE_TYPES = ['BARCODE', 'QR', 'RFID'] as const;
+export type StockCodeType = (typeof STOCK_CODE_TYPES)[number];
+const epcCode = z
+  .string()
+  .trim()
+  .toUpperCase()
+  .regex(/^[0-9A-F]{8,64}$/, 'EPC is 8-64 hex characters');
+
 export const stockRowInput = z.object({
   itemNameId: id,
   /** TAG rows: omit to auto-assign from the item name's prefix/digits (TagSequence) */
@@ -157,6 +166,9 @@ export const stockRowInput = z.object({
   rate: decimalInput.optional(),
   purchaseCost: decimalInput.optional(),
   remarks: z.string().max(300).optional(),
+  /** TASK-98: label code type (default BARCODE) + RFID EPC (unique per business) */
+  codeType: z.enum(STOCK_CODE_TYPES).optional(),
+  epcCode: epcCode.optional(),
 });
 export const stockEntryBody = z
   .object({
@@ -170,7 +182,8 @@ export const stockEntryBody = z
   })
   .refine((b) => b.rows.every((r) => r.less <= r.gross), { message: 'less cannot exceed gross', path: ['rows'] });
 
-export const updateStockItemBody = stockRowInput.omit({ itemNameId: true, tagNo: true }).partial();
+/** TASK-98: epcCode null clears it. */
+export const updateStockItemBody = stockRowInput.omit({ itemNameId: true, tagNo: true }).partial().extend({ epcCode: epcCode.nullable().optional() });
 
 /** Stock list status filter: a real status, or ALL = every status except DELETED. */
 export const STOCK_LIST_STATUSES = [...STOCK_STATUSES, 'ALL'] as const;
@@ -187,7 +200,18 @@ export const stockListQuery = pageQuery.extend({
   maxWeight: optWeight,
   /** admins: specific branch or omit for active branch; "all" handled via X-Branch-Id */
   branchId: id.optional(),
+  /** TASK-98 */
+  codeType: z.enum(STOCK_CODE_TYPES).optional(),
 });
+
+/** TASK-98: GET /stock/next-tag — peek the next auto tag no. without consuming it. */
+export const nextTagQuery = z.object({ itemNameId: id });
+export interface NextTagDto {
+  /** null when the item name has no tag prefix/digits (manual tag needed) */
+  tagNo: string | null;
+  prefix: string | null;
+  next: number | null;
+}
 
 export interface StockItemDto {
   id: number;
@@ -218,6 +242,9 @@ export interface StockItemDto {
   photoUrl: string | null;
   remarks: string | null;
   createdAt: string;
+  /** TASK-98 — always sent by the API (optional only so older hand-built literals keep compiling) */
+  codeType?: StockCodeType;
+  epcCode?: string | null;
 }
 
 /** GET /stock — totals are over ALL filtered rows, not just the page. */

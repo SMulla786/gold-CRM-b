@@ -472,7 +472,10 @@ export async function subscriptionView(ctx: TenantContext): Promise<Subscription
       where: { businessId: ctx.businessId! },
       orderBy: { createdAt: 'desc' },
       take: 50,
-      include: { subscription: { select: { plan: { select: { name: true, durationDays: true } } } } },
+      include: {
+        plan: { select: { name: true, durationDays: true } },
+        subscription: { select: { plan: { select: { name: true, durationDays: true } } } },
+      },
     }),
     // Only ACTIVE plans are offered; tenants never get the full /platform/plans list.
     prisma.plan.findMany({ where: { isActive: true }, orderBy: [{ price: 'asc' }, { id: 'asc' }] }),
@@ -489,8 +492,8 @@ export async function subscriptionView(ctx: TenantContext): Promise<Subscription
     usedUsers,
     modules: sub.modules,
     payments: payments.map((p) => {
-      // PENDING-MIGRATION (subscription_payment_plan): prefer the requested plan (p.plan) once SubscriptionPayment.planId exists.
-      const plan = p.subscription?.plan ?? null;
+      // The plan the owner asked for wins; else the plan of the subscription the payment is linked to.
+      const plan = p.plan ?? p.subscription?.plan ?? null;
       return {
         id: p.id,
         amount: p.amount.toString(),
@@ -537,6 +540,7 @@ export async function recordSubscriptionPayment(ctx: TenantContext, body: { amou
       status: 'PENDING', // owner records; Super Admin confirms
       paidAt: body.paidAt ?? null,
       recordedById: ctx.userId,
+      planId: body.planId ?? null,
     },
   });
   return { id: p.id };
