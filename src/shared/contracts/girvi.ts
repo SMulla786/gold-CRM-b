@@ -162,3 +162,73 @@ export interface GirviListItemDto {
   payoutCash?: string;
   payoutOnline?: string;
 }
+
+// ───────────── Phase 9b: girvi transfer (re-pledge to a lender) ─────────────
+
+/** Hand pledged customer items to a lender against money received (cash + online must equal principal). */
+export const girviTransferBody = z
+  .object({
+    lenderPartyId: id,
+    itemIds: z.array(id).min(1).max(200),
+    transferDate: z.coerce.date().optional(),
+    principal: decimalInput.positive(),
+    ratePercent: z.coerce.number().min(0).max(100),
+    ratePeriod: z.enum(['MONTHLY', 'ANNUAL']),
+    interestType: z.enum(['SI', 'CI']),
+    ciPeriod: z.enum(['DAILY', 'MONTHLY', 'HALF_YEARLY', 'YEARLY']).optional(),
+    method: z.enum(['FULL_MONTH', 'DAY_WISE']),
+    tenureMonths: z.coerce.number().int().min(1).max(120),
+    remark: z.string().trim().max(300).optional(),
+    ...money,
+  })
+  .refine(bankRule, { message: 'Select a bank account', path: ['bankAccountId'] })
+  .refine((b) => Math.abs(b.cash + b.online - b.principal) < 0.005, { message: 'Cash + online must equal the amount received', path: ['cash'] })
+  .refine((b) => b.interestType === 'SI' || b.ciPeriod != null, { message: 'Pick the compounding period', path: ['ciPeriod'] });
+
+/** Receive items back: repay the lender principal + interest (cash + online must equal the total paid). */
+export const girviTransferReturnBody = z
+  .object({ returnedOn: z.coerce.date().optional(), interest: decimalInput.default(0), remark: z.string().trim().max(200).optional(), ...money })
+  .refine(bankRule, { message: 'Select a bank account', path: ['bankAccountId'] });
+
+export const girviTransferListQuery = pageQuery.extend({
+  status: z.enum(['ACTIVE', 'RETURNED']).optional(),
+  lenderPartyId: id.optional(),
+  from: z.coerce.date().optional(),
+  to: z.coerce.date().optional(),
+});
+
+export interface GirviTransferItemDto {
+  id: number;
+  batchId: number;
+  girviNo: number;
+  customer: PartyRefDto;
+  name: string;
+  category: string;
+  net: string;
+  fine: string;
+  valuation: string;
+}
+
+export interface GirviTransferDto {
+  id: number;
+  transferNo: number;
+  lender: PartyRefDto;
+  transferDate: string;
+  returnDate: string;
+  tenureMonths: number;
+  ratePercent: string;
+  ratePeriod: 'MONTHLY' | 'ANNUAL';
+  interestType: 'SI' | 'CI';
+  ciPeriod: 'DAILY' | 'MONTHLY' | 'HALF_YEARLY' | 'YEARLY' | null;
+  method: 'FULL_MONTH' | 'DAY_WISE';
+  principal: string;
+  cash: string;
+  online: string;
+  status: 'ACTIVE' | 'RETURNED';
+  /** interest owed to the lender as of today (ACTIVE) or paid (RETURNED) */
+  interest: string;
+  returnedOn: string | null;
+  items: GirviTransferItemDto[];
+  remark: string | null;
+  createdAt: string;
+}

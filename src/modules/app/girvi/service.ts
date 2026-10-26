@@ -146,6 +146,11 @@ export async function releaseGirvi(ctx: TenantContext, id: number, body: GirviRe
     if (D(body.principalPaid).gt(fresh.principal)) throw new HttpError(400, 'VALIDATION', 'Principal paid exceeds the outstanding loan');
     const pledgedTotal = await tx.girviItem.count({ where: { batchId: id, status: 'PLEDGED' } });
 
+    // Lock the items, then refuse any that are with a lender (Phase 9b transfer) — same lock order as createTransfer.
+    await tx.$queryRaw`SELECT id FROM "GirviItem" WHERE id = ANY(${itemIds}::int[]) ORDER BY id FOR UPDATE`;
+    if (await tx.girviTransferItem.count({ where: { girviItemId: { in: itemIds }, transfer: { status: 'ACTIVE' } } })) {
+      throw new HttpError(409, 'CONFLICT', 'An item is with a lender (girvi transfer); receive it back first');
+    }
     // Guard first (all itemIds must be PLEDGED in this batch) so a double-release is a 409, not a stale isLast 400.
     const upd = await tx.girviItem.updateMany({ where: { id: { in: itemIds }, batchId: id, status: 'PLEDGED' }, data: { status: 'RELEASED', releasedAt: txnDate } });
     if (upd.count !== itemIds.length) throw new HttpError(409, 'CONFLICT', 'An item is not pledged in this girvi');
