@@ -66,7 +66,14 @@ export const girviReleaseBody = z
   })
   .refine(bankRule, { message: 'Select a bank account', path: ['bankAccountId'] });
 
-export const girviListQuery = pageQuery.extend({ status: z.enum(['ACTIVE', 'CLOSED']).optional(), partyId: id.optional() });
+export const girviListQuery = pageQuery.extend({
+  status: z.enum(['ACTIVE', 'CLOSED']).optional(),
+  partyId: id.optional(),
+  /** TASK-97: issue-date range + party type (ledger book / loan list filters) */
+  from: z.coerce.date().optional(),
+  to: z.coerce.date().optional(),
+  partyType: z.enum(['CUSTOMER', 'SUPPLIER']).optional(),
+});
 export const girviAsOfQuery = z.object({ asOf: z.coerce.date().optional() });
 
 export interface GirviItemDto {
@@ -141,4 +148,17 @@ export interface GirviListItemDto {
   interestDue: string;
   overdue: boolean;
   status: 'ACTIVE' | 'CLOSED';
+  /** TASK-97 loan-list / ledger-book columns (decimals as strings, non-reversed txns only) */
+  createdAt?: string;
+  itemNames?: string[];
+  interestType?: 'SI' | 'CI';
+  ratePercent?: string;
+  /** GRANT + TOPUP paid out */
+  principalGiven?: string;
+  /** principal received back on RELEASE */
+  principalReturned?: string;
+  interestPaid?: string;
+  /** how the grant was paid out */
+  payoutCash?: string;
+  payoutOnline?: string;
 }

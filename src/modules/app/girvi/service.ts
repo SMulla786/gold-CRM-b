@@ -211,22 +211,50 @@ export async function getGirvi(ctx: TenantContext, id: number, asOf: Date): Prom
 
 export async function listGirvi(ctx: TenantContext, query: any): Promise<Paged<GirviListItemDto>> {
   const sdb = scopedDb(ctx);
-  const where: any = { ...(query.status ? { status: query.status } : {}), ...(query.partyId ? { partyId: query.partyId } : {}) };
-  if (query.q) {
-    const parties = await sdb.party.findMany({ where: { OR: [{ name: { contains: query.q, mode: 'insensitive' } }, { mobile: { contains: query.q } }] }, select: { id: true } });
+  const where: any = {
+    ...(query.status ? { status: query.status } : {}),
+    ...(query.partyId ? { partyId: query.partyId } : {}),
+    ...(query.from || query.to ? { issueDate: { ...(query.from ? { gte: ledger.businessDate(query.from) } : {}), ...(query.to ? { lte: ledger.businessDate(query.to) } : {}) } } : {}),
+  };
+  if (query.q || query.partyType) {
+    const parties = await sdb.party.findMany({
+      where: {
+        ...(query.partyType ? { type: query.partyType } : {}),
+        ...(query.q ? { OR: [{ name: { contains: query.q, mode: 'insensitive' } }, { mobile: { contains: query.q } }] } : {}),
+      },
+      select: { id: true },
+    });
+    const ids = { partyId: { in: parties.map((p) => p.id) } };
     const asNo = Number(query.q);
-    where.OR = [...(Number.isInteger(asNo) ? [{ girviNo: asNo }] : []), { partyId: { in: parties.map((p) => p.id) } }];
+    // a numeric q may be a girvi number; partyType still narrows it
+    where.AND = [query.q && Number.isInteger(asNo) && !query.partyType ? { OR: [{ girviNo: asNo }, ids] } : ids];
   }
   const [rows, total] = await Promise.all([
-    sdb.girviBatch.findMany({ where, include: { _count: { select: { items: true } }, items: { where: { status: 'PLEDGED' }, select: { id: true } } }, orderBy: { id: 'desc' }, skip: (query.page - 1) * query.pageSize, take: query.pageSize }),
+    sdb.girviBatch.findMany({ where, include: { items: { select: { name: true, status: true } } }, orderBy: { id: 'desc' }, skip: (query.page - 1) * query.pageSize, take: query.pageSize }),
     sdb.girviBatch.count({ where }),
   ]);
   const parties = new Map((await sdb.party.findMany({ where: { id: { in: [...new Set(rows.map((b) => b.partyId))] } } })).map((p) => [p.id, p]));
+  const sums = await prisma.girviTxn.groupBy({
+    by: ['batchId', 'type'],
+    where: { batchId: { in: rows.map((b) => b.id) }, isReversed: false },
+    _sum: { principal: true, interest: true, cash: true, online: true },
+  });
+  const sum = (batchId: number, types: string[], f: 'principal' | 'interest' | 'cash' | 'online') =>
+    sums.filter((r) => r.batchId === batchId && types.includes(r.type)).reduce((a, r) => a.plus(r._sum[f] ?? 0), new Prisma.Decimal(0));
   const today = ledger.businessDate();
   const items: GirviListItemDto[] = rows.map((b) => ({
     id: b.id, girviNo: b.girviNo, party: partyRef(parties.get(b.partyId)), issueDate: dateOnly(b.issueDate), returnDate: dateOnly(b.returnDate),
-    itemCount: b._count.items, pledgedCount: b.items.length, valuation: money(b.valuation), principal: money(b.principal), interestDue: dueOf(b, today),
+    itemCount: b.items.length, pledgedCount: b.items.filter((i) => i.status === 'PLEDGED').length, valuation: money(b.valuation), principal: money(b.principal), interestDue: dueOf(b, today),
     overdue: b.status === 'ACTIVE' && today.getTime() > b.returnDate.getTime(), status: b.status,
+    createdAt: b.createdAt.toISOString(),
+    itemNames: b.items.map((i) => i.name),
+    interestType: b.interestType,
+    ratePercent: b.ratePercent.toString(),
+    principalGiven: money(sum(b.id, ['GRANT', 'TOPUP'], 'principal')),
+    principalReturned: money(sum(b.id, ['RELEASE'], 'principal')),
+    interestPaid: money(sum(b.id, ['INTEREST', 'RELEASE'], 'interest')),
+    payoutCash: money(sum(b.id, ['GRANT'], 'cash')),
+    payoutOnline: money(sum(b.id, ['GRANT'], 'online')),
   }));
   return { items, total, page: query.page, pageSize: query.pageSize };
 }
