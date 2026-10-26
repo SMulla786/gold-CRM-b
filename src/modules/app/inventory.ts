@@ -15,6 +15,7 @@ import type {
   ItemGroupDto,
   ItemNameDto,
   JewelleryTypeDto,
+  NextTagDto,
   Paged,
   ShortageRowDto,
   StockClass,
@@ -204,6 +205,8 @@ const stockDto = (s: any, branchName: string, hsnCode: string | null): StockItem
   photoUrl: s.photoUrl,
   remarks: s.remarks,
   createdAt: s.createdAt.toISOString(),
+  codeType: s.codeType,
+  epcCode: s.epcCode ?? null,
 });
 
 async function decorateStock(ctx: TenantContext, items: any[]): Promise<StockItemDto[]> {
@@ -225,6 +228,19 @@ export async function nextTagNo(tx: Prisma.TransactionClient, businessId: number
     RETURNING "next"`;
   const used = Number(r[0]!.next) - 1;
   return `${prefix}${String(used).padStart(digits, '0')}`;
+}
+
+/**
+ * TASK-98: peek the tag no. the next auto-tag for this item name would get, WITHOUT consuming it (read-only mirror of nextTagNo:
+ * no row → 1, else the row's current "next"). Only a preview — a concurrent entry may take it first.
+ */
+export async function peekNextTag(ctx: TenantContext, itemNameId: number): Promise<NextTagDto> {
+  const n = await scopedDb(ctx).itemName.findUnique({ where: { id: itemNameId } });
+  if (!n) throw new HttpError(404, 'NOT_FOUND', 'Item name not found');
+  if (!n.tagPrefix || !n.tagDigits) return { tagNo: null, prefix: n.tagPrefix ?? null, next: null };
+  const seq = await prisma.tagSequence.findUnique({ where: { businessId_prefix: { businessId: ctx.businessId!, prefix: n.tagPrefix } } });
+  const next = seq ? Number(seq.next) : 1;
+  return { tagNo: `${n.tagPrefix}${String(next).padStart(n.tagDigits, '0')}`, prefix: n.tagPrefix, next };
 }
 
 /** Race-free entry number via the same atomic TagSequence upsert (reserved prefix '#ENTRY'). */
@@ -284,6 +300,7 @@ export async function createStockEntry(ctx: TenantContext, body: { stockClass: S
           tagNo, huid: row.huid ?? null, karatCode: r.karatCode, pcs, gross: row.gross, less: row.less, net: r.net, tunch: r.tunch, wastage: row.wastage,
           fine: r.fine, stoneCharge: row.stoneCharge, labour: row.labour, labourUnit: row.labourUnit, other: row.other, rate: row.rate ?? null,
           purchaseCost: r.purchaseCost, status: 'AVAILABLE', source: 'STOCK_INSERT', sourceId: String(entryNo), entryNo, remarks: row.remarks ?? null, createdById: ctx.userId,
+          codeType: row.codeType ?? 'BARCODE', epcCode: row.epcCode ?? null,
         },
       });
       await ledger.post(tx, lctx, [{
@@ -314,7 +331,8 @@ function stockWhere(query: any): any {
     ...(query.itemNameId ? { itemNameId: query.itemNameId } : {}),
     ...(query.karatCode ? { karatCode: query.karatCode } : {}),
     ...(query.branchId ? { branchId: query.branchId } : {}),
-    ...(query.q ? { OR: [{ tagNo: { contains: query.q, mode: 'insensitive' } }, { huid: { contains: query.q, mode: 'insensitive' } }, { itemName: { name: { contains: query.q, mode: 'insensitive' } } }] } : {}),
+    ...(query.codeType ? { codeType: query.codeType } : {}),
+    ...(query.q ? { OR: [{ tagNo: { contains: query.q, mode: 'insensitive' } }, { huid: { contains: query.q, mode: 'insensitive' } }, { epcCode: { contains: query.q, mode: 'insensitive' } }, { itemName: { name: { contains: query.q, mode: 'insensitive' } } }] } : {}),
     ...(query.minWeight != null || query.maxWeight != null ? { net: { ...(query.minWeight != null ? { gte: query.minWeight } : {}), ...(query.maxWeight != null ? { lte: query.maxWeight } : {}) } } : {}),
   };
 }
@@ -370,9 +388,9 @@ const lctxOf = (ctx: TenantContext) => ({ businessId: ctx.businessId!, branchIds
 
 /** Recompute one item, reverse ALL its ledger rows (any source, so a transferred item nets to 0 at both branches), repost the fresh IN at its current branch. */
 async function applyStockEdit(tx: Prisma.TransactionClient, lctx: ledger.LedgerContext, item: any, body: any, touchByCode: Map<string, number>): Promise<void> {
-  const merged = { pcs: item.pcs, gross: numN(item.gross), less: numN(item.less), tunch: numN(item.tunch), wastage: numN(item.wastage), stoneCharge: numN(item.stoneCharge), labour: numN(item.labour), labourUnit: item.labourUnit, other: numN(item.other), rate: item.rate != null ? numN(item.rate) : undefined, purchaseCost: item.purchaseCost != null ? numN(item.purchaseCost) : undefined, karatCode: item.karatCode ?? undefined, huid: item.huid ?? undefined, remarks: item.remarks ?? undefined, ...body };
+  const merged = { pcs: item.pcs, gross: numN(item.gross), less: numN(item.less), tunch: numN(item.tunch), wastage: numN(item.wastage), stoneCharge: numN(item.stoneCharge), labour: numN(item.labour), labourUnit: item.labourUnit, other: numN(item.other), rate: item.rate != null ? numN(item.rate) : undefined, purchaseCost: item.purchaseCost != null ? numN(item.purchaseCost) : undefined, karatCode: item.karatCode ?? undefined, huid: item.huid ?? undefined, remarks: item.remarks ?? undefined, codeType: item.codeType, epcCode: item.epcCode ?? undefined, ...body };
   const r = resolveRow(merged, item.itemName, touchByCode);
-  await tx.stockItem.update({ where: { id: item.id }, data: { pcs: merged.pcs, gross: merged.gross, less: merged.less, tunch: r.tunch, wastage: merged.wastage, net: r.net, fine: r.fine, stoneCharge: merged.stoneCharge, labour: merged.labour, labourUnit: merged.labourUnit, other: merged.other, rate: merged.rate ?? null, purchaseCost: r.purchaseCost, karatCode: r.karatCode, huid: merged.huid ?? null, remarks: merged.remarks ?? null } });
+  await tx.stockItem.update({ where: { id: item.id }, data: { pcs: merged.pcs, gross: merged.gross, less: merged.less, tunch: r.tunch, wastage: merged.wastage, net: r.net, fine: r.fine, stoneCharge: merged.stoneCharge, labour: merged.labour, labourUnit: merged.labourUnit, other: merged.other, rate: merged.rate ?? null, purchaseCost: r.purchaseCost, karatCode: r.karatCode, huid: merged.huid ?? null, remarks: merged.remarks ?? null, codeType: merged.codeType, epcCode: merged.epcCode ?? null } });
   await ledger.reverseForItem(tx, lctx, item.id);
   await ledger.post(tx, lctx, [{ branchId: item.branchId, asset: ledger.assetForStockClass(item.stockClass), direction: 'IN', karatCode: r.karatCode, pcs: merged.pcs, gross: merged.gross, net: r.net, fine: r.fine, amount: r.purchaseCost, source: 'STOCK_INSERT', sourceId: String(item.id), stockItemId: item.id, narration: `Edit stock item #${item.id}` }]);
 }

@@ -75,6 +75,8 @@ const TENANT_MODELS: Record<string, Scope> = {
   SetStockLog: 'branch',
   TagTemplate: 'business',
   TradePayment: 'business',
+  // TASK-98 samples (SampleMovement goes through its scoped Sample):
+  Sample: 'branch',
   // BillItem/BillPayment have no businessId — always reached through a scoped Bill (handled in services).
   // JewelleryType omitted (nullable businessId: global + custom) — scoped in its service like Role.
   // TagSequence omitted — incremented via a raw locked UPDATE inside the stock-entry tx with explicit businessId.

@@ -2,7 +2,7 @@ import path from 'node:path';
 import { Router } from 'express';
 import { requireAnyPermission, requireMpin, requirePermission } from '../../../middleware/guards';
 import { HttpError } from '../../../middleware/error';
-import { id as idSchema, orderBody, addOrderAdvanceBody, orderListQuery, karigarIssueBody, karigarReceiveBody, karigarIssueListQuery } from '../../../shared';
+import { id as idSchema, orderBody, addOrderAdvanceBody, orderListQuery, karigarIssueBody, karigarReceiveBody, karigarIssueListQuery, bulkCancelOrdersBody } from '../../../shared';
 import * as orders from './service';
 import { CONTENT_TYPE, upload } from './files';
 
@@ -13,6 +13,9 @@ const KARIGAR = 'orders.karigar_list';
 const BILLING = 'orders.billing';
 
 ordersRouter.post('/orders', requirePermission(CREATE, 'edit'), async (req, res) => res.status(201).json(await orders.createOrder(req.ctx!, orderBody.parse(req.body))));
+// TASK-98 — literal paths registered before /orders/:id
+ordersRouter.get('/orders/next-no', requirePermission(CREATE, 'view'), async (req, res) => res.json(await orders.peekNextOrderNo(req.ctx!)));
+ordersRouter.post('/orders/bulk-cancel', requirePermission(CREATE, 'delete'), requireMpin, async (req, res) => res.json(await orders.bulkCancelOrders(req.ctx!, bulkCancelOrdersBody.parse(req.body).ids)));
 ordersRouter.get('/orders', requireAnyPermission([LIST, BILLING], 'view'), async (req, res) => res.json(await orders.listOrders(req.ctx!, orderListQuery.parse(req.query))));
 ordersRouter.get('/orders/:id', requirePermission(LIST, 'view'), async (req, res) => res.json(await orders.getOrder(req.ctx!, idSchema.parse(req.params.id))));
 ordersRouter.post('/orders/:id/advance', requirePermission(CREATE, 'edit'), async (req, res) => res.json(await orders.addOrderAdvance(req.ctx!, idSchema.parse(req.params.id), addOrderAdvanceBody.parse(req.body).payments)));

@@ -174,5 +174,39 @@ describe('orders', () => {
     expect((await orders.listOrders(s.ctx, { ...page, statuses: ['PENDING'] })).total).toBe(0);
     expect((await orders.listOrders(s.ctx, { ...page, status: 'CANCELLED', statuses: ['IN_PROCESS', 'CANCELLED'] })).items.map((o) => o.id)).toEqual([o2.id]);
   });
+  it('TASK-98: next-no peeks without consuming (two calls equal, then create gets it); next-tag peek likewise', async () => {
+    const s = await setup();
+    expect((await orders.peekNextOrderNo(s.ctx)).nextNo).toBe(1); // no DocSequence row yet
+    const o1 = await makeOrder(s.ctx, s.itemName.id, s.customer.id);
+    expect(o1.orderNo).toBe(1);
+    const p1 = await orders.peekNextOrderNo(s.ctx);
+    const p2 = await orders.peekNextOrderNo(s.ctx);
+    expect(p1).toEqual(p2);
+    expect(p1.nextNo).toBe(2);
+    expect((await makeOrder(s.ctx, s.itemName.id, s.customer.id)).orderNo).toBe(p1.nextNo);
+
+    const t1 = await inv.peekNextTag(s.ctx, s.itemName.id);
+    expect(t1).toEqual({ tagNo: 'GR0001', prefix: 'GR', next: 1 });
+    expect(await inv.peekNextTag(s.ctx, s.itemName.id)).toEqual(t1);
+    const entry = await inv.createStockEntry(s.ctx, { stockClass: 'GOLD', method: 'TAG', rows: [{ itemNameId: s.itemName.id, gross: 1, less: 0, pcs: 1, wastage: 0, stoneCharge: 0, labour: 0, labourUnit: 'PER_GRAM', other: 0 }] } as any);
+    expect(entry.items[0]!.tagNo).toBe(t1.tagNo);
+    expect((await inv.peekNextTag(s.ctx, s.itemName.id)).tagNo).toBe('GR0002');
+  });
+
+  it('TASK-98: bulk cancel — cancellable ones cancel, the rest are reported (open karigar issue, already cancelled, unknown id)', async () => {
+    const s = await setup();
+    const ok1 = await makeOrder(s.ctx, s.itemName.id, s.customer.id);
+    const ok2 = await makeOrder(s.ctx, s.itemName.id, s.customer.id);
+    const busy = await makeOrder(s.ctx, s.itemName.id, s.customer.id);
+    await orders.createKarigarIssue(s.ctx, { karigarId: s.karigar.id, orderItemIds: [busy.items[0]!.id], goldFine: 0, silverFine: 0, cash: 0, online: 0 } as any);
+    const done = await makeOrder(s.ctx, s.itemName.id, s.customer.id);
+    await orders.cancelOrder(s.ctx, done.id);
+    const res = await orders.bulkCancelOrders(s.ctx, [ok1.id, busy.id, ok2.id, done.id, 999999, ok1.id]);
+    expect([...res.cancelled].sort((a, b) => a - b)).toEqual([ok1.id, ok2.id].sort((a, b) => a - b));
+    expect(res.failed.map((f) => f.id).sort((a, b) => a - b)).toEqual([busy.id, done.id, 999999].sort((a, b) => a - b));
+    expect(res.failed.every((f) => f.reason.length > 0)).toBe(true);
+    expect((await orders.getOrder(s.ctx, ok2.id)).status).toBe('CANCELLED');
+    expect((await orders.getOrder(s.ctx, busy.id)).status).toBe('IN_PROCESS');
+  });
 });
 

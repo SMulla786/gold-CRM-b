@@ -7,7 +7,7 @@ import { logActivity } from '../../../lib/activity';
 import { HttpError } from '../../../middleware/error';
 import type { TenantContext } from '../../../middleware/context';
 import { computeLine, RATE_UNIT_GRAMS } from '../../../shared';
-import type { OrderDto, OrderItemDto, KarigarIssueDto, BillPaymentInput } from '../../../shared';
+import type { OrderDto, OrderItemDto, KarigarIssueDto, BillPaymentInput, BulkCancelOrdersResultDto, OrderNextNoDto } from '../../../shared';
 import { currentRates, getSettings } from '../service';
 import { computePayments, sumAmounts } from '../billing/service';
 import { nextTagNo } from '../inventory';
@@ -169,6 +169,34 @@ export async function cancelOrder(ctx: TenantContext, id: number): Promise<void>
     if (claim.count !== 1) throw new HttpError(409, 'CONFLICT', 'Order is no longer cancellable');
     await logActivity(tx, ctx, { module: 'ORDER', action: 'DELETED', entity: 'Order', entityId: String(id), summary: `Order #${order.orderNo} cancelled` }); // advances stay as the party's credit
   });
+}
+
+/**
+ * TASK-98: bulk cancel ('delete' in the UI) — each order through cancelOrder (its own tx + status guard + activity row),
+ * so one non-cancellable order never blocks the rest. Business errors are reported per id; unexpected errors propagate.
+ */
+export async function bulkCancelOrders(ctx: TenantContext, ids: number[]): Promise<BulkCancelOrdersResultDto> {
+  const out: BulkCancelOrdersResultDto = { cancelled: [], failed: [] };
+  for (const id of [...new Set(ids)]) {
+    try {
+      await cancelOrder(ctx, id);
+      out.cancelled.push(id);
+    } catch (e) {
+      if (!(e instanceof HttpError)) throw e;
+      out.failed.push({ id, reason: e.message });
+    }
+  }
+  return out;
+}
+
+/**
+ * TASK-98: the order no. the next createOrder in the active branch would get — a read-only mirror of nextNo
+ * (no DocSequence row → 1, else its current "next"). A preview only: a concurrent create may take it first.
+ */
+export async function peekNextOrderNo(ctx: TenantContext): Promise<OrderNextNoDto> {
+  const branchId = activeBranch(ctx);
+  const seq = await prisma.docSequence.findUnique({ where: { businessId_branchId_key: { businessId: ctx.businessId!, branchId, key: 'ORDER' } } });
+  return { nextNo: seq ? Number(seq.next) : 1 };
 }
 
 /**

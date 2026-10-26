@@ -56,6 +56,7 @@ export const MODULES: ModuleDef[] = [
       p('inventory.new_stock', 'New Stock'),
       p('inventory.import_stock', 'Import Stock'),
       p('inventory.all_stock', 'All Stock'),
+      p('inventory.samples', 'Samples / Tounch'),
       p('inventory.scan_match', 'Scan/Match'),
       p('inventory.tag_print', 'Generate/Print'),
       p('inventory.printer_setting', 'Printer Setting'),

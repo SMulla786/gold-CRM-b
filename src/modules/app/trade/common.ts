@@ -116,7 +116,7 @@ export async function loadPayments(ctx: TenantContext, docType: TradeDocType, do
   const bankIds = [...new Set(rows.map((r) => r.bankAccountId).filter((x): x is number => x != null))];
   const banks = bankIds.length ? await scopedDb(ctx).bankAccount.findMany({ where: { id: { in: bankIds } }, select: { id: true, bankName: true } }) : [];
   const name = new Map(banks.map((b) => [b.id, b.bankName]));
-  return rows.map((r) => ({ id: r.id, mode: r.mode, amount: money(r.amount), bankAccount: r.bankAccountId != null ? { id: r.bankAccountId, name: name.get(r.bankAccountId) ?? '' } : null, reference: r.reference }));
+  return rows.map((r) => ({ id: r.id, mode: r.mode as TradePaymentDto['mode'], amount: money(r.amount), bankAccount: r.bankAccountId != null ? { id: r.bankAccountId, name: name.get(r.bankAccountId) ?? '' } : null, reference: r.reference }));
 }
 
 /** JSON snapshot of a doc row for ActivityLog.meta (Decimal → string, Date → ISO). */

@@ -13,6 +13,7 @@ import {
   itemNameBody,
   itemNameListQuery,
   jewelleryTypeBody,
+  nextTagQuery,
   printerSettingsBody,
   setStockBody,
   setStockLogQuery,
@@ -66,6 +67,8 @@ inventoryRouter.get('/stock/all-summary', requirePermission('inventory.all_stock
 inventoryRouter.post('/stock/all-summary/set', requirePermission('inventory.all_stock', 'edit'), requireMpin, async (req, res) => res.status(201).json(await extras.setStock(req.ctx!, setStockBody.parse(req.body))));
 inventoryRouter.get('/stock/set-stock-logs', requirePermission('inventory.all_stock', 'view'), async (req, res) => res.json(await extras.listSetStockLogs(req.ctx!, setStockLogQuery.parse(req.query))));
 inventoryRouter.post('/stock/entries', requirePermission('inventory.new_stock', 'edit'), async (req, res) => res.status(201).json(await inv.createStockEntry(req.ctx!, stockEntryBody.parse(req.body))));
+// TASK-98: live tag-no preview for New Stock (read-only peek, never consumes a number)
+inventoryRouter.get('/stock/next-tag', requirePermission('inventory.new_stock', 'view'), async (req, res) => res.json(await inv.peekNextTag(req.ctx!, nextTagQuery.parse(req.query).itemNameId)));
 inventoryRouter.get('/stock/summary', requirePermission('inventory.all_stock', 'view'), async (req, res) => res.json(await inv.stockSummary(req.ctx!)));
 inventoryRouter.get('/stock/groups', requirePermission('inventory.all_stock', 'view'), async (req, res) => res.json(await inv.stockGroups(req.ctx!, stockListQuery.parse(req.query))));
 inventoryRouter.get('/stock/shortage', requirePermission('inventory.all_stock', 'view'), async (req, res) => res.json(await inv.shortage(req.ctx!, shortageQuery.parse(req.query))));

@@ -42,6 +42,7 @@ import { ordersRouter } from './orders/routes';
 import { repairRouter } from './repair/routes';
 import { tradeRouter } from './trade/routes';
 import { schemesRouter } from './schemes/routes';
+import { samplesRouter } from './samples/routes';
 
 export const appRouter = Router();
 appRouter.use(inventoryRouter);
@@ -59,6 +60,7 @@ appRouter.use(ordersRouter);
 appRouter.use(repairRouter);
 appRouter.use(tradeRouter);
 appRouter.use(schemesRouter);
+appRouter.use(samplesRouter);
 
 const PARTIES = 'settings.parties';
 const MISC = 'settings.misc';
