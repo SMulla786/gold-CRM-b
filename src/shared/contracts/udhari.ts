@@ -102,6 +102,9 @@ export interface UdharEntryRowDto {
   narration: string | null;
   isReversal: boolean;
   createdAt: string;
+  /** Udhar List only: party running balance just before / after this row (same txnDate,id order as the Statement) */
+  old?: BalanceDto;
+  final?: BalanceDto;
 }
 
 /** Udhar Ledger: party-wise balances. */

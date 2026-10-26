@@ -252,6 +252,10 @@ export const INVOICE_PRINT_COLUMNS = [
   'hsn', 'karat', 'pcs', 'gross', 'less', 'net', 'tunch', 'wastage', 'fine', 'stone', 'rate', 'labour', 'other', 'disc', 'total',
 ] as const;
 
+/** TASK-98: printed bill formats (billing.invoice.format). A4_GST = the standard tax invoice. */
+export const INVOICE_FORMATS = ['A4_GST', 'A4_ESTIMATE', 'A5', 'THERMAL_80', 'THERMAL_58', 'A4_IMAGES'] as const;
+export type InvoiceFormat = (typeof INVOICE_FORMATS)[number];
+
 /** Every allowed setting key with its value schema. Value defaults = shop defaults when no row exists. */
 export const SETTING_SCHEMAS = {
   'calc.basis': z.object({ sale: calcBasis.default('NET'), purchase: calcBasis.default('NET') }),
@@ -298,6 +302,8 @@ export const SETTING_SCHEMAS = {
     categories: z.array(z.string().trim().min(1).max(40)).default(['Gold', 'Silver']),
     /** categories kept for old loans but hidden on New Girvi (Manage Item Categories: Activate/Deactivate) */
     inactiveCategories: z.array(z.string().trim().min(1).max(40)).default([]),
+    /** show the "default N% of valuation" hint on New Girvi (missing = true) */
+    showStdPercent: z.boolean().optional(),
   }),
   /** Girvi receipt layout (original: Receipt Customization & Layout Preview) — presentation only */
   'girvi.receipt': z.object({
@@ -322,6 +328,28 @@ export const SETTING_SCHEMAS = {
     showRemarks: z.boolean().default(true),
     showSignatures: z.boolean().default(true),
     terms: z.string().max(1000).default(''),
+  }),
+  /** TASK-98: bill print format + what the printed sale/purchase bill shows — presentation only.
+   *  Terms text stays in invoice.content.terms; amount-based rate stays in calc.amountBasedRate. */
+  'billing.invoice': z.object({
+    format: z.enum(INVOICE_FORMATS).default('A4_GST'),
+    /** party's current udhar (money) balance under the bill totals */
+    showDueBalance: z.boolean().default(false),
+    showAmountInWords: z.boolean().default(true),
+    showHsn: z.boolean().default(true),
+    showSignature: z.boolean().default(true),
+    showTerms: z.boolean().default(true),
+  }),
+  /** TASK-98 (original: metal_pay_rate_from_amount): on a metal payment row, type the ₹ amount and the rate is worked back as amount ÷ fine */
+  'calc.metalPayRate': z.object({ fromAmount: z.boolean().default(false) }),
+  /** TASK-98 Just Bill Preferences: which columns / pay rows New Just Bill + its print show (presentation only) */
+  'justbill.prefs': z.object({
+    showRate: z.boolean().default(true),
+    showMaking: z.boolean().default(true),
+    showGst: z.boolean().default(true),
+    showOther: z.boolean().default(true),
+    showAdvance: z.boolean().default(true),
+    showReturn: z.boolean().default(true),
   }),
 } as const;
 export type SettingKey = keyof typeof SETTING_SCHEMAS;

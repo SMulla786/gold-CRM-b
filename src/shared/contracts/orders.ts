@@ -8,7 +8,7 @@ import { CHARGE_UNITS } from './inventory';
 import { billPaymentInput } from './billing';
 import type { BillPaymentDto } from './billing';
 import { decimalInput, METALS } from './masters';
-import type { PartyRefDto } from './masters';
+import type { Metal, PartyRefDto } from './masters';
 
 const weight = z.coerce.number().finite().min(0).max(1_000_000);
 
@@ -155,6 +155,8 @@ export const karigarIssueBody = z
     /** TASK-97: agreed karigar wastage — stored for reference only (no posting) */
     wastagePercent: z.coerce.number().min(0).max(100).optional(),
     wastageGm: weight.optional(),
+    /** Samples handed over with this issue — issued atomically (IN_HAND|RETURNED → ISSUED) and linked to the issue; any unavailable sample rolls the whole issue back (409). */
+    sampleIds: z.array(id).max(50).optional(),
   })
   .refine((b) => b.online === 0 || b.bankAccountId != null, { message: 'Select a bank account', path: ['bankAccountId'] });
 
@@ -197,7 +199,18 @@ export interface KarigarIssueDto {
   wastagePercent: string | null;
   wastageGm: string | null;
   items: Array<OrderItemDto & { order: { id: number; orderNo: number; party: PartyRefDto } }>;
+  /** Samples issued with this issue (Sample.karigarIssueId = this id; kept after the sample is returned). Weights are 3-dp strings. */
+  samples?: KarigarIssueSampleDto[];
   createdAt: string;
+}
+
+export interface KarigarIssueSampleDto {
+  id: number;
+  sampleNo: number;
+  metal: Metal;
+  grossWt: string;
+  tounchPercent: string;
+  fine: string;
 }
 
 // ───────────── Repair ─────────────

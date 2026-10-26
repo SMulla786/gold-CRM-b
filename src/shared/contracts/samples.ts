@@ -76,6 +76,8 @@ export interface SampleDto {
   party: { id: number; name: string } | null;
   karigar: { id: number; name: string } | null;
   branch: { id: number; name: string };
+  /** Karigar issue this sample was last issued with (kept after return, for history) */
+  karigarIssueId?: number | null;
   createdAt: string;
   updatedAt: string;
 }

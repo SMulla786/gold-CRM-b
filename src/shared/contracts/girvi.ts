@@ -37,6 +37,8 @@ export const girviBody = z
     ciPeriod: z.enum(['DAILY', 'MONTHLY', 'HALF_YEARLY', 'YEARLY']).optional(),
     method: z.enum(['FULL_MONTH', 'DAY_WISE']),
     tenureMonths: z.coerce.number().int().min(1).max(120),
+    /** optional tenure in days: when sent, returnDate = issueDate + tenureDays and tenureMonths = ceil(days / 30) (server-side) */
+    tenureDays: z.coerce.number().int().min(1).max(3600).optional(),
     remark: z.string().trim().max(300).optional(),
     /** owner-approved: fixed interest for the first month (0 = off) */
     firstMonthInterest: decimalInput.default(0),
@@ -144,6 +146,8 @@ export interface GirviBatchDto {
   overdue: boolean;
   status: 'ACTIVE' | 'CLOSED';
   remark: string | null;
+  /** uploaded customer document (relative path; image or PDF) — served at GET /app/girvi/:id/doc */
+  docUrl?: string | null;
   items: GirviItemDto[];
   txns: GirviTxnDto[];
   createdAt: string;
@@ -175,6 +179,8 @@ export interface GirviListItemDto {
   /** how the grant was paid out */
   payoutCash?: string;
   payoutOnline?: string;
+  /** only the GRANT txn exists, so DELETE /girvi/:id is allowed (MPIN) */
+  deletable?: boolean;
 }
 
 // ───────────── Phase 9b: girvi transfer (re-pledge to a lender) ─────────────

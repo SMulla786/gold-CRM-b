@@ -11,8 +11,10 @@ const range = { from: z.coerce.date().optional(), to: z.coerce.date().optional()
 
 export interface DashboardDto {
   date: string;
-  parties: { customers: number; suppliers: number; customersNewThisMonth: number };
+  /** suppliersNewThisMonth: additive (dashboard Suppliers tile trend); always filled by the server */
+  parties: { customers: number; suppliers: number; customersNewThisMonth: number; suppliersNewThisMonth?: number };
   stock: Array<{ stockClass: (typeof STOCK_CLASSES)[number]; items: number; pcs: number; net: string; fine: string; value: string }>;
+  /** todayReceived = Σ active BillPayment.amount dated today on ACTIVE SELL bills (initial payments on today's bills + later payments today on any bill) */
   sales: { todayTotal: string; todayCount: number; todayReceived: string; monthTotal: string; yearTotal: string; pendingBalance: string };
   purchases: { monthTotal: string };
   /** Σ party balances (+ receivable only) */
@@ -34,10 +36,13 @@ export interface DashboardDto {
     purchasesMonthTotal: string;
     collectedThisMonth: string;
     customersNewThisMonth: number;
+    suppliersNewThisMonth?: number;
   };
   /** TASK-97: parties with a receivable udhar balance whose oldest unpaid debit (FIFO) is older than 30 days, most overdue first (top 10).
    *  amount/gold/silver = positive balance per asset (0 when not owed); since = that debit's date; daysOverdue = days past the 30-day due. */
   udharOverdue?: Array<{ party: { id: number; name: string; mobile: string }; amount: string; gold: string; silver: string; since: string; daysOverdue: number }>;
+  /** Σ money balance (amount) of EVERY overdue party (same FIFO/30-day rule as udharOverdue, not just the top 10) */
+  udharOverdueTotal?: string;
 }
 
 export const activityQuery = pageQuery.extend({

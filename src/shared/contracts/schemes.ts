@@ -134,7 +134,10 @@ export const schemeTxnListQuery = pageQuery.extend({
   kind: z.enum(SCHEME_KINDS).optional(),
   schemeId: id.optional(),
   groupId: id.optional(),
-  medium: z.enum(SCHEME_PAY_MEDIUMS).optional(),
+  /** one medium, or a comma list (e.g. CASH,TOKEN) */
+  medium: z
+    .preprocess((v) => (typeof v === 'string' ? v.split(',').map((s) => s.trim()).filter(Boolean) : v), z.array(z.enum(SCHEME_PAY_MEDIUMS)).min(1))
+    .optional(),
   from: z.coerce.date().optional(),
   to: z.coerce.date().optional(),
 });
