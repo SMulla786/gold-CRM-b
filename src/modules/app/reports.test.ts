@@ -95,6 +95,19 @@ describe('reports activity + GST', () => {
     expect(res.items[0]!.entityId).toBe('2'); // newest (higher id) first
   });
 
+  it('activity q matches summary or party name, case-insensitive', async () => {
+    const { business, root } = await createBusiness({ name: 'A' });
+    await db.activityLog.createMany({
+      data: [
+        { businessId: business.id, branchId: root.id, userId: 1, module: 'UDHAR', action: 'CREATED', entity: 'UdharTxn', entityId: '1', summary: 'Udhar #1', partyName: 'Ramesh Patil' },
+        { businessId: business.id, branchId: root.id, userId: 1, module: 'BILLING', action: 'CREATED', entity: 'Bill', entityId: '2', summary: 'Bill INV-1' },
+      ],
+    });
+    const ctx = ctxFor(business.id, [root.id], root.id);
+    expect((await activity(ctx, { page: 1, pageSize: 20, q: 'ramesh' })).items.map((r) => r.entityId)).toEqual(['1']);
+    expect((await activity(ctx, { page: 1, pageSize: 20, q: 'inv-1' })).items.map((r) => r.entityId)).toEqual(['2']);
+  });
+
   it('GST register lists ACTIVE GST bills with HSN codes; ROUGH excluded', async () => {
     const { business, root } = await createBusiness({ name: 'A' });
     const p = await party(business.id);

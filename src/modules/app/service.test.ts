@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { db, truncateAll } from '../../../test/helpers/db';
-import { createBranch, createBusiness, createPlan } from '../../../test/helpers/factory';
+import { createBranch, createBusiness, createPlan, createUser } from '../../../test/helpers/factory';
 import * as svc from './service';
 import * as platform from '../platform/service';
 import type { TenantContext } from '../../middleware/context';
@@ -54,6 +54,26 @@ describe('rate limits', () => {
       ],
     });
     expect(off.map((o) => o.karatCode)).toEqual(['24K']);
+  });
+});
+
+describe('rate history', () => {
+  it('returns the creator name in createdBy, pages and filters by metal', async () => {
+    const { business, root } = await createBusiness({ name: 'A' });
+    const { user } = await createUser({ businessId: business.id, branchId: root.id, level: 'ADMIN' });
+    const c = ctx({ businessId: business.id, userId: user.id, scopeBranchId: root.id, branchIds: [root.id] });
+    await svc.setRates(c, { metal: 'GOLD', rateUnit: 'GRAM_10', rates: [{ karatCode: '24K', sellRate: 150000, buyRate: 148000 }, { karatCode: '22K', sellRate: 137500, buyRate: 135000 }] });
+    await svc.setRates(c, { metal: 'SILVER', rateUnit: 'KG_1', rates: [{ karatCode: '999', sellRate: 180000, buyRate: 178000 }] });
+    const gold = await svc.rateHistory(c, { page: 1, pageSize: 1, metal: 'GOLD' });
+    expect(gold.total).toBe(2);
+    expect(gold.items).toHaveLength(1);
+    expect(gold.items[0]).toMatchObject({ metal: 'GOLD', createdBy: 'Test User' });
+    const all = await svc.rateHistory(c, { page: 1, pageSize: 20 });
+    expect(all.total).toBe(3);
+    // A row without a creator stays null.
+    await db.metalRate.create({ data: { businessId: business.id, metal: 'GOLD', karatCode: '18K', rateUnit: 'GRAM_10', sellRate: 1, buyRate: 1 } });
+    const latest = await svc.rateHistory(c, { page: 1, pageSize: 20, metal: 'GOLD' });
+    expect(latest.items.find((i) => i.karatCode === '18K')?.createdBy).toBeNull();
   });
 });
 

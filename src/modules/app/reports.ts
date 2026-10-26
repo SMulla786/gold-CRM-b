@@ -117,11 +117,13 @@ export async function dashboard(ctx: TenantContext): Promise<DashboardDto> {
 
 // ───────────── Activity ─────────────
 
-export async function activity(ctx: TenantContext, q: { page: number; pageSize: number; from?: Date; to?: Date; module?: string; action?: (typeof ACTIVITY_ACTIONS)[number]; userId?: number }): Promise<Paged<ActivityDto>> {
+export async function activity(ctx: TenantContext, q: { page: number; pageSize: number; q?: string; from?: Date; to?: Date; module?: string; action?: (typeof ACTIVITY_ACTIONS)[number]; userId?: number }): Promise<Paged<ActivityDto>> {
   const sdb = scopedDb(ctx);
   const branches = branchFilter(ctx);
   const where: any = {
     branchId: { in: branches },
+    // q (from pageQuery) searches the human-readable text: summary + party name.
+    ...(q.q ? { OR: [{ summary: { contains: q.q, mode: 'insensitive' } }, { partyName: { contains: q.q, mode: 'insensitive' } }] } : {}),
     ...(q.module ? { module: q.module } : {}),
     ...(q.action ? { action: q.action } : {}),
     ...(q.userId ? { userId: q.userId } : {}),

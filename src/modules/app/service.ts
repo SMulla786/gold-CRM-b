@@ -298,8 +298,12 @@ export async function rateHistory(ctx: TenantContext, query: { page: number; pag
     sdb.metalRate.findMany({ where, skip: (query.page - 1) * query.pageSize, take: query.pageSize, orderBy: { effectiveAt: 'desc' } }),
     sdb.metalRate.count({ where }),
   ]);
+  // Creator names via raw prisma (no relation on MetalRate; the creator may sit outside the active branch).
+  const userIds = [...new Set(rows.map((r) => r.createdById).filter((x): x is number => x != null))];
+  const users = userIds.length ? await prisma.user.findMany({ where: { id: { in: userIds }, businessId: ctx.businessId! }, select: { id: true, name: true } }) : [];
+  const userName = new Map(users.map((u) => [u.id, u.name]));
   return {
-    items: rows.map((r) => ({ id: r.id, metal: r.metal, karatCode: r.karatCode, rateUnit: r.rateUnit as RateUnitKey, sellRate: r.sellRate.toString(), buyRate: r.buyRate.toString(), effectiveAt: r.effectiveAt.toISOString(), branchId: r.branchId, createdBy: null })),
+    items: rows.map((r) => ({ id: r.id, metal: r.metal, karatCode: r.karatCode, rateUnit: r.rateUnit as RateUnitKey, sellRate: r.sellRate.toString(), buyRate: r.buyRate.toString(), effectiveAt: r.effectiveAt.toISOString(), branchId: r.branchId, createdBy: r.createdById != null ? (userName.get(r.createdById) ?? null) : null })),
     total,
     page: query.page,
     pageSize: query.pageSize,
