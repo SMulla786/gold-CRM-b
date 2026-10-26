@@ -6,7 +6,7 @@ import { logActivity } from '../../lib/activity';
 import { HttpError } from '../../middleware/error';
 import type { TenantContext } from '../../middleware/context';
 import { IE_SOURCE_TYPES, LEDGER_ASSETS } from '../../shared';
-import type { AssetTotalsDto, DayBookAllInOneRowDto, DayBookDto, IncomeExpenseDailySummaryDto, IncomeExpenseDto, LedgerAsset, LedgerPageDto, LedgerRowDto, LedgerSource, Paged } from '../../shared';
+import type { AssetTotalsDto, DayBookAllInOneRowDto, DayBookDto, IncomeExpenseDailySummaryDto, IncomeExpenseDto, LedgerAsset, OldMetalSummaryRowDto, LedgerPageDto, LedgerRowDto, LedgerSource, Paged } from '../../shared';
 
 type IeSourceType = (typeof IE_SOURCE_TYPES)[number];
 // TASK-81: which ledger sources each IE source-type surfaces. DIRECT = manual income/expense rows.
@@ -448,4 +448,31 @@ async function userNames(ctx: TenantContext, ids: number[]): Promise<Map<number,
   if (!ids.length) return new Map();
   const rows = await prisma.user.findMany({ where: { id: { in: ids }, businessId: ctx.businessId! }, select: { id: true, name: true } });
   return new Map(rows.map((r) => [r.id, r.name]));
+}
+
+// ───────────── Old Metal Ledger ─────────────
+
+/** Per-source IN/OUT/net of old (KACHA) gold & silver, fine grams; reversal rows net out on their own. */
+export async function getOldMetalSummary(ctx: TenantContext, query: { from?: Date; to?: Date }): Promise<OldMetalSummaryRowDto[]> {
+  const rows = await scopedDb(ctx).ledgerEntry.groupBy({
+    by: ['source', 'asset', 'direction'],
+    where: { branchId: { in: branchFilter(ctx) }, asset: { in: ['GOLD', 'SILVER'] }, metalForm: 'KACHA', ...dateWhere(query.from, query.to) },
+    _sum: { fine: true },
+  });
+  const bySource = new Map<string, Record<'goldIn' | 'goldOut' | 'silverIn' | 'silverOut', Prisma.Decimal>>();
+  for (const r of rows) {
+    const acc = bySource.get(r.source) ?? { goldIn: new Prisma.Decimal(0), goldOut: new Prisma.Decimal(0), silverIn: new Prisma.Decimal(0), silverOut: new Prisma.Decimal(0) };
+    const key = `${r.asset === 'GOLD' ? 'gold' : 'silver'}${r.direction === 'IN' ? 'In' : 'Out'}` as keyof typeof acc;
+    acc[key] = acc[key].plus(r._sum.fine ?? 0);
+    bySource.set(r.source, acc);
+  }
+  return [...bySource].map(([source, v]) => ({
+    source: source as LedgerSource,
+    goldIn: v.goldIn.toFixed(3),
+    goldOut: v.goldOut.toFixed(3),
+    goldNet: v.goldIn.minus(v.goldOut).toFixed(3),
+    silverIn: v.silverIn.toFixed(3),
+    silverOut: v.silverOut.toFixed(3),
+    silverNet: v.silverIn.minus(v.silverOut).toFixed(3),
+  }));
 }

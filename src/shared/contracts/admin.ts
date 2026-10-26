@@ -68,6 +68,15 @@ export interface BranchNodeDto {
   isActive: boolean;
   userCount: number;
   children: BranchNodeDto[];
+  /** Branch details for the edit dialog (optional so tree-only callers/mocks needn't fill them). */
+  inchargeName?: string | null;
+  countryCode?: string;
+  mobile?: string | null;
+  gstin?: string | null;
+  stateId?: number | null;
+  districtId?: number | null;
+  address?: string | null;
+  disclaimer?: string | null;
 }
 
 export interface UserDto {

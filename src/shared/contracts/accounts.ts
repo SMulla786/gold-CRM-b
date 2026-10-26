@@ -156,3 +156,19 @@ export interface DayBookAllInOneRowDto {
   /** per asset, main unit as in LedgerRowDto.balance; assets with no movement are "0" */
   assets: Record<(typeof LEDGER_ASSETS)[number], { in: string; out: string }>;
 }
+
+/**
+ * Old Metal Ledger: old/raw (KACHA) gold & silver flowing through every module (bills' old-gold payments, exchange,
+ * kacha processing, opening…). Summary = per source module; the row history is GET /app/ledgers?asset=GOLD|SILVER&metalForm=KACHA.
+ */
+export const oldMetalSummaryQuery = z.object({ from: dateOnly.optional(), to: dateOnly.optional() });
+export interface OldMetalSummaryRowDto {
+  source: (typeof LEDGER_SOURCES)[number];
+  /** fine grams */
+  goldIn: string;
+  goldOut: string;
+  goldNet: string;
+  silverIn: string;
+  silverOut: string;
+  silverNet: string;
+}
