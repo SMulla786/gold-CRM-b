@@ -2,6 +2,7 @@ import { rm } from 'node:fs/promises';
 import type { Prisma } from '@prisma/client';
 import { prisma } from '../../lib/prisma';
 import { scopedDb } from '../../lib/db';
+import { parseCsv } from '../../lib/csv';
 import * as ledger from '../../lib/ledger';
 import { logActivity } from '../../lib/activity';
 import { HttpError } from '../../middleware/error';
@@ -572,24 +573,6 @@ export async function shortage(ctx: TenantContext, query: { stockClass?: StockCl
 // ───────────── CSV import ─────────────
 
 const CSV_COLS = ['item_name', 'tag_no', 'huid', 'karat', 'pcs', 'gross', 'less', 'tunch', 'wastage', 'stone_charge', 'labour', 'labour_unit', 'other', 'rate', 'purchase_cost', 'remarks'];
-
-/** Minimal CSV parser: handles quoted fields + escaped quotes; no embedded newlines inside quotes. */
-function parseCsv(text: string): string[][] {
-  return text.replace(/\r/g, '').split('\n').filter((l) => l.trim() !== '').map((line) => {
-    const out: string[] = [];
-    let cur = '';
-    let q = false;
-    for (let i = 0; i < line.length; i++) {
-      const ch = line[i];
-      if (q) {
-        if (ch === '"' && line[i + 1] === '"') { cur += '"'; i++; } else if (ch === '"') q = false; else cur += ch;
-      } else if (ch === '"') q = true;
-      else if (ch === ',') { out.push(cur); cur = ''; } else cur += ch;
-    }
-    out.push(cur);
-    return out.map((c) => c.trim());
-  });
-}
 
 export async function importStock(ctx: TenantContext, csv: string, fields: { stockClass: StockClass; method: 'LOOSE' | 'TAG'; groupId: number; dryRun: boolean }): Promise<StockImportResultDto> {
   const sdb = scopedDb(ctx);

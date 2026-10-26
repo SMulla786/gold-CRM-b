@@ -232,3 +232,35 @@ export interface GirviTransferDto {
   remark: string | null;
   createdAt: string;
 }
+
+// ───────────── Phase 9b: girvi bulk import ─────────────
+
+/** CSV: one row per pledged item; rows sharing loan_ref form one loan. Columns in GIRVI_IMPORT_COLUMNS order (header row required). */
+export const GIRVI_IMPORT_COLUMNS = [
+  'loan_ref', 'customer_name', 'mobile', 'address', 'issue_date', 'tenure_months', 'rate_percent', 'rate_period', 'interest_type', 'ci_period', 'method',
+  'principal', 'cash', 'online', 'item_category', 'item_name', 'gross', 'net', 'purity', 'rate', 'remark',
+] as const;
+export const girviImportFields = z.object({ dryRun: z.enum(['true', 'false']).default('true'), bankAccountId: id.optional() });
+
+export interface GirviImportLoanDto {
+  loanRef: string;
+  /** first CSV row of this loan (1-based incl. header) */
+  row: number;
+  customer: string;
+  mobile: string;
+  /** existing customer matched by mobile, else a new customer is created */
+  existingCustomer: boolean;
+  issueDate: string;
+  items: number;
+  valuation: string;
+  principal: string;
+  /** set after a real import */
+  girviNo: number | null;
+  errors: Array<{ row: number; field?: string; message: string }>;
+}
+export interface GirviImportResultDto {
+  dryRun: boolean;
+  loans: GirviImportLoanDto[];
+  valid: number;
+  imported: number;
+}

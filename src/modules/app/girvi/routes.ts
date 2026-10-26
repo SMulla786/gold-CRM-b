@@ -1,8 +1,11 @@
 import { Router } from 'express';
+import multer from 'multer';
+import { HttpError } from '../../../middleware/error';
 import { requireMpin, requirePermission } from '../../../middleware/guards';
 import {
   girviAsOfQuery,
   girviBody,
+  girviImportFields,
   girviInterestBody,
   girviListQuery,
   girviReleaseBody,
@@ -14,12 +17,22 @@ import {
 } from '../../../shared';
 import * as girvi from './service';
 import * as transfer from './transfer';
+import { girviImportSampleCsv, importGirvi } from './import';
+
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 2 * 1024 * 1024 } });
 
 export const girviRouter = Router();
 const ENTRY = 'girvi.entry';
 const LEDGER = 'girvi.ledger';
 const TRANSFER = 'girvi.transfer';
 
+// Phase 9b — bulk import (dryRun=true validates only; a real run imports only when every loan is valid)
+girviRouter.get('/girvi/import/sample.csv', requirePermission(ENTRY, 'view'), (_req, res) => res.type('text/csv').send(girviImportSampleCsv()));
+girviRouter.post('/girvi/import', requirePermission(ENTRY, 'edit'), upload.single('file'), async (req, res) => {
+  if (!req.file) throw new HttpError(400, 'VALIDATION', 'No CSV file uploaded (field "file")');
+  const f = girviImportFields.parse(req.body);
+  res.json(await importGirvi(req.ctx!, req.file.buffer.toString('utf8'), { dryRun: f.dryRun === 'true', bankAccountId: f.bankAccountId }));
+});
 // Phase 9b — transfers (re-pledge to a lender); registered before /girvi/:id
 girviRouter.get('/girvi/transfers', requirePermission(TRANSFER, 'view'), async (req, res) => res.json(await transfer.listTransfers(req.ctx!, girviTransferListQuery.parse(req.query))));
 girviRouter.post('/girvi/transfers', requirePermission(TRANSFER, 'edit'), async (req, res) => res.status(201).json(await transfer.createTransfer(req.ctx!, girviTransferBody.parse(req.body))));
