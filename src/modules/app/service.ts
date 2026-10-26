@@ -11,6 +11,7 @@ import type {
   Metal,
   PartyDto,
   PartyListItemDto,
+  OccasionDto,
   PartyRefDto,
   Paged,
   RateHistoryDto,
@@ -83,6 +84,39 @@ export async function searchParties(ctx: TenantContext, query: { q: string; type
     orderBy: { name: 'asc' },
   });
   return rows.map(partyRef);
+}
+
+const isLeapYear = (y: number) => (y % 4 === 0 && y % 100 !== 0) || y % 400 === 0;
+
+/** TASK-89: active parties whose birthday/anniversary falls within the next `days` IST days (today = daysAway 0).
+ *  Feb-29 occasions show on Feb-28 in non-leap years; only the nearest future occurrence per occasion. */
+export async function listOccasions(ctx: TenantContext, days: number, now: Date = new Date()): Promise<OccasionDto[]> {
+  const parties = await scopedDb(ctx).party.findMany({
+    where: { isActive: true, OR: [{ birthday: { not: null } }, { anniversary: { not: null } }] },
+    select: { id: true, type: true, name: true, mobile: true, shopName: true, birthday: true, anniversary: true },
+  });
+  const istNow = new Date(now.getTime() + 330 * 60000); // IST calendar via +5:30 shift; UTC getters then read IST Y/M/D
+  const todayMs = Date.UTC(istNow.getUTCFullYear(), istNow.getUTCMonth(), istNow.getUTCDate());
+  const out: OccasionDto[] = [];
+  const add = (p: (typeof parties)[number], kind: 'BIRTHDAY' | 'ANNIVERSARY', d: Date | null) => {
+    if (!d) return;
+    const mon = d.getUTCMonth();
+    const day = d.getUTCDate();
+    for (const year of [istNow.getUTCFullYear(), istNow.getUTCFullYear() + 1]) {
+      const adjDay = mon === 1 && day === 29 && !isLeapYear(year) ? 28 : day;
+      const occMs = Date.UTC(year, mon, adjDay);
+      const daysAway = Math.round((occMs - todayMs) / 86_400_000);
+      if (daysAway >= 0 && daysAway <= days) {
+        out.push({ party: partyRef(p), kind, date: new Date(occMs).toISOString().slice(0, 10), daysAway });
+        break; // nearest future occurrence only
+      }
+    }
+  };
+  for (const p of parties) {
+    add(p, 'BIRTHDAY', p.birthday);
+    add(p, 'ANNIVERSARY', p.anniversary);
+  }
+  return out.sort((a, b) => a.daysAway - b.daysAway || a.party.name.localeCompare(b.party.name));
 }
 
 export async function getParty(ctx: TenantContext, partyId: number): Promise<PartyDto> {

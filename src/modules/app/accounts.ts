@@ -6,7 +6,7 @@ import { logActivity } from '../../lib/activity';
 import { HttpError } from '../../middleware/error';
 import type { TenantContext } from '../../middleware/context';
 import { IE_SOURCE_TYPES, LEDGER_ASSETS } from '../../shared';
-import type { AssetTotalsDto, DayBookDto, IncomeExpenseDailySummaryDto, IncomeExpenseDto, LedgerAsset, LedgerPageDto, LedgerRowDto, LedgerSource, Paged } from '../../shared';
+import type { AssetTotalsDto, DayBookAllInOneRowDto, DayBookDto, IncomeExpenseDailySummaryDto, IncomeExpenseDto, LedgerAsset, LedgerPageDto, LedgerRowDto, LedgerSource, Paged } from '../../shared';
 
 type IeSourceType = (typeof IE_SOURCE_TYPES)[number];
 // TASK-81: which ledger sources each IE source-type surfaces. DIRECT = manual income/expense rows.
@@ -378,6 +378,57 @@ export async function getDayBook(ctx: TenantContext, query: { from?: Date; to?: 
   }
 
   return { from: dateOnly(from), to: dateOnly(to), totals, bySource, status };
+}
+
+/** TASK-90: Day-Book "All-in-One" — one row per (source, sourceId, txnDate) document with every asset's IN/OUT side by side.
+ *  Grouped SQL (3 queries, no per-document round-trips), scoped by businessId + the active branch(es). */
+export async function getDayBookAllInOne(ctx: TenantContext, q: { page: number; pageSize: number; from?: Date; to?: Date; source?: LedgerSource }): Promise<Paged<DayBookAllInOneRowDto>> {
+  const from = ledger.businessDate(q.from ?? new Date());
+  const to = ledger.businessDate(q.to ?? new Date());
+  const sdb = scopedDb(ctx);
+  const where: any = { branchId: { in: branchFilter(ctx) }, txnDate: { gte: from, lte: to }, ...(q.source ? { source: q.source } : {}) };
+  const docs = await sdb.ledgerEntry.groupBy({ by: ['source', 'sourceId', 'txnDate'], where, orderBy: [{ txnDate: 'desc' }, { sourceId: 'desc' }] });
+  const total = docs.length;
+  const page = docs.slice((q.page - 1) * q.pageSize, (q.page - 1) * q.pageSize + q.pageSize);
+  if (page.length === 0) return { items: [], total, page: q.page, pageSize: q.pageSize };
+
+  const scoped = { ...where, sourceId: { in: [...new Set(page.map((d) => d.sourceId))] } };
+  const [agg, reps] = await Promise.all([
+    sdb.ledgerEntry.groupBy({ by: ['source', 'sourceId', 'txnDate', 'asset', 'direction'], where: scoped, _sum: { amount: true, fine: true, pcs: true } }),
+    sdb.ledgerEntry.findMany({ where: scoped, select: { source: true, sourceId: true, txnDate: true, partyId: true, narration: true }, distinct: ['source', 'sourceId', 'txnDate'] }),
+  ]);
+  const key = (s: string, id: string, d: Date) => `${s}|${id}|${d.toISOString()}`;
+  const assetMap = new Map<string, Record<string, { in: Prisma.Decimal; out: Prisma.Decimal }>>();
+  for (const g of agg) {
+    const k = key(g.source, g.sourceId, g.txnDate);
+    let rec = assetMap.get(k);
+    if (!rec) {
+      rec = Object.fromEntries(LEDGER_ASSETS.map((a) => [a, { in: new Prisma.Decimal(0), out: new Prisma.Decimal(0) }]));
+      assetMap.set(k, rec);
+    }
+    const v = new Prisma.Decimal((g._sum as any)[UNIT[g.asset]] ?? 0);
+    if (g.direction === 'IN') rec[g.asset]!.in = rec[g.asset]!.in.plus(v);
+    else rec[g.asset]!.out = rec[g.asset]!.out.plus(v);
+  }
+  const repMap = new Map(reps.map((r) => [key(r.source, r.sourceId, r.txnDate), r]));
+  const partyNames = await scopedNames(sdb.party, reps.map((r) => r.partyId).filter((x): x is number => x != null));
+
+  const items: DayBookAllInOneRowDto[] = page.map((d) => {
+    const rec = assetMap.get(key(d.source, d.sourceId, d.txnDate));
+    const rep = repMap.get(key(d.source, d.sourceId, d.txnDate));
+    const assets = Object.fromEntries(
+      LEDGER_ASSETS.map((a) => [a, { in: (rec?.[a]?.in ?? new Prisma.Decimal(0)).toString(), out: (rec?.[a]?.out ?? new Prisma.Decimal(0)).toString() }]),
+    ) as Record<(typeof LEDGER_ASSETS)[number], { in: string; out: string }>;
+    return {
+      txnDate: dateOnly(d.txnDate),
+      source: d.source as LedgerSource,
+      sourceId: d.sourceId,
+      party: rep?.partyId != null ? { id: rep.partyId, name: partyNames.get(rep.partyId) ?? '' } : null,
+      narration: rep?.narration ?? null,
+      assets,
+    };
+  });
+  return { items, total, page: q.page, pageSize: q.pageSize };
 }
 
 // ───────────── helpers ─────────────

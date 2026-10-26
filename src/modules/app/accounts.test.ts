@@ -138,3 +138,27 @@ describe('TASK-81 income/expense daily summary + sourceType', () => {
     expect(Number((await acc.incomeExpenseDailySummary(s.ctx, { sourceType: 'DIRECT' }))[0]!.profit)).toBe(1000);
   });
 });
+
+describe('TASK-90 day-book all-in-one', () => {
+  it('one row per source document with each asset in/out side by side, plus party + narration', async () => {
+    const s = await setup();
+    const party = await db.party.create({ data: { businessId: s.business.id, type: 'CUSTOMER', name: 'Cust', mobile: '9000000099' } });
+    const today = ledger.businessDate();
+    const row = (over: Record<string, unknown>) => db.ledgerEntry.create({ data: { businessId: s.business.id, branchId: s.root.id, txnDate: today, asset: 'MONEY', direction: 'IN', amount: 0, source: 'SELL_BILL', sourceId: '1', createdById: 1, ...over } });
+    await row({ asset: 'MONEY', direction: 'IN', amount: 1000, partyId: party.id, narration: 'Sale #1' });
+    await row({ asset: 'GOLD', direction: 'OUT', net: 5, fine: 5, partyId: party.id, narration: 'Sale #1' });
+    await row({ source: 'PURCHASE_BILL', sourceId: '2', asset: 'MONEY', direction: 'OUT', amount: 300 });
+
+    const res = await acc.getDayBookAllInOne(s.ctx, { page: 1, pageSize: 20 });
+    expect(res.total).toBe(2);
+    const sell = res.items.find((r) => r.source === 'SELL_BILL' && r.sourceId === '1')!;
+    expect(Number(sell.assets.MONEY.in)).toBe(1000);
+    expect(Number(sell.assets.MONEY.out)).toBe(0);
+    expect(Number(sell.assets.GOLD.out)).toBe(5);
+    expect(sell.party).toEqual({ id: party.id, name: 'Cust' });
+    expect(sell.narration).toBe('Sale #1');
+    const pur = res.items.find((r) => r.source === 'PURCHASE_BILL')!;
+    expect(Number(pur.assets.MONEY.out)).toBe(300);
+    expect(pur.party).toBeNull();
+  });
+});

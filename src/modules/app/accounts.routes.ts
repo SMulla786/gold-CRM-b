@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { assertAnyPermission, requireMpin, requirePermission } from '../../middleware/guards';
-import { dayBookQuery, id as idSchema, incomeExpenseBody, incomeExpenseListQuery, ledgerQuery } from '../../shared';
+import { dayBookAllInOneQuery, dayBookQuery, id as idSchema, incomeExpenseBody, incomeExpenseListQuery, ledgerQuery } from '../../shared';
 import type { LedgerAsset } from '../../shared';
 import * as acc from './accounts';
 
@@ -29,3 +29,4 @@ accountsRouter.get('/ledgers', async (req, res) => {
   res.json(await acc.getLedgerPage(req.ctx!, q));
 });
 accountsRouter.get('/day-book', requirePermission('daybook.all_in_one', 'view'), async (req, res) => res.json(await acc.getDayBook(req.ctx!, dayBookQuery.parse(req.query))));
+accountsRouter.get('/day-book/all-in-one', requirePermission('daybook.all_in_one', 'view'), async (req, res) => res.json(await acc.getDayBookAllInOne(req.ctx!, dayBookAllInOneQuery.parse(req.query))));

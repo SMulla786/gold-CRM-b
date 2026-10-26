@@ -9,6 +9,7 @@ import {
   hsnToggleBody,
   id as idSchema,
   karatBody,
+  occasionsQuery,
   partyBody,
   partyListQuery,
   partySearchQuery,
@@ -66,6 +67,7 @@ const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 2 *
 // ───────────── Parties ─────────────
 appRouter.get('/parties', requirePermission(PARTIES, 'view'), async (req, res) => res.json(await svc.listParties(req.ctx!, partyListQuery.parse(req.query))));
 appRouter.get('/parties/search', requirePermission(PARTIES, 'view'), async (req, res) => res.json(await svc.searchParties(req.ctx!, partySearchQuery.parse(req.query))));
+appRouter.get('/parties/occasions', requirePermission(PARTIES, 'view'), async (req, res) => res.json(await svc.listOccasions(req.ctx!, occasionsQuery.parse(req.query).days))); // TASK-89, before /parties/:id
 appRouter.get('/parties/:id', requirePermission(PARTIES, 'view'), async (req, res) => res.json(await svc.getParty(req.ctx!, idSchema.parse(req.params.id))));
 appRouter.post('/parties', requirePermission(PARTIES, 'edit'), async (req, res) => {
   const { dto, duplicateIds } = await svc.createParty(req.ctx!, partyBody.parse(req.body));
