@@ -2098,26 +2098,29 @@ enum SampleStatus {
 
 /// A tounch (purity-test) sample held in custody. Status changes are guarded updateMany flips + a SampleMovement row.
 model Sample {
-  id            Int              @id @default(autoincrement())
-  businessId    Int
-  branchId      Int
+  id             Int              @id @default(autoincrement())
+  businessId     Int
+  branchId       Int
   /// per-branch DocSequence key 'SAMPLE'
-  sampleNo      Int
-  partyId       Int?
-  karigarId     Int?
-  metal         MetalKind
-  grossWt       Decimal          @db.Decimal(14, 3)
-  tounchPercent Decimal          @db.Decimal(6, 3)
-  fine          Decimal          @db.Decimal(14, 3)
-  status        SampleStatus     @default(IN_HAND)
-  note          String?
-  createdById   Int?
-  createdAt     DateTime         @default(now())
-  updatedAt     DateTime         @updatedAt
-  movements     SampleMovement[]
+  sampleNo       Int
+  partyId        Int?
+  karigarId      Int?
+  /// KarigarIssue this sample was last issued with (kept after return for history)
+  karigarIssueId Int?
+  metal          MetalKind
+  grossWt        Decimal          @db.Decimal(14, 3)
+  tounchPercent  Decimal          @db.Decimal(6, 3)
+  fine           Decimal          @db.Decimal(14, 3)
+  status         SampleStatus     @default(IN_HAND)
+  note           String?
+  createdById    Int?
+  createdAt      DateTime         @default(now())
+  updatedAt      DateTime         @updatedAt
+  movements      SampleMovement[]
 
   @@unique([businessId, branchId, sampleNo])
   @@index([businessId, branchId, status])
+  @@index([karigarIssueId])
 }
 
 /// Custody log of a sample (CREATED | ISSUED | RETURNED | MELTED | EDITED); reached through its scoped Sample.
