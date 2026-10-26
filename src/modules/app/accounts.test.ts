@@ -81,6 +81,22 @@ describe('income/expense + asset ledgers', () => {
     expect(Number(m.closing)).toBe(150);
   });
 
+  it('TASK-97 groupBy=DATE: one row per day, newest first, each opening = previous closing', async () => {
+    const s = await setup();
+    await acc.createIncomeExpense(s.ctx, ie({ cash: 100, txnDate: new Date('2020-01-01') }));
+    await acc.createIncomeExpense(s.ctx, ie({ cash: 40, txnDate: new Date('2020-01-03') }));
+    const book = await acc.getDayBook(s.ctx, { from: new Date('2020-01-02'), to: new Date('2020-01-03'), groupBy: 'DATE' });
+    expect(book.days?.map((d) => d.date)).toEqual(['2020-01-03', '2020-01-02']);
+    const money = (i: number) => book.days![i]!.totals.find((t) => t.asset === 'MONEY')!;
+    expect(Number(money(1).opening)).toBe(100); // Jan 2: carried from Jan 1, quiet day
+    expect(Number(money(1).closing)).toBe(100);
+    expect(Number(money(0).opening)).toBe(100); // Jan 3 opens on Jan 2's closing
+    expect(Number(money(0).in)).toBe(40);
+    expect(Number(money(0).closing)).toBe(140);
+    expect(book.days![0]!.status).toBe('OPEN');
+    expect((await acc.getDayBook(s.ctx, {})).days).toBeUndefined(); // only on request
+  });
+
   it('only today\'s entries can be edited; an edit reverses the old ledger rows', async () => {
     const s = await setup();
     // gold-only past entry: proves the today-guard without touching the MONEY ledger asserted below.
@@ -112,6 +128,8 @@ describe('TASK-81 income/expense daily summary + sourceType', () => {
     expect(Number(summary[0]!.cashOut)).toBe(300);
     expect(Number(summary[0]!.profit)).toBe(700);
     expect(Number(summary[0]!.goldNet)).toBe(2);
+    expect(Number(summary[0]!.goldIn)).toBe(2); // TASK-97 split in/out
+    expect(Number(summary[0]!.goldOut)).toBe(0);
   });
 
   it('sourceType: DIRECT lists manual entries; an auto source lists per-document aggregates', async () => {

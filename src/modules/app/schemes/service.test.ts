@@ -177,6 +177,75 @@ describe('schemes', () => {
     expect([...p1.items, ...p2.items].map((e) => e.assignId).sort()).toEqual(['D2', 'D3']);
   });
 
+  it('an Anjuman with no EMI (tenure 0) takes ad-hoc deposits with no installment slot; SAVING still needs tenure ≥ 1', async () => {
+    const { schemeBody } = await import('../../../shared');
+    expect(schemeBody.safeParse({ kind: 'SAVING', type: 'CASH', name: 'S1', emiAmount: 100, startDate: '2026-01-01' }).success).toBe(false);
+    expect(schemeBody.safeParse({ kind: 'ANJUMAN', type: 'CASH', name: 'A1', emiAmount: 0, startDate: '2026-01-01' }).success).toBe(true);
+    const s = await setup();
+    const scheme = await cashScheme(s.ctx, { kind: 'ANJUMAN', emiAmount: 0, tenureMonths: 0, bonusType: 'NONE' });
+    const e = await schemes.enroll(s.ctx, { schemeId: scheme.id, partyId: s.party.id, assignId: 'N1', displayName: 'C', tokenAmount: 0 } as any);
+    const after = await schemes.addPayment(s.ctx, { enrollmentId: e.id, amount: 750, medium: 'CASH' } as any);
+    expect(after.payments[0]!.emiNo).toBeNull();
+    expect(after.emisDue).toBe(0);
+    expect(after.maturity.paid).toBe('750.00');
+  });
+
+  it('token medium: default TOKEN unchanged; CASH token posts money-in with no EMI slot; ONLINE needs a bank', async () => {
+    const s = await setup();
+    const scheme = await cashScheme(s.ctx);
+    const t1 = await schemes.enroll(s.ctx, { schemeId: scheme.id, partyId: s.party.id, assignId: 'T1', displayName: 'C', tokenAmount: 300 } as any);
+    expect(t1.payments.map((p) => [p.medium, p.emiNo])).toEqual([['TOKEN', null]]);
+    const t2 = await schemes.enroll(s.ctx, { schemeId: scheme.id, partyId: s.party.id, assignId: 'T2', displayName: 'C', tokenAmount: 300, tokenMedium: 'CASH' } as any);
+    expect(t2.payments.map((p) => [p.medium, p.emiNo])).toEqual([['CASH', null]]);
+    expect(t2.emisPaid).toBe(0);
+    expect(await schemeMoneyIn()).toBe(2);
+    await expect(schemes.enroll(s.ctx, { schemeId: scheme.id, partyId: s.party.id, assignId: 'T3', displayName: 'C', tokenAmount: 300, tokenMedium: 'ONLINE' } as any)).rejects.toMatchObject({ status: 400 });
+    const t4 = await schemes.enroll(s.ctx, { schemeId: scheme.id, partyId: s.party.id, assignId: 'T4', displayName: 'C', tokenAmount: 300, tokenMedium: 'ONLINE', tokenBankAccountId: s.bank.id } as any);
+    expect(t4.payments[0]!.bankAccount?.id).toBe(s.bank.id);
+  });
+
+  it('enrollment list: comma status list and enrol-date range', async () => {
+    const s = await setup();
+    const scheme = await cashScheme(s.ctx);
+    const a = await schemes.enroll(s.ctx, { schemeId: scheme.id, partyId: s.party.id, assignId: 'S1', displayName: 'C', tokenAmount: 0, startDate: new Date('2026-01-10') } as any);
+    await schemes.enroll(s.ctx, { schemeId: scheme.id, partyId: s.party.id, assignId: 'S2', displayName: 'C', tokenAmount: 0, startDate: new Date('2026-03-10') } as any);
+    await schemes.markWon(s.ctx, a.id);
+    const { enrollmentListQuery } = await import('../../../shared');
+    const list = (raw: Record<string, string>) => schemes.listEnrollments(s.ctx, enrollmentListQuery.parse(raw));
+    expect((await list({ status: 'WON,WITHDRAWN' })).items.map((e) => e.assignId)).toEqual(['S1']);
+    expect((await list({ status: 'ACTIVE' })).items.map((e) => e.assignId)).toEqual(['S2']);
+    expect((await list({ from: '2026-03-01', to: '2026-03-31' })).items.map((e) => e.assignId)).toEqual(['S2']);
+  });
+
+  it('dues: q filters server-side; perMonth gives one row per due EMI (count = emisDue)', async () => {
+    const s = await setup();
+    const scheme = await cashScheme(s.ctx);
+    const start = new Date(); start.setUTCMonth(start.getUTCMonth() - 2); // EMIs 1..3 are due today
+    await schemes.enroll(s.ctx, { schemeId: scheme.id, partyId: s.party.id, assignId: 'P1', displayName: 'Alpha', tokenAmount: 0, startDate: start } as any);
+    const e2 = await schemes.enroll(s.ctx, { schemeId: scheme.id, partyId: s.party.id, assignId: 'P2', displayName: 'Beta', tokenAmount: 0, startDate: start } as any);
+    await schemes.addPayment(s.ctx, { enrollmentId: e2.id, emiNo: 2, amount: 2000, medium: 'CASH' } as any);
+    const flat = (await schemes.dues(s.ctx, {})) as any[];
+    const months = (await schemes.dues(s.ctx, { perMonth: 'true' })) as any[];
+    expect(months.length).toBe(flat.reduce((a, d) => a + d.emisDue, 0));
+    expect(months.filter((m) => m.assignId === 'P2').map((m) => m.emiNo)).toEqual([1, 3]);
+    expect(((await schemes.dues(s.ctx, { q: 'beta' })) as any[]).map((d) => d.assignId)).toEqual(['P2']);
+  });
+
+  it('day book days: per-day opening/in/out/closing chain to the range totals', async () => {
+    const s = await setup();
+    const scheme = await cashScheme(s.ctx);
+    const e = await schemes.enroll(s.ctx, { schemeId: scheme.id, partyId: s.party.id, assignId: 'D1', displayName: 'C', tokenAmount: 0 } as any);
+    await schemes.addPayment(s.ctx, { enrollmentId: e.id, emiNo: 1, amount: 2000, medium: 'CASH' } as any);
+    const today = new Date();
+    const from = new Date(today.getTime() - 2 * 86_400_000);
+    const book = await schemes.dayBook(s.ctx, { from, to: today });
+    expect(book.days).toHaveLength(3);
+    expect(book.days![0]!.opening).toBe(book.opening);
+    expect(book.days![2]!.closing).toBe(book.closing);
+    expect(book.days![2]!.moneyIn).toBe('2000.00');
+    expect(book.days![2]!.txnCount).toBe(1);
+  });
+
   it('cross-tenant party / scheme → 404', async () => {
     const s = await setup();
     const scheme = await cashScheme(s.ctx);

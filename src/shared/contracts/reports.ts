@@ -60,6 +60,12 @@ export interface GstRegisterRowDto {
   total: string;
   /** TASK-97: effective GST % of the bill ((cgst+sgst+igst)/taxable×100, 2 dp); service fills it */
   gstPercent?: string;
+  /** TASK-97 GST (always filled by the server) */
+  itcEligibility?: 'ELIGIBLE' | 'BLOCKED_17_5' | 'INELIGIBLE';
+  itcBlockReason?: string | null;
+  supplierInvoiceNo?: string | null;
+  supplyCategory?: 'TAXABLE' | 'ZERO_RATED' | 'NIL_EXEMPT' | 'NON_GST';
+  reverseCharge?: boolean;
 }
 export interface HsnSummaryRowDto {
   hsnCode: string;
@@ -144,12 +150,33 @@ export interface Gstr3bDto {
   from: string;
   to: string;
   gstin: string | null;
-  /** 3.1(a) outward taxable supplies (ACTIVE GST sell bills) */
-  outward: TaxCols;
+  /** 3.1(a) outward taxable supplies (ACTIVE GST sell bills, supplyCategory TAXABLE). TASK-97 sub-rows always filled by the server. */
+  outward: TaxCols & {
+    /** 3.1(b) zero-rated */
+    zeroRated?: TaxCols;
+    /** 3.1(c) nil-rated / exempted */
+    nilExempt?: TaxCols;
+    /** 3.1(e) non-GST outward (GST bills marked NON_GST; ROUGH bills stay in top-level nonGst) */
+    nonGst?: TaxCols;
+    /** 3.1(d) inward supplies liable to reverse charge (ACTIVE GST purchase bills with reverseCharge) */
+    reverseCharge?: TaxCols;
+  };
   /** informational: ROUGH sell bills' final */
   nonGst: string;
-  /** 4 ITC: ACTIVE GST purchase bills from parties with a GSTIN */
-  itc: { cgst: string; sgst: string; igst: string };
+  /** 4 ITC: ACTIVE GST purchase bills from parties with a GSTIN (or reverse-charge). Flat cgst/sgst/igst = 4(C) net ITC = eligible. */
+  itc: {
+    cgst: string;
+    sgst: string;
+    igst: string;
+    /** 4(C) net ITC available (itcEligibility ELIGIBLE); 4(A)(5) = eligible + reversed */
+    eligible?: { cgst: string; sgst: string; igst: string };
+    /** 4(B)(1) reversed — blocked under section 17(5) */
+    reversed?: { cgst: string; sgst: string; igst: string };
+    /** 4(D)(2) ineligible ITC (not claimed) */
+    ineligible?: { cgst: string; sgst: string; igst: string };
+    /** taxable value of every counted purchase bill (all eligibility buckets) */
+    taxable?: string;
+  };
   /** Σ output tax − Σ ITC, floored at 0 — the portal does the per-head set-off */
   netPayableIndicative: string;
 }

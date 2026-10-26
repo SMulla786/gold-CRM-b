@@ -24,12 +24,14 @@ export const schemeBody = z
     description: z.string().trim().max(300).optional(),
     /** 0 allowed for an ad-hoc Anjuman (no fixed EMI) */
     emiAmount: decimalInput,
-    tenureMonths: z.coerce.number().int().min(1).max(120),
+    /** ≥1 for SAVING; an ANJUMAN with no EMI may send 0 / omit it (no installment slots, deposits are ad-hoc) */
+    tenureMonths: z.coerce.number().int().min(0).max(120).default(0),
     bonusType: z.enum(SCHEME_BONUS_TYPES).default('NONE'),
     bonusValue: decimalInput.default(0),
     startDate: z.coerce.date(),
     validityDate: z.coerce.date().optional(),
   })
+  .refine((b) => b.kind === 'ANJUMAN' || b.tenureMonths >= 1, { message: 'Tenure must be at least 1 month', path: ['tenureMonths'] })
   .refine((b) => (b.bonusType !== 'PERCENT' && b.bonusType !== 'FIXED') || b.bonusValue > 0, { message: 'Enter the bonus value', path: ['bonusValue'] })
   .refine((b) => b.bonusType !== 'ONE_EMI' || b.emiAmount > 0, { message: 'One-EMI bonus needs an EMI amount', path: ['bonusType'] });
 
@@ -68,6 +70,9 @@ export const enrollmentBody = z.object({
   startDate: z.coerce.date().optional(),
   /** joining token (spec token_amt) → a TOKEN payment, counts toward paid */
   tokenAmount: decimalInput.default(0),
+  /** how the token was paid; TOKEN (default) = cash-in as before. Never takes an EMI slot. ONLINE needs tokenBankAccountId. */
+  tokenMedium: z.enum(SCHEME_PAY_MEDIUMS).optional(),
+  tokenBankAccountId: id.optional(),
   /** "Enroll with EMI pay" */
   firstPayment: schemePaymentInput.optional(),
 });
@@ -89,6 +94,10 @@ export const schemeListQuery = pageQuery.extend({
   kind: z.enum(SCHEME_KINDS).optional(),
   type: z.enum(SCHEME_TYPES).optional(),
   active: z.enum(['true', 'false']).optional(),
+  /** date range on `dateField` (default startDate); inclusive business days */
+  from: z.coerce.date().optional(),
+  to: z.coerce.date().optional(),
+  dateField: z.enum(['startDate', 'createdAt']).optional(),
 });
 export const schemeGroupListQuery = z.object({ schemeId: id.optional() });
 export const enrollmentListQuery = pageQuery.extend({
@@ -96,9 +105,24 @@ export const enrollmentListQuery = pageQuery.extend({
   schemeId: id.optional(),
   groupId: id.optional(),
   partyId: id.optional(),
-  status: z.enum(ENROLLMENT_STATUSES).optional(),
+  /** one status, or a comma list (e.g. WON,WITHDRAWN) */
+  status: z
+    .preprocess((v) => (typeof v === 'string' ? v.split(',').map((s) => s.trim()).filter(Boolean) : v), z.array(z.enum(ENROLLMENT_STATUSES)).min(1))
+    .optional(),
   /** only ACTIVE/WON with an installment due on or before today */
   due: z.enum(['true', 'false']).optional(),
+  /** enrol (start) date range, inclusive */
+  from: z.coerce.date().optional(),
+  to: z.coerce.date().optional(),
+});
+/** GET /app/schemes/dues — perMonth=true returns SchemeDueMonthRowDto[] (one row per unpaid due EMI) */
+export const schemeDuesQuery = z.object({
+  kind: z.enum(SCHEME_KINDS).optional(),
+  schemeId: id.optional(),
+  groupId: id.optional(),
+  /** assign id / member name / party name / mobile */
+  q: z.string().trim().optional(),
+  perMonth: z.enum(['true', 'false']).optional(),
 });
 export const schemeTxnListQuery = pageQuery.extend({
   kind: z.enum(SCHEME_KINDS).optional(),
@@ -215,6 +239,29 @@ export interface SchemeDueRowDto {
   oldestDueDate: string;
 }
 
+/** GET /app/schemes/dues?perMonth=true row — one unpaid installment that is due by today */
+export interface SchemeDueMonthRowDto {
+  enrollmentId: number;
+  assignId: string;
+  party: PartyRefDto;
+  scheme: { id: number; name: string };
+  group: { id: number; name: string } | null;
+  emiNo: number;
+  emiDate: string;
+  amount: string;
+}
+
+/** One business day of the scheme day-book (SCHEME ledger rows on that date; reversals count on their own date) */
+export interface SchemeDayBookDayDto {
+  date: string;
+  opening: string;
+  moneyIn: string;
+  moneyOut: string;
+  closing: string;
+  /** scheme payments dated that day */
+  txnCount: number;
+}
+
 /** GET /app/schemes/day-book — money in/out from SCHEME ledger rows */
 export interface SchemeDayBookDto {
   from: string;
@@ -224,4 +271,5 @@ export interface SchemeDayBookDto {
   moneyOut: string;
   closing: string;
   rows: SchemeTxnRowDto[];
+  days?: SchemeDayBookDayDto[];
 }

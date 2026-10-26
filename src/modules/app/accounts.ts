@@ -6,7 +6,7 @@ import { logActivity } from '../../lib/activity';
 import { HttpError } from '../../middleware/error';
 import type { TenantContext } from '../../middleware/context';
 import { IE_SOURCE_TYPES, LEDGER_ASSETS } from '../../shared';
-import type { AssetTotalsDto, DayBookAllInOneRowDto, DayBookDto, IncomeExpenseDailySummaryDto, IncomeExpenseDto, LedgerAsset, OldMetalSummaryRowDto, LedgerPageDto, LedgerRowDto, LedgerSource, Paged } from '../../shared';
+import type { AssetTotalsDto, DayBookAllInOneRowDto, DayBookDayDto, DayBookDto, IncomeExpenseDailySummaryDto, IncomeExpenseDto, LedgerAsset, OldMetalSummaryRowDto, LedgerPageDto, LedgerRowDto, LedgerSource, Paged } from '../../shared';
 
 type IeSourceType = (typeof IE_SOURCE_TYPES)[number];
 // TASK-81: which ledger sources each IE source-type surfaces. DIRECT = manual income/expense rows.
@@ -185,15 +185,26 @@ export async function incomeExpenseDailySummary(ctx: TenantContext, query: { fro
     sdb.ledgerEntry.groupBy({ by: ['txnDate', 'direction'], where: { ...base, asset: 'MONEY', bankAccountId: null }, _sum: { amount: true } }),
     sdb.ledgerEntry.groupBy({ by: ['txnDate', 'asset', 'direction'], where: { ...base, asset: { in: ['GOLD', 'SILVER'] } }, _sum: { fine: true } }),
   ]);
-  type Day = { cashIn: Prisma.Decimal; cashOut: Prisma.Decimal; moneyIn: Prisma.Decimal; moneyOut: Prisma.Decimal; gold: Prisma.Decimal; silver: Prisma.Decimal };
+  const zero = () => toDec(null);
+  type Day = { cashIn: Prisma.Decimal; cashOut: Prisma.Decimal; moneyIn: Prisma.Decimal; moneyOut: Prisma.Decimal; goldIn: Prisma.Decimal; goldOut: Prisma.Decimal; silverIn: Prisma.Decimal; silverOut: Prisma.Decimal };
   const days = new Map<string, Day>();
-  const day = (d: Date): Day => { const k = dateOnly(d); let e = days.get(k); if (!e) { e = { cashIn: toDec(null), cashOut: toDec(null), moneyIn: toDec(null), moneyOut: toDec(null), gold: toDec(null), silver: toDec(null) }; days.set(k, e); } return e; };
+  const day = (d: Date): Day => { const k = dateOnly(d); let e = days.get(k); if (!e) { e = { cashIn: zero(), cashOut: zero(), moneyIn: zero(), moneyOut: zero(), goldIn: zero(), goldOut: zero(), silverIn: zero(), silverOut: zero() }; days.set(k, e); } return e; };
   for (const r of money) { const e = day(r.txnDate); if (r.direction === 'IN') e.moneyIn = e.moneyIn.plus(toDec(r._sum.amount)); else e.moneyOut = e.moneyOut.plus(toDec(r._sum.amount)); }
   for (const r of cash) { const e = day(r.txnDate); if (r.direction === 'IN') e.cashIn = e.cashIn.plus(toDec(r._sum.amount)); else e.cashOut = e.cashOut.plus(toDec(r._sum.amount)); }
-  for (const r of metal) { const e = day(r.txnDate); const net = r.direction === 'IN' ? toDec(r._sum.fine) : toDec(r._sum.fine).neg(); if (r.asset === 'GOLD') e.gold = e.gold.plus(net); else e.silver = e.silver.plus(net); }
+  for (const r of metal) {
+    const e = day(r.txnDate);
+    const fine = toDec(r._sum.fine);
+    if (r.asset === 'GOLD') { if (r.direction === 'IN') e.goldIn = e.goldIn.plus(fine); else e.goldOut = e.goldOut.plus(fine); }
+    else if (r.direction === 'IN') e.silverIn = e.silverIn.plus(fine);
+    else e.silverOut = e.silverOut.plus(fine);
+  }
   return [...days.entries()]
     .sort(([a], [b]) => (a < b ? 1 : -1))
-    .map(([date, e]) => ({ date, cashIn: e.cashIn.toString(), cashOut: e.cashOut.toString(), profit: e.moneyIn.minus(e.moneyOut).toString(), goldNet: e.gold.toString(), silverNet: e.silver.toString() }));
+    .map(([date, e]) => ({
+      date, cashIn: e.cashIn.toString(), cashOut: e.cashOut.toString(), profit: e.moneyIn.minus(e.moneyOut).toString(),
+      goldNet: e.goldIn.minus(e.goldOut).toString(), silverNet: e.silverIn.minus(e.silverOut).toString(),
+      goldIn: e.goldIn.toString(), goldOut: e.goldOut.toString(), silverIn: e.silverIn.toString(), silverOut: e.silverOut.toString(),
+    }));
 }
 
 export async function updateIncomeExpense(ctx: TenantContext, id: number, body: IeBody): Promise<IncomeExpenseDto> {
@@ -361,7 +372,7 @@ async function decorateLedger(ctx: TenantContext, rows: RawRow[], opening: Prism
 
 // ───────────── Day-Book ─────────────
 
-export async function getDayBook(ctx: TenantContext, query: { from?: Date; to?: Date; source?: LedgerSource }): Promise<DayBookDto> {
+export async function getDayBook(ctx: TenantContext, query: { from?: Date; to?: Date; source?: LedgerSource; groupBy?: 'DATE' }): Promise<DayBookDto> {
   const from = ledger.businessDate(query.from ?? new Date());
   const to = ledger.businessDate(query.to ?? new Date());
   const sdb = scopedDb(ctx);
@@ -405,7 +416,53 @@ export async function getDayBook(ctx: TenantContext, query: { from?: Date; to?: 
     status = row?.status ?? 'OPEN';
   }
 
-  return { from: dateOnly(from), to: dateOnly(to), totals, bySource, status };
+  const days = query.groupBy === 'DATE' ? await dayBookDays(ctx, scope, from, to, open) : undefined;
+  return { from: dateOnly(from), to: dateOnly(to), totals, bySource, status, ...(days ? { days } : {}) };
+}
+
+const DAY_MS = 86_400_000;
+const MAX_DAYS = 62;
+
+/** TASK-97: one opening/in/out/closing row per business day in [from, to] (each day's opening = previous closing), newest first.
+ *  Long ranges are trimmed to the last MAX_DAYS days ending at `to` (opening carried in from before that window). */
+async function dayBookDays(ctx: TenantContext, scope: any, from: Date, to: Date, openBeforeFrom: any[]): Promise<DayBookDayDto[]> {
+  const sdb = scopedDb(ctx);
+  const start = new Date(Math.max(from.getTime(), to.getTime() - (MAX_DAYS - 1) * DAY_MS));
+  const sum = { _sum: { amount: true, fine: true, pcs: true } } as const;
+  const [gap, perDay, closed] = await Promise.all([
+    // movements between `from` and the trimmed window start roll into the first day's opening
+    start.getTime() > from.getTime()
+      ? sdb.ledgerEntry.groupBy({ by: ['asset', 'direction'], where: { ...scope, txnDate: { gte: from, lt: start } }, ...sum })
+      : Promise.resolve([] as any[]),
+    sdb.ledgerEntry.groupBy({ by: ['txnDate', 'asset', 'direction'], where: { ...scope, txnDate: { gte: start, lte: to } }, ...sum }),
+    ctx.activeBranchId != null
+      ? sdb.dayBook.findMany({ where: { branchId: ctx.activeBranchId, date: { gte: start, lte: to } }, select: { date: true, status: true } })
+      : Promise.resolve([] as { date: Date; status: 'OPEN' | 'CLOSED' }[]),
+  ]);
+  const statusOf = new Map(closed.map((d) => [dateOnly(d.date), d.status]));
+  const val = (g: any, asset: LedgerAsset) => new Prisma.Decimal(g._sum[UNIT[asset]] ?? 0);
+  const signed = (groups: any[], asset: LedgerAsset) =>
+    groups.filter((g) => g.asset === asset).reduce((a, g) => (g.direction === 'IN' ? a.plus(val(g, asset)) : a.minus(val(g, asset))), new Prisma.Decimal(0));
+
+  const running = new Map(LEDGER_ASSETS.map((a) => [a, signed(openBeforeFrom, a).plus(signed(gap, a))]));
+  const out: DayBookDayDto[] = [];
+  for (let t = start.getTime(); t <= to.getTime(); t += DAY_MS) {
+    const key = dateOnly(new Date(t));
+    const rows = perDay.filter((g) => dateOnly(g.txnDate) === key);
+    out.push({
+      date: key,
+      status: ctx.activeBranchId != null ? (statusOf.get(key) ?? 'OPEN') : null,
+      totals: LEDGER_ASSETS.map((asset) => {
+        const opening = running.get(asset)!;
+        const inSum = rows.filter((g) => g.asset === asset && g.direction === 'IN').reduce((a, g) => a.plus(val(g, asset)), new Prisma.Decimal(0));
+        const outSum = rows.filter((g) => g.asset === asset && g.direction === 'OUT').reduce((a, g) => a.plus(val(g, asset)), new Prisma.Decimal(0));
+        const closing = opening.plus(inSum).minus(outSum);
+        running.set(asset, closing);
+        return { asset, opening: opening.toString(), in: inSum.toString(), out: outSum.toString(), closing: closing.toString() };
+      }),
+    });
+  }
+  return out.reverse();
 }
 
 /** TASK-90: Day-Book "All-in-One" — one row per (source, sourceId, txnDate) document with every asset's IN/OUT side by side.

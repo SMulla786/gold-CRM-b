@@ -18,6 +18,10 @@ export const DISCOUNT_UNITS = ['FIXED', 'PERCENT'] as const;
 export const BILL_PAYMENT_MODES = ['CASH', 'ONLINE', 'METAL'] as const;
 /** Cash received on one sell bill at or above this needs the party's PAN (Income-tax 269ST / PAN rule). */
 export const PAN_CASH_LIMIT = 200000;
+/** TASK-97 GST: purchase ITC eligibility (GSTR-3B 4(A)/4(B)(1) 17(5) reversal/4(D)(2)) */
+export const ITC_ELIGIBILITY = ['ELIGIBLE', 'BLOCKED_17_5', 'INELIGIBLE'] as const;
+/** TASK-97 GST: sell supply category (GSTR-3B 3.1(a) TAXABLE, (b) ZERO_RATED, (c) NIL_EXEMPT, (e) NON_GST) */
+export const GST_SUPPLY_CATEGORIES = ['TAXABLE', 'ZERO_RATED', 'NIL_EXEMPT', 'NON_GST'] as const;
 
 const weight = z.coerce.number().finite().min(0).max(1_000_000);
 
@@ -94,6 +98,14 @@ export const billBody = z
     draftId: id.optional(),
     /** SELL delivering a customer order (Phase 8): its RESERVED finished pieces may be sold; order → DELIVERED in the same tx */
     orderId: id.optional(),
+    /** TASK-97 GST (reporting only, no calc/posting effect). Omitted → ELIGIBLE / TAXABLE / false on create, unchanged on edit. */
+    itcEligibility: z.enum(ITC_ELIGIBILITY).optional(),
+    itcBlockReason: z.string().trim().max(200).optional(),
+    /** PURCHASE: supplier's own invoice no. — GSTR-2B match key */
+    supplierInvoiceNo: z.string().trim().max(40).optional(),
+    supplyCategory: z.enum(GST_SUPPLY_CATEGORIES).optional(),
+    /** PURCHASE: inward supply liable to reverse charge (GSTR-3B 3.1(d)) */
+    reverseCharge: z.boolean().optional(),
   })
   .refine((b) => b.items.every((r) => r.less <= r.gross), { message: 'less cannot exceed gross', path: ['items'] })
   .refine((b) => b.keepBalanceAs === 'MONEY' || (b.keepRate ?? 0) > 0, { message: 'Enter the rate to keep the balance in metal', path: ['keepRate'] });
@@ -205,6 +217,12 @@ export interface BillDto extends BillListItemDto {
   keepRate: string | null;
   remark: string | null;
   deletedWithStock: boolean | null;
+  /** TASK-97 GST (always filled by the server) */
+  itcEligibility?: (typeof ITC_ELIGIBILITY)[number];
+  itcBlockReason?: string | null;
+  supplierInvoiceNo?: string | null;
+  supplyCategory?: (typeof GST_SUPPLY_CATEGORIES)[number];
+  reverseCharge?: boolean;
   items: BillLineDto[];
   payments: BillPaymentDto[];
 }

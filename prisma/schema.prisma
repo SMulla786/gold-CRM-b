@@ -917,47 +917,53 @@ model DocSequence {
 }
 
 model Bill {
-  id               Int           @id @default(autoincrement())
-  businessId       Int
-  branchId         Int
-  kind             BillKind
-  billType         BillType
+  id                Int               @id @default(autoincrement())
+  businessId        Int
+  branchId          Int
+  kind              BillKind
+  billType          BillType
   /// formatted per invoice settings, e.g. INV/2026-27/00001
-  billNo           String
-  seq              Int
-  partyId          Int
-  billDate         DateTime      @db.Date
-  dueDate          DateTime?     @db.Date
+  billNo            String
+  seq               Int
+  partyId           Int
+  billDate          DateTime          @db.Date
+  dueDate           DateTime?         @db.Date
   /// GST computed as IGST (party state differs from branch/business state)
-  interState       Boolean       @default(false)
-  sub              Decimal       @db.Decimal(14, 2)
-  discount         Decimal       @default(0) @db.Decimal(14, 2)
-  discountUnit     DiscountUnit  @default(FIXED)
-  discountAmount   Decimal       @default(0) @db.Decimal(14, 2)
-  gstPercent       Decimal       @default(0) @db.Decimal(5, 2)
-  taxable          Decimal       @db.Decimal(14, 2)
-  cgst             Decimal       @default(0) @db.Decimal(14, 2)
-  sgst             Decimal       @default(0) @db.Decimal(14, 2)
-  igst             Decimal       @default(0) @db.Decimal(14, 2)
-  total            Decimal       @db.Decimal(14, 2)
-  round            Decimal       @default(0) @db.Decimal(8, 2)
-  final            Decimal       @db.Decimal(14, 2)
+  interState        Boolean           @default(false)
+  sub               Decimal           @db.Decimal(14, 2)
+  discount          Decimal           @default(0) @db.Decimal(14, 2)
+  discountUnit      DiscountUnit      @default(FIXED)
+  discountAmount    Decimal           @default(0) @db.Decimal(14, 2)
+  gstPercent        Decimal           @default(0) @db.Decimal(5, 2)
+  /// TASK-97 GST: ITC eligibility (purchase), supplier's own invoice no (2B match key), supply category, RCM
+  itcEligibility    ItcEligibility    @default(ELIGIBLE)
+  itcBlockReason    String?
+  supplierInvoiceNo String?
+  supplyCategory    GstSupplyCategory @default(TAXABLE)
+  reverseCharge     Boolean           @default(false)
+  taxable           Decimal           @db.Decimal(14, 2)
+  cgst              Decimal           @default(0) @db.Decimal(14, 2)
+  sgst              Decimal           @default(0) @db.Decimal(14, 2)
+  igst              Decimal           @default(0) @db.Decimal(14, 2)
+  total             Decimal           @db.Decimal(14, 2)
+  round             Decimal           @default(0) @db.Decimal(8, 2)
+  final             Decimal           @db.Decimal(14, 2)
   /// sum of active payments (money value), kept in step with every payment add/reverse
-  paid             Decimal       @default(0) @db.Decimal(14, 2)
-  keepBalanceAs    KeepBalanceAs @default(MONEY)
+  paid              Decimal           @default(0) @db.Decimal(14, 2)
+  keepBalanceAs     KeepBalanceAs     @default(MONEY)
   /// rate per rate-unit used to convert the balance to metal (GOLD/SILVER keep)
-  keepRate         Decimal?      @db.Decimal(14, 2)
-  keepWeight       Decimal?      @db.Decimal(14, 3)
-  remark           String?
-  status           BillStatus    @default(ACTIVE)
+  keepRate          Decimal?          @db.Decimal(14, 2)
+  keepWeight        Decimal?          @db.Decimal(14, 3)
+  remark            String?
+  status            BillStatus        @default(ACTIVE)
   /// set on delete: true = stock returned (sell: AVAILABLE again, purchase: DELETED)
-  deletedWithStock Boolean?
-  deletedAt        DateTime?
-  createdById      Int?
-  createdAt        DateTime      @default(now())
-  updatedAt        DateTime      @updatedAt
-  items            BillItem[]
-  payments         BillPayment[]
+  deletedWithStock  Boolean?
+  deletedAt         DateTime?
+  createdById       Int?
+  createdAt         DateTime          @default(now())
+  updatedAt         DateTime          @updatedAt
+  items             BillItem[]
+  payments          BillPayment[]
 
   @@unique([businessId, branchId, kind, billType, billNo])
   @@index([businessId, branchId, kind, billDate])
@@ -1278,6 +1284,8 @@ model Order {
   isUrgent     Boolean        @default(false)
   designUrl    String?
   remark       String?
+  /// TASK-97 order-level misc charges (Rs), added to estTotal
+  miscCharges  Decimal        @default(0) @db.Decimal(14, 2)
   status       OrderStatus    @default(PENDING)
   estTotal     Decimal        @default(0) @db.Decimal(14, 2)
   /// money value of active advances
@@ -1295,36 +1303,40 @@ model Order {
 }
 
 model OrderItem {
-  id             Int             @id @default(autoincrement())
-  orderId        Int
-  itemNameId     Int
-  metal          MetalKind
-  karatCode      String?
-  touch          Decimal         @db.Decimal(6, 3)
-  size           String?
-  pcs            Int             @default(1)
-  gross          Decimal         @db.Decimal(14, 3)
-  less           Decimal         @default(0) @db.Decimal(14, 3)
-  net            Decimal         @db.Decimal(14, 3)
-  wastage        Decimal         @default(0) @db.Decimal(6, 3)
-  fine           Decimal         @db.Decimal(14, 3)
-  making         Decimal         @default(0) @db.Decimal(12, 2)
-  makingUnit     ChargeUnit      @default(PER_GRAM)
-  other          Decimal         @default(0) @db.Decimal(14, 2)
-  estTotal       Decimal         @default(0) @db.Decimal(14, 2)
-  remark         String?
-  status         OrderItemStatus @default(PENDING)
-  karigarIssueId Int?
+  id              Int             @id @default(autoincrement())
+  orderId         Int
+  itemNameId      Int
+  metal           MetalKind
+  karatCode       String?
+  touch           Decimal         @db.Decimal(6, 3)
+  size            String?
+  pcs             Int             @default(1)
+  gross           Decimal         @db.Decimal(14, 3)
+  less            Decimal         @default(0) @db.Decimal(14, 3)
+  net             Decimal         @db.Decimal(14, 3)
+  wastage         Decimal         @default(0) @db.Decimal(6, 3)
+  fine            Decimal         @db.Decimal(14, 3)
+  making          Decimal         @default(0) @db.Decimal(12, 2)
+  makingUnit      ChargeUnit      @default(PER_GRAM)
+  other           Decimal         @default(0) @db.Decimal(14, 2)
+  /// TASK-97: flat labour Rs per line, wastage in grams, jewellery type
+  labour          Decimal         @default(0) @db.Decimal(12, 2)
+  wastageGm       Decimal         @default(0) @db.Decimal(14, 3)
+  jewelleryTypeId Int?
+  estTotal        Decimal         @default(0) @db.Decimal(14, 2)
+  remark          String?
+  status          OrderItemStatus @default(PENDING)
+  karigarIssueId  Int?
   /// finished piece created on karigar receive (StockItem RESERVED, source ORDER_RECEIVE)
-  stockItemId    Int?
-  returnedGross  Decimal?        @db.Decimal(14, 3)
-  returnedNet    Decimal?        @db.Decimal(14, 3)
-  returnedFine   Decimal?        @db.Decimal(14, 3)
+  stockItemId     Int?
+  returnedGross   Decimal?        @db.Decimal(14, 3)
+  returnedNet     Decimal?        @db.Decimal(14, 3)
+  returnedFine    Decimal?        @db.Decimal(14, 3)
   /// fine weight the karigar is allowed to lose (ghat)
-  ghatAllowance  Decimal?        @db.Decimal(14, 3)
-  karigarLabour  Decimal?        @db.Decimal(12, 2)
-  receivedAt     DateTime?
-  order          Order           @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  ghatAllowance   Decimal?        @db.Decimal(14, 3)
+  karigarLabour   Decimal?        @db.Decimal(12, 2)
+  receivedAt      DateTime?
+  order           Order           @relation(fields: [orderId], references: [id], onDelete: Cascade)
 
   @@index([orderId])
   @@index([karigarIssueId])
@@ -1361,23 +1373,25 @@ enum KarigarIssueStatus {
 
 /// Work + material handed to a karigar (Party type KARIGAR) for one or more order items.
 model KarigarIssue {
-  id            Int                @id @default(autoincrement())
-  businessId    Int
-  branchId      Int
-  issueNo       Int
-  karigarId     Int
-  issueDate     DateTime           @db.Date
-  dueDate       DateTime?          @db.Date
-  goldFine      Decimal            @default(0) @db.Decimal(14, 3)
-  silverFine    Decimal            @default(0) @db.Decimal(14, 3)
-  cash          Decimal            @default(0) @db.Decimal(14, 2)
-  online        Decimal            @default(0) @db.Decimal(14, 2)
-  bankAccountId Int?
-  remark        String?
-  status        KarigarIssueStatus @default(OPEN)
-  createdById   Int?
-  createdAt     DateTime           @default(now())
-  updatedAt     DateTime           @updatedAt
+  id             Int                @id @default(autoincrement())
+  businessId     Int
+  branchId       Int
+  issueNo        Int
+  karigarId      Int
+  issueDate      DateTime           @db.Date
+  dueDate        DateTime?          @db.Date
+  goldFine       Decimal            @default(0) @db.Decimal(14, 3)
+  silverFine     Decimal            @default(0) @db.Decimal(14, 3)
+  cash           Decimal            @default(0) @db.Decimal(14, 2)
+  online         Decimal            @default(0) @db.Decimal(14, 2)
+  bankAccountId  Int?
+  remark         String?
+  wastagePercent Decimal?           @db.Decimal(6, 3)
+  wastageGm      Decimal?           @db.Decimal(14, 3)
+  status         KarigarIssueStatus @default(OPEN)
+  createdById    Int?
+  createdAt      DateTime           @default(now())
+  updatedAt      DateTime           @updatedAt
 
   @@unique([businessId, branchId, issueNo])
   @@index([businessId, karigarId])
@@ -1414,6 +1428,8 @@ model RepairTicket {
   net            Decimal?       @db.Decimal(14, 3)
   karatCode      String?
   hallmark       String?
+  purity         Decimal?       @db.Decimal(5, 2)
+  subCategory    String?
   photoUrl       String?
   expectedDate   DateTime       @db.Date
   priority       RepairPriority @default(NORMAL)
@@ -1429,6 +1445,7 @@ model RepairTicket {
   addedMetal     MetalKind?
   addedFine      Decimal?       @db.Decimal(14, 3)
   addedRate      Decimal?       @db.Decimal(14, 2)
+  addedKaratCode String?
   deliveryCash   Decimal?       @db.Decimal(14, 2)
   deliveryOnline Decimal?       @db.Decimal(14, 2)
   deliveryBankId Int?
@@ -1756,29 +1773,34 @@ model BuySellLine {
 }
 
 model BhavBooking {
-  id            Int        @id @default(autoincrement())
+  id            Int               @id @default(autoincrement())
   businessId    Int
   branchId      Int
   bookingNo     Int
   side          TradeSide
   partyId       Int
   metal         MetalKind
-  txnDate       DateTime   @db.Date
-  weight        Decimal    @db.Decimal(14, 3)
+  txnDate       DateTime          @db.Date
+  weight        Decimal           @db.Decimal(14, 3)
   /// settings units, locked
-  rate          Decimal    @db.Decimal(14, 2)
-  amount        Decimal    @db.Decimal(14, 2)
+  rate          Decimal           @db.Decimal(14, 2)
+  amount        Decimal           @db.Decimal(14, 2)
   /// advance received (party credit until delivered)
-  cash          Decimal    @default(0) @db.Decimal(14, 2)
-  online        Decimal    @default(0) @db.Decimal(14, 2)
+  cash          Decimal           @default(0) @db.Decimal(14, 2)
+  online        Decimal           @default(0) @db.Decimal(14, 2)
   bankAccountId Int?
   /// weight − delivered via buy-sell
-  pendingWeight Decimal    @db.Decimal(14, 3)
-  status        BhavStatus @default(PENDING)
+  pendingWeight Decimal           @db.Decimal(14, 3)
+  status        BhavStatus        @default(PENDING)
+  /// TASK-97: ONLY_ENTRY = no ledger/udhar posting for the advance
+  entryType     BhavEntryType     @default(LEDGER)
+  verifiedAt    DateTime?
+  verifiedById  Int?
+  lines         BhavBookingLine[]
   narration     String?
   createdById   Int?
-  createdAt     DateTime   @default(now())
-  updatedAt     DateTime   @updatedAt
+  createdAt     DateTime          @default(now())
+  updatedAt     DateTime          @updatedAt
 
   @@unique([businessId, branchId, bookingNo])
   @@index([businessId, branchId, status])
@@ -1937,4 +1959,100 @@ model PermissionEnquiry {
 
   @@index([businessId, status])
   @@index([userId, permissionId, status])
+}
+
+// ───────────── TASK-97 (developer1) additive models ─────────────
+
+enum BhavEntryType {
+  LEDGER
+  ONLY_ENTRY
+}
+
+enum ItcEligibility {
+  ELIGIBLE
+  BLOCKED_17_5
+  INELIGIBLE
+}
+
+enum GstSupplyCategory {
+  TAXABLE
+  ZERO_RATED
+  NIL_EXEMPT
+  NON_GST
+}
+
+/// Optional weight/rate rows of a bhav booking; booking.weight/amount are their sums.
+model BhavBookingLine {
+  id        Int         @id @default(autoincrement())
+  bookingId Int
+  weight    Decimal     @db.Decimal(14, 3)
+  rate      Decimal     @db.Decimal(14, 2)
+  amount    Decimal     @db.Decimal(14, 2)
+  booking   BhavBooking @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+
+  @@index([bookingId])
+}
+
+/// Split payment rows for trade docs (EXCHANGE | BUY_SELL | BHAV); totals still live on the doc.
+model TradePayment {
+  id            Int             @id @default(autoincrement())
+  businessId    Int
+  docType       String
+  docId         Int
+  mode          BillPaymentMode
+  amount        Decimal         @db.Decimal(14, 2)
+  bankAccountId Int?
+  reference     String?
+  createdAt     DateTime        @default(now())
+
+  @@index([businessId, docType, docId])
+}
+
+model TagTemplate {
+  id          Int          @id @default(autoincrement())
+  businessId  Int
+  name        String
+  widthMm     Decimal      @db.Decimal(6, 2)
+  heightMm    Decimal      @db.Decimal(6, 2)
+  shape       String       @default("RECT")
+  direction   String       @default("HORIZONTAL")
+  neckWidthMm Decimal?     @db.Decimal(6, 2)
+  elements    Json
+  appliesTo   StockClass[]
+  isActive    Boolean      @default(false)
+  createdById Int?
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+
+  @@index([businessId])
+}
+
+model SetStockLog {
+  id         Int      @id @default(autoincrement())
+  businessId Int
+  branchId   Int
+  card       String
+  oldBalance Decimal  @db.Decimal(16, 3)
+  newBalance Decimal  @db.Decimal(16, 3)
+  remarks    String?
+  userId     Int?
+  createdAt  DateTime @default(now())
+
+  @@index([businessId, createdAt])
+}
+
+model RepairConsumable {
+  id           Int      @id @default(autoincrement())
+  businessId   Int
+  branchId     Int
+  name         String
+  category     String?
+  unit         String   @default("pcs")
+  currentStock Decimal  @default(0) @db.Decimal(14, 3)
+  minLevel     Decimal  @default(0) @db.Decimal(14, 3)
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@index([businessId, branchId])
 }

@@ -7,7 +7,7 @@ import { logActivity } from '../../../lib/activity';
 import { HttpError } from '../../../middleware/error';
 import type { TenantContext } from '../../../middleware/context';
 import { moneyToMetal, schemeMaturity } from '../../../shared';
-import type { SchemeDto, SchemeGroupDto, EnrollmentDto, EnrollmentDetailDto, SchemePaymentDto, SchemeDueRowDto, SchemeTxnRowDto, SchemeDayBookDto } from '../../../shared';
+import type { SchemeDto, SchemeGroupDto, EnrollmentDto, EnrollmentDetailDto, SchemePaymentDto, SchemeDueRowDto, SchemeDueMonthRowDto, SchemeTxnRowDto, SchemeDayBookDto, SchemeDayBookDayDto } from '../../../shared';
 import { currentRates } from '../service';
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -31,14 +31,34 @@ function emiDateFor(start: Date, emiNo: number): Date {
 /** Unpaid installments due on/before `today` + the next unpaid slot. Shared by buildEnrollment and the 'due' list filter. */
 function emiSchedule(start: Date, tenure: number, paidSlots: Set<number | null>, today: Date) {
   let emisDue = 0, nextEmiNo: number | null = null, nextEmiDate: string | null = null;
+  const dueEmis: { emiNo: number; emiDate: string }[] = []; // the unpaid due slots themselves (dues perMonth view)
   for (let m = 1; m <= tenure; m++) {
     if (paidSlots.has(m)) continue;
     const d = emiDateFor(start, m);
     if (nextEmiNo == null) { nextEmiNo = m; nextEmiDate = d.toISOString().slice(0, 10); }
-    if (d.getTime() <= today.getTime()) emisDue++;
+    if (d.getTime() <= today.getTime()) { emisDue++; dueEmis.push({ emiNo: m, emiDate: d.toISOString().slice(0, 10) }); }
   }
-  return { emisDue, nextEmiNo, nextEmiDate };
+  return { emisDue, nextEmiNo, nextEmiDate, dueEmis };
 }
+/** Non-reversed paid EMI slots per enrollment, in one query. */
+async function paidSlotsFor(ids: number[]): Promise<Map<number, Set<number | null>>> {
+  const slots = new Map<number, Set<number | null>>();
+  if (ids.length === 0) return slots;
+  const paid = await prisma.schemePayment.findMany({ where: { enrollmentId: { in: ids }, emiNo: { not: null }, isReversed: false }, select: { enrollmentId: true, emiNo: true } });
+  for (const p of paid) {
+    if (!slots.has(p.enrollmentId)) slots.set(p.enrollmentId, new Set());
+    slots.get(p.enrollmentId)!.add(p.emiNo);
+  }
+  return slots;
+}
+const IST_OFFSET_MS = 330 * 60_000;
+/** Inclusive business-day range on a timestamp column: [from 00:00 IST, to+1 00:00 IST). */
+const istDayRange = (from?: Date, to?: Date) => ({
+  ...(from ? { gte: new Date(dateOnly(from).getTime() - IST_OFFSET_MS) } : {}),
+  ...(to ? { lt: new Date(dateOnly(to).getTime() - IST_OFFSET_MS + 86_400_000) } : {}),
+});
+/** Inclusive range on a @db.Date column. */
+const dateColRange = (from?: Date, to?: Date) => ({ ...(from ? { gte: dateOnly(from) } : {}), ...(to ? { lte: dateOnly(to) } : {}) });
 const todayGoldRate = async (ctx: TenantContext) => Number((await currentRates(ctx)).gold.rows[0]?.sellRate ?? 0);
 const isP2002 = (e: unknown) => e instanceof Prisma.PrismaClientKnownRequestError && e.code === 'P2002';
 
@@ -68,6 +88,7 @@ export async function listSchemes(ctx: TenantContext, q: any): Promise<{ items: 
   const where = {
     ...(q.kind ? { kind: q.kind } : {}), ...(q.type ? { type: q.type } : {}), ...(q.active ? { isActive: q.active === 'true' } : {}),
     ...(q.q ? { name: { contains: q.q, mode: 'insensitive' as const } } : {}),
+    ...(q.from || q.to ? (q.dateField === 'createdAt' ? { createdAt: istDayRange(q.from, q.to) } : { startDate: dateColRange(q.from, q.to) }) : {}),
   };
   const [rows, total] = await Promise.all([
     sdb.scheme.findMany({ where, orderBy: { id: 'desc' }, skip: (q.page - 1) * q.pageSize, take: q.pageSize, select: { id: true } }),
@@ -123,6 +144,7 @@ export async function enroll(ctx: TenantContext, body: any): Promise<EnrollmentD
   if (!scheme) throw new HttpError(404, 'NOT_FOUND', 'Scheme not found');
   if (!scheme.isActive) throw new HttpError(409, 'CONFLICT', 'Scheme is not active');
   if (!(await sdb.party.findUnique({ where: { id: body.partyId } }))) throw new HttpError(404, 'NOT_FOUND', 'Party not found');
+  if (Number(body.tokenAmount) > 0 && body.tokenMedium === 'ONLINE' && body.tokenBankAccountId == null) throw new HttpError(400, 'VALIDATION', 'Select a bank account for the token');
   const goldRate = scheme.type === 'GOLD' ? await todayGoldRate(ctx) : 0;
 
   const enrollmentId = await prisma.$transaction(async (tx) => {
@@ -148,20 +170,28 @@ export async function enroll(ctx: TenantContext, body: any): Promise<EnrollmentD
       if (isP2002(e)) throw new HttpError(409, 'CONFLICT', 'That assign id is already used in this scheme');
       throw e;
     }
-    if (Number(body.tokenAmount) > 0) await postPayment(tx, ctx, enrollment, scheme, { amount: body.tokenAmount, medium: 'TOKEN' }, goldRate);
+    if (Number(body.tokenAmount) > 0) {
+      const tokenMedium = body.tokenMedium ?? 'TOKEN';
+      // a token paid by another medium posts like an EMI of that medium (ledger/bank), but never takes an installment slot
+      const token = tokenMedium === 'TOKEN'
+        ? { amount: body.tokenAmount, medium: 'TOKEN' }
+        : { amount: body.tokenAmount, medium: tokenMedium, bankAccountId: tokenMedium === 'ONLINE' ? body.tokenBankAccountId : undefined, remark: 'Joining token', noSlot: true };
+      await postPayment(tx, ctx, enrollment, scheme, token, goldRate);
+    }
     if (body.firstPayment) await postPayment(tx, ctx, enrollment, scheme, body.firstPayment, goldRate);
     return enrollment.id;
   });
   return getEnrollment(ctx, enrollmentId);
 }
 
-/** Core payment post, used by enroll (token/first) and addPayment — assumes enrollment/scheme already validated + scoped. */
+/** Core payment post, used by enroll (token/first) and addPayment — assumes enrollment/scheme already validated + scoped.
+ * `input.noSlot` (internal only, set by enroll for a non-TOKEN-medium joining token) skips the installment slot. */
 async function postPayment(tx: Prisma.TransactionClient, ctx: TenantContext, enrollment: any, scheme: any, input: any, goldRate: number) {
   const medium = input.medium ?? 'CASH';
   // emiNo: TOKEN never takes a slot; EMI schemes assign given-or-lowest-unpaid 1..tenure
   let emiNo: number | null = null;
   let emiDate: Date | null = null;
-  if (medium !== 'TOKEN' && scheme.tenureMonths > 0) {
+  if (medium !== 'TOKEN' && !input.noSlot && scheme.tenureMonths > 0) {
     if (input.emiNo != null) {
       if (input.emiNo > scheme.tenureMonths) throw new HttpError(400, 'VALIDATION', 'EMI number exceeds the tenure');
       emiNo = input.emiNo;
@@ -274,16 +304,9 @@ export async function listEnrollments(ctx: TenantContext, q: any): Promise<{ ite
     // 'Due today' depends on startDate + tenure + paid slots (and emiDateFor's JS month roll-over), which has no clean SQL form.
     // So filter the FULL matching set on a light projection first, then page in memory: total and page count stay correct.
     // Contract: only ACTIVE/WON are "due" unless the caller picked a status.
-    const where = await enrollmentWhere(ctx, q.status ? q : { ...q, status: { in: ['ACTIVE', 'WON'] } });
+    const where = await enrollmentWhere(ctx, q.status ? q : { ...q, status: ['ACTIVE', 'WON'] });
     const all = await prisma.schemeEnrollment.findMany({ where, orderBy: { id: 'desc' }, select: { id: true, startDate: true, scheme: { select: { tenureMonths: true } } } });
-    const paid = all.length
-      ? await prisma.schemePayment.findMany({ where: { enrollmentId: { in: all.map((e) => e.id) }, emiNo: { not: null }, isReversed: false }, select: { enrollmentId: true, emiNo: true } })
-      : [];
-    const slots = new Map<number, Set<number | null>>();
-    for (const p of paid) {
-      if (!slots.has(p.enrollmentId)) slots.set(p.enrollmentId, new Set());
-      slots.get(p.enrollmentId)!.add(p.emiNo);
-    }
+    const slots = await paidSlotsFor(all.map((e) => e.id));
     const today = ledger.businessDate();
     const dueIds = all.filter((e) => emiSchedule(e.startDate, e.scheme.tenureMonths, slots.get(e.id) ?? new Set(), today).emisDue > 0).map((e) => e.id);
     const items = await build(dueIds.slice((q.page - 1) * q.pageSize, q.page * q.pageSize));
@@ -303,11 +326,23 @@ export async function getEnrollment(ctx: TenantContext, id: number): Promise<Enr
   return dto as EnrollmentDetailDto;
 }
 
-export async function dues(ctx: TenantContext, q: any): Promise<SchemeDueRowDto[]> {
-  const where = { businessId: ctx.businessId!, branchId: { in: branchScope(ctx) }, status: { in: ['ACTIVE', 'WON'] as any }, ...(q.schemeId ? { schemeId: q.schemeId } : {}), ...(q.groupId ? { groupId: q.groupId } : {}), ...(q.kind ? { scheme: { kind: q.kind } } : {}) };
+export async function dues(ctx: TenantContext, q: any): Promise<SchemeDueRowDto[] | SchemeDueMonthRowDto[]> {
+  const kw = typeof q.q === 'string' ? q.q.trim() : '';
+  const where = {
+    businessId: ctx.businessId!, branchId: { in: branchScope(ctx) }, status: { in: ['ACTIVE', 'WON'] as any }, ...(q.schemeId ? { schemeId: q.schemeId } : {}), ...(q.groupId ? { groupId: q.groupId } : {}), ...(q.kind ? { scheme: { kind: q.kind } } : {}),
+    ...(kw ? enrollmentKeyword(kw, await partyIdsMatching(ctx, kw)) : {}),
+  };
   const rows = await prisma.schemeEnrollment.findMany({ where, select: { id: true } });
-  const built = await Promise.all(rows.map((r) => buildEnrollment(ctx, r.id, false)));
-  return built.filter((e): e is EnrollmentDto => !!e && e.emisDue > 0).map((e) => ({
+  const built = (await Promise.all(rows.map((r) => buildEnrollment(ctx, r.id, false)))).filter((e): e is EnrollmentDto => !!e && e.emisDue > 0);
+  if (q.perMonth === 'true') {
+    // one row per unpaid due slot — same emiSchedule() as emisDue, so the month count always equals emisDue
+    const slots = await paidSlotsFor(built.map((e) => e.id));
+    const today = ledger.businessDate();
+    return built.flatMap((e) => emiSchedule(new Date(`${e.startDate}T00:00:00Z`), e.scheme.tenureMonths, slots.get(e.id) ?? new Set(), today).dueEmis.map((m) => ({
+      enrollmentId: e.id, assignId: e.assignId, party: e.party, scheme: { id: e.scheme.id, name: e.scheme.name }, group: e.group, emiNo: m.emiNo, emiDate: m.emiDate, amount: e.emiAmount,
+    })));
+  }
+  return built.map((e) => ({
     enrollmentId: e.id, assignId: e.assignId, displayName: e.displayName, party: e.party, scheme: { id: e.scheme.id, name: e.scheme.name }, group: e.group,
     emiAmount: e.emiAmount, emisDue: e.emisDue, dueAmount: money(D(e.emiAmount).times(e.emisDue)), oldestDueDate: e.nextEmiDate ?? '',
   }));
@@ -330,14 +365,36 @@ export async function dayBook(ctx: TenantContext, q: any): Promise<SchemeDayBook
   const ledgerWhere = { source: 'SCHEME' as const, asset: 'MONEY' as const };
   const [before, inRange] = await Promise.all([
     sdb.ledgerEntry.findMany({ where: { ...ledgerWhere, txnDate: { lt: from } }, select: { direction: true, amount: true } }),
-    sdb.ledgerEntry.findMany({ where: { ...ledgerWhere, txnDate: { gte: from, lte: to } }, select: { direction: true, amount: true } }),
+    sdb.ledgerEntry.findMany({ where: { ...ledgerWhere, txnDate: { gte: from, lte: to } }, select: { direction: true, amount: true, txnDate: true } }),
   ]);
   const net = (rows: { direction: string; amount: Prisma.Decimal | null }[]) => rows.reduce((s, r) => (r.direction === 'IN' ? s.plus(r.amount ?? 0) : s.minus(r.amount ?? 0)), new Prisma.Decimal(0));
   const opening = net(before);
   const moneyIn = inRange.filter((r) => r.direction === 'IN').reduce((s, r) => s.plus(r.amount ?? 0), new Prisma.Decimal(0));
   const moneyOut = inRange.filter((r) => r.direction === 'OUT').reduce((s, r) => s.plus(r.amount ?? 0), new Prisma.Decimal(0));
   const txnRows = await prisma.schemePayment.findMany({ where: { ...txnWhere(ctx, { kind: q.kind }), txnDate: { gte: from, lte: to } }, orderBy: { id: 'desc' }, include: txnInclude });
-  return { from: from.toISOString().slice(0, 10), to: to.toISOString().slice(0, 10), opening: money(opening), moneyIn: money(moneyIn), moneyOut: money(moneyOut), closing: money(opening.plus(moneyIn).minus(moneyOut)), rows: await decorateTxns(ctx, txnRows) };
+  const days = dayBreakdown(from, to, opening, inRange, txnRows.map((t) => t.txnDate));
+  return { from: from.toISOString().slice(0, 10), to: to.toISOString().slice(0, 10), opening: money(opening), moneyIn: money(moneyIn), moneyOut: money(moneyOut), closing: money(opening.plus(moneyIn).minus(moneyOut)), rows: await decorateTxns(ctx, txnRows), days };
+}
+
+/** Per-day opening/in/out/closing over [from, to] from the same in-range SCHEME ledger rows (each row on its own txnDate). */
+function dayBreakdown(from: Date, to: Date, opening: Prisma.Decimal, rows: { direction: string; amount: Prisma.Decimal | null; txnDate: Date }[], txnDates: Date[]): SchemeDayBookDayDto[] {
+  const key = (d: Date) => d.toISOString().slice(0, 10);
+  const inBy = new Map<string, Prisma.Decimal>(), outBy = new Map<string, Prisma.Decimal>(), countBy = new Map<string, number>();
+  for (const r of rows) {
+    const m = r.direction === 'IN' ? inBy : outBy;
+    m.set(key(r.txnDate), (m.get(key(r.txnDate)) ?? new Prisma.Decimal(0)).plus(r.amount ?? 0));
+  }
+  for (const d of txnDates) countBy.set(key(d), (countBy.get(key(d)) ?? 0) + 1);
+  const days: SchemeDayBookDayDto[] = [];
+  let open = opening;
+  for (let t = from.getTime(); t <= to.getTime(); t += 86_400_000) {
+    const k = key(new Date(t));
+    const dIn = inBy.get(k) ?? new Prisma.Decimal(0), dOut = outBy.get(k) ?? new Prisma.Decimal(0);
+    const close = open.plus(dIn).minus(dOut);
+    days.push({ date: k, opening: money(open), moneyIn: money(dIn), moneyOut: money(dOut), closing: money(close), txnCount: countBy.get(k) ?? 0 });
+    open = close;
+  }
+  return days;
 }
 
 // ───────────── builders ─────────────
@@ -373,7 +430,8 @@ async function enrollmentWhere(ctx: TenantContext, q: any): Promise<Prisma.Schem
   return {
     businessId: ctx.businessId!, branchId: { in: branchScope(ctx) },
     ...(q.schemeId ? { schemeId: q.schemeId } : {}), ...(q.groupId ? { groupId: q.groupId } : {}), ...(q.partyId ? { partyId: q.partyId } : {}),
-    ...(q.status ? { status: q.status } : {}), ...(q.kind ? { scheme: { kind: q.kind } } : {}),
+    ...(q.status ? { status: Array.isArray(q.status) ? { in: q.status } : q.status } : {}), ...(q.kind ? { scheme: { kind: q.kind } } : {}),
+    ...(q.from || q.to ? { startDate: dateColRange(q.from, q.to) } : {}),
     ...(kw ? enrollmentKeyword(kw, await partyIdsMatching(ctx, kw)) : {}),
   };
 }

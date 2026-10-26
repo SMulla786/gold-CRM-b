@@ -33,6 +33,11 @@ export const orderItemInput = z
     makingUnit: z.enum(CHARGE_UNITS).default('PER_GRAM'),
     other: decimalInput.default(0),
     remark: z.string().trim().max(200).optional(),
+    /** TASK-97: flat labour Rs for the line (added to the line estimate) */
+    labour: decimalInput.default(0),
+    /** TASK-97: wastage in fine grams, added to the line fine (and to the metal value when the sale basis is FINE) */
+    wastageGm: weight.default(0),
+    jewelleryTypeId: id.optional(),
   })
   .refine((r) => r.less <= r.gross, { message: 'less cannot exceed gross', path: ['less'] });
 
@@ -46,9 +51,23 @@ export const orderBody = z.object({
   items: z.array(orderItemInput).min(1).max(50),
   /** advance: CASH / ONLINE / METAL (KACHA or BULLION) */
   payments: z.array(billPaymentInput).max(10).default([]),
+  /** TASK-97: order-level misc charges (Rs), added to estTotal */
+  miscCharges: decimalInput.default(0),
+  /** TASK-97: rate override per settings unit (gold per 10 g etc.) — used instead of today's rate for estTotal and the FIXED lock */
+  goldRate: decimalInput.optional(),
+  silverRate: decimalInput.optional(),
 });
 export const addOrderAdvanceBody = z.object({ payments: z.array(billPaymentInput).min(1).max(10) });
-export const orderListQuery = pageQuery.extend({ status: z.enum(ORDER_STATUSES).optional(), partyId: id.optional() });
+export const orderListQuery = pageQuery.extend({
+  status: z.enum(ORDER_STATUSES).optional(),
+  partyId: id.optional(),
+  /** TASK-97: comma list of ORDER_STATUSES (e.g. "PENDING,IN_PROCESS"); combined with `status` when both are given */
+  statuses: z
+    .string()
+    .optional()
+    .transform((v) => (v ? v.split(',').map((x) => x.trim()).filter(Boolean) : undefined))
+    .pipe(z.array(z.enum(ORDER_STATUSES)).optional()),
+});
 
 export interface OrderItemDto {
   id: number;
@@ -76,6 +95,10 @@ export interface OrderItemDto {
   returnedFine: string | null;
   ghatAllowance: string | null;
   karigarLabour: string | null;
+  /** TASK-97 */
+  labour: string;
+  wastageGm: string;
+  jewelleryTypeId: number | null;
 }
 
 export interface OrderDto {
@@ -94,6 +117,10 @@ export interface OrderDto {
   estTotal: string;
   advance: string;
   billId: number | null;
+  /** TASK-97 */
+  miscCharges: string;
+  /** set → GET /app/orders/:id/design streams the file (image or PDF) */
+  designUrl: string | null;
   items: OrderItemDto[];
   payments: BillPaymentDto[];
   createdBy: string | null;
@@ -114,6 +141,9 @@ export const karigarIssueBody = z
     online: decimalInput.default(0),
     bankAccountId: id.optional(),
     remark: z.string().trim().max(300).optional(),
+    /** TASK-97: agreed karigar wastage — stored for reference only (no posting) */
+    wastagePercent: z.coerce.number().min(0).max(100).optional(),
+    wastageGm: weight.optional(),
   })
   .refine((b) => b.online === 0 || b.bankAccountId != null, { message: 'Select a bank account', path: ['bankAccountId'] });
 
@@ -152,6 +182,9 @@ export interface KarigarIssueDto {
   bankAccount: { id: number; name: string } | null;
   remark: string | null;
   status: 'OPEN' | 'RECEIVED' | 'CANCELLED';
+  /** TASK-97 (info only) */
+  wastagePercent: string | null;
+  wastageGm: string | null;
   items: Array<OrderItemDto & { order: { id: number; orderNo: number; party: PartyRefDto } }>;
   createdAt: string;
 }
@@ -179,6 +212,9 @@ export const repairBody = z
     advanceCash: decimalInput.default(0),
     advanceOnline: decimalInput.default(0),
     advanceBankId: id.optional(),
+    /** TASK-97: purity % and sub-category */
+    purity: z.coerce.number().min(0).max(100).optional(),
+    subCategory: z.string().trim().max(40).optional(),
   })
   .refine((b) => b.advanceOnline === 0 || b.advanceBankId != null, { message: 'Select a bank account', path: ['advanceBankId'] });
 
@@ -192,8 +228,9 @@ export const repairStatusBody = z.object({
 
 export const repairDeliverBody = z
   .object({
-    /** shop metal added (solder) — shop GOLD/SILVER OUT */
-    addedMetal: z.enum(METALS).optional(),
+    /** shop metal added (solder) — shop GOLD/SILVER OUT; OTHER = value billed only, no stock/ledger metal posting */
+    addedMetal: z.enum(['GOLD', 'SILVER', 'OTHER']).optional(),
+    addedKaratCode: z.string().trim().max(6).optional(),
     addedFine: weight.default(0),
     addedRate: decimalInput.default(0),
     cash: decimalInput.default(0),
@@ -204,7 +241,14 @@ export const repairDeliverBody = z
   .refine((b) => b.online === 0 || b.bankAccountId != null, { message: 'Select a bank account', path: ['bankAccountId'] })
   .refine((b) => b.addedFine === 0 || b.addedMetal != null, { message: 'Pick the metal added', path: ['addedMetal'] });
 
-export const repairListQuery = pageQuery.extend({ status: z.enum(REPAIR_STATUSES).optional(), partyId: id.optional() });
+export const repairListQuery = pageQuery.extend({
+  status: z.enum(REPAIR_STATUSES).optional(),
+  partyId: id.optional(),
+  /** TASK-97: ticket metal + createdAt range (business dates, inclusive) */
+  metal: z.enum(['GOLD', 'SILVER', 'OTHER']).optional(),
+  from: z.coerce.date().optional(),
+  to: z.coerce.date().optional(),
+});
 
 export interface RepairTicketDto {
   id: number;
@@ -218,6 +262,10 @@ export interface RepairTicketDto {
   net: string | null;
   karatCode: string | null;
   hallmark: string | null;
+  /** TASK-97 */
+  purity: string | null;
+  subCategory: string | null;
+  /** set → GET /app/repairs/:id/photo streams it */
   photoUrl: string | null;
   expectedDate: string;
   priority: 'NORMAL' | 'URGENT' | 'EXPRESS';
@@ -232,4 +280,47 @@ export interface RepairTicketDto {
   balance: string;
   deliveredAt: string | null;
   createdAt: string;
+  /** TASK-97 settlement breakdown (null until delivered / when not used) */
+  addedMetal: 'GOLD' | 'SILVER' | 'OTHER' | null;
+  addedFine: string | null;
+  addedRate: string | null;
+  addedKaratCode: string | null;
+  deliveryCash: string | null;
+  deliveryOnline: string | null;
+  deliveryBank: { id: number; name: string } | null;
+}
+
+// TASK-97 repair consumables (solder, wire, polish …) — per-branch stock count, no ledger posting
+export const repairConsumableBody = z.object({
+  name: z.string().trim().min(1).max(60),
+  category: z.string().trim().max(40).optional(),
+  unit: z.string().trim().min(1).max(10).default('pcs'),
+  currentStock: weight.default(0),
+  minLevel: weight.default(0),
+  isActive: z.boolean().default(true),
+});
+export const updateRepairConsumableBody = z.object({
+  name: z.string().trim().min(1).max(60).optional(),
+  category: z.string().trim().max(40).nullable().optional(),
+  unit: z.string().trim().min(1).max(10).optional(),
+  currentStock: weight.optional(),
+  minLevel: weight.optional(),
+  isActive: z.boolean().optional(),
+});
+export const repairConsumableAdjustBody = z.object({
+  delta: z.coerce.number().finite().refine((n) => n !== 0, 'Enter a non-zero quantity'),
+  reason: z.string().trim().max(200).optional(),
+});
+
+export interface RepairConsumableDto {
+  id: number;
+  name: string;
+  category: string | null;
+  unit: string;
+  currentStock: string;
+  minLevel: string;
+  isActive: boolean;
+  /** OUT when stock ≤ 0, LOW when stock ≤ minLevel */
+  status: 'OK' | 'LOW' | 'OUT';
+  updatedAt: string;
 }

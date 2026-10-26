@@ -189,6 +189,11 @@ export async function gstRegister(ctx: TenantContext, q: { page: number; pageSiz
       igst: money(D(b.igst)),
       total: money(D(b.final)),
       gstPercent: D(b.gstPercent).toString(), // stored bill rate (one rate per bill), e.g. '3' — same source as GSTR-1
+      itcEligibility: b.itcEligibility,
+      itcBlockReason: b.itcBlockReason,
+      supplierInvoiceNo: b.supplierInvoiceNo,
+      supplyCategory: b.supplyCategory,
+      reverseCharge: b.reverseCharge,
     };
   });
   return { items, total, page: q.page, pageSize: q.pageSize };
@@ -379,21 +384,30 @@ export async function gstr3b(ctx: TenantContext, q: { from: Date; to: Date }): P
   const shop = await shopIdentity(ctx);
   const period = Prisma.sql`b."billDate" >= ${from}::date AND b."billDate" <= ${to}::date`;
 
-  const [outRow, nonRow, itcRow] = await Promise.all([
-    prisma.$queryRaw<Cols[]>(Prisma.sql`SELECT COALESCE(SUM(taxable),0)::numeric AS taxable, COALESCE(SUM(cgst),0)::numeric AS cgst, COALESCE(SUM(sgst),0)::numeric AS sgst, COALESCE(SUM(igst),0)::numeric AS igst FROM "Bill" b WHERE ${scope} AND b.kind::text='SELL' AND b."billType"::text='GST' AND b.status::text='ACTIVE' AND ${period}`),
+  const sums = Prisma.sql`COALESCE(SUM(b.taxable),0)::numeric AS taxable, COALESCE(SUM(b.cgst),0)::numeric AS cgst, COALESCE(SUM(b.sgst),0)::numeric AS sgst, COALESCE(SUM(b.igst),0)::numeric AS igst`;
+  const [outRows, nonRow, itcRows, rcmRow] = await Promise.all([
+    // same bill set as before, split by supplyCategory (3.1 a/b/c/e)
+    prisma.$queryRaw<(Cols & { k: string })[]>(Prisma.sql`SELECT b."supplyCategory"::text AS k, ${sums} FROM "Bill" b WHERE ${scope} AND b.kind::text='SELL' AND b."billType"::text='GST' AND b.status::text='ACTIVE' AND ${period} GROUP BY 1`),
     prisma.$queryRaw<{ s: Prisma.Decimal }[]>(Prisma.sql`SELECT COALESCE(SUM(final),0)::numeric AS s FROM "Bill" b WHERE ${scope} AND b.kind::text='SELL' AND b."billType"::text='ROUGH' AND b.status::text='ACTIVE' AND ${period}`),
-    prisma.$queryRaw<{ cgst: Prisma.Decimal; sgst: Prisma.Decimal; igst: Prisma.Decimal }[]>(Prisma.sql`SELECT COALESCE(SUM(b.cgst),0)::numeric AS cgst, COALESCE(SUM(b.sgst),0)::numeric AS sgst, COALESCE(SUM(b.igst),0)::numeric AS igst FROM "Bill" b JOIN "Party" p ON p.id = b."partyId" WHERE b."businessId" = ${ctx.businessId!} AND b."branchId" IN (${Prisma.join(branchFilter(ctx))}) AND b.kind::text='PURCHASE' AND b."billType"::text='GST' AND b.status::text='ACTIVE' AND p.gstin IS NOT NULL AND ${period}`),
+    // ITC split by itcEligibility; a reverse-charge purchase is claimable even from an unregistered supplier
+    prisma.$queryRaw<(Cols & { k: string })[]>(Prisma.sql`SELECT b."itcEligibility"::text AS k, ${sums} FROM "Bill" b JOIN "Party" p ON p.id = b."partyId" WHERE b."businessId" = ${ctx.businessId!} AND b."branchId" IN (${Prisma.join(branchFilter(ctx))}) AND b.kind::text='PURCHASE' AND b."billType"::text='GST' AND b.status::text='ACTIVE' AND (p.gstin IS NOT NULL OR b."reverseCharge") AND ${period} GROUP BY 1`),
+    prisma.$queryRaw<Cols[]>(Prisma.sql`SELECT ${sums} FROM "Bill" b WHERE ${scope} AND b.kind::text='PURCHASE' AND b."billType"::text='GST' AND b.status::text='ACTIVE' AND b."reverseCharge" AND ${period}`),
   ]);
-  const out = outRow[0]!;
-  const itc = itcRow[0]!;
-  const outputTax = D(out.cgst).plus(out.sgst).plus(out.igst);
-  const itcTax = D(itc.cgst).plus(itc.sgst).plus(itc.igst);
-  const net = outputTax.minus(itcTax);
+  const zero: Cols = { taxable: D(0), cgst: D(0), sgst: D(0), igst: D(0) };
+  const pick = (rows: (Cols & { k: string })[], k: string): Cols => rows.find((r) => r.k === k) ?? zero;
+  const cols = (c: Cols) => ({ taxable: money(D(c.taxable)), cgst: money(D(c.cgst)), sgst: money(D(c.sgst)), igst: money(D(c.igst)) });
+  const tax = (c: Cols) => ({ cgst: money(D(c.cgst)), sgst: money(D(c.sgst)), igst: money(D(c.igst)) });
+  const taxOf = (c: Cols) => D(c.cgst).plus(c.sgst).plus(c.igst);
+  const sumOf = (rows: Cols[], f: (c: Cols) => Prisma.Decimal) => rows.reduce((a, c) => a.plus(f(c)), D(0));
+  const eligible = pick(itcRows, 'ELIGIBLE');
+  const rcm = rcmRow[0]!;
+  // output tax over every GST sell bill (unchanged) + RCM tax payable on inward supplies − eligible ITC only (blocked/ineligible never offset)
+  const net = sumOf(outRows, taxOf).plus(taxOf(rcm)).minus(taxOf(eligible));
   return {
     from, to, gstin: shop.gstin,
-    outward: { taxable: money(D(out.taxable)), cgst: money(D(out.cgst)), sgst: money(D(out.sgst)), igst: money(D(out.igst)) },
+    outward: { ...cols(pick(outRows, 'TAXABLE')), zeroRated: cols(pick(outRows, 'ZERO_RATED')), nilExempt: cols(pick(outRows, 'NIL_EXEMPT')), nonGst: cols(pick(outRows, 'NON_GST')), reverseCharge: cols(rcm) },
     nonGst: money(D(nonRow[0]!.s)),
-    itc: { cgst: money(D(itc.cgst)), sgst: money(D(itc.sgst)), igst: money(D(itc.igst)) },
+    itc: { ...tax(eligible), eligible: tax(eligible), reversed: tax(pick(itcRows, 'BLOCKED_17_5')), ineligible: tax(pick(itcRows, 'INELIGIBLE')), taxable: money(sumOf(itcRows, (c) => D(c.taxable))) },
     netPayableIndicative: money(net.isNegative() ? D(0) : net),
   };
 }

@@ -45,6 +45,11 @@ export interface IncomeExpenseDailySummaryDto {
   /** fine grams IN − OUT */
   goldNet: string;
   silverNet: string;
+  /** TASK-97: fine grams in / out separately (net = in − out) */
+  goldIn?: string;
+  goldOut?: string;
+  silverIn?: string;
+  silverOut?: string;
 }
 
 export interface IncomeExpenseDto {
@@ -121,6 +126,8 @@ export const dayBookQuery = z.object({
   from: dateOnly.optional(),
   to: dateOnly.optional(),
   source: z.enum(LEDGER_SOURCES).optional(),
+  /** TASK-97: 'DATE' also returns `days` — one opening/in/out/closing row per business day in the range (max 62 days) */
+  groupBy: z.enum(['DATE']).optional(),
 });
 
 export interface AssetTotalsDto {
@@ -141,6 +148,15 @@ export interface DayBookDto {
   status?: 'OPEN' | 'CLOSED' | null;
   totals: AssetTotalsDto[];
   bySource: Array<{ source: (typeof LEDGER_SOURCES)[number]; asset: (typeof LEDGER_ASSETS)[number]; in: string; out: string }>;
+  /** TASK-97: present when groupBy=DATE — newest day first */
+  days?: DayBookDayDto[];
+}
+
+export interface DayBookDayDto {
+  date: string;
+  /** branch-day status for the active branch; null when viewing all branches */
+  status: 'OPEN' | 'CLOSED' | null;
+  totals: Array<Omit<AssetTotalsDto, 'value'>>;
 }
 
 /** TASK-90: Day-Book "All-in-One" — one row per source document with every asset's IN/OUT side by side. */
