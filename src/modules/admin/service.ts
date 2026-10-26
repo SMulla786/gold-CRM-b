@@ -452,7 +452,7 @@ export async function putRolePermissions(ctx: TenantContext, roleId: number, gra
 
 export async function getBusiness(ctx: TenantContext): Promise<BusinessProfileDto> {
   const b = await prisma.business.findUniqueOrThrow({ where: { id: ctx.businessId! } });
-  return { id: b.id, name: b.name, ownerName: b.ownerName, mobile: b.mobile, email: b.email, gstin: b.gstin, address: b.address, stateId: b.stateId, districtId: b.districtId };
+  return { id: b.id, name: b.name, ownerName: b.ownerName, mobile: b.mobile, alternateMobile: b.alternateMobile, email: b.email, gstin: b.gstin, address: b.address, stateId: b.stateId, districtId: b.districtId };
 }
 
 export async function updateBusiness(ctx: TenantContext, body: Record<string, unknown>): Promise<BusinessProfileDto> {
@@ -467,8 +467,19 @@ export async function subscriptionView(ctx: TenantContext): Promise<Subscription
     prisma.branch.count({ where: { businessId: ctx.businessId! } }),
     prisma.user.count({ where: { businessId: ctx.businessId! } }),
   ]);
+  const [payments, plans] = await Promise.all([
+    prisma.subscriptionPayment.findMany({
+      where: { businessId: ctx.businessId! },
+      orderBy: { createdAt: 'desc' },
+      take: 50,
+      include: { subscription: { select: { plan: { select: { name: true, durationDays: true } } } } },
+    }),
+    // Only ACTIVE plans are offered; tenants never get the full /platform/plans list.
+    prisma.plan.findMany({ where: { isActive: true }, orderBy: [{ price: 'asc' }, { id: 'asc' }] }),
+  ]);
   return {
     planName: sub.plan.name,
+    planId: sub.planId,
     startsAt: sub.startsAt.toISOString(),
     endsAt: sub.endsAt.toISOString(),
     readOnly: ctx.readOnly,
@@ -477,20 +488,40 @@ export async function subscriptionView(ctx: TenantContext): Promise<Subscription
     usedBranches,
     usedUsers,
     modules: sub.modules,
-    payments: (await prisma.subscriptionPayment.findMany({ where: { businessId: ctx.businessId! }, orderBy: { createdAt: 'desc' }, take: 50 })).map((p) => ({
-      id: p.id,
-      amount: p.amount.toString(),
-      method: p.method as SubscriptionPaymentRowDto['method'],
-      utr: p.utr,
-      status: p.status,
-      paidAt: p.paidAt ? p.paidAt.toISOString() : null,
-      createdAt: p.createdAt.toISOString(),
-      hasProof: p.screenshotUrl != null,
+    payments: payments.map((p) => {
+      // PENDING-MIGRATION (subscription_payment_plan): prefer the requested plan (p.plan) once SubscriptionPayment.planId exists.
+      const plan = p.subscription?.plan ?? null;
+      return {
+        id: p.id,
+        amount: p.amount.toString(),
+        method: p.method as SubscriptionPaymentRowDto['method'],
+        utr: p.utr,
+        status: p.status,
+        paidAt: p.paidAt ? p.paidAt.toISOString() : null,
+        createdAt: p.createdAt.toISOString(),
+        hasProof: p.screenshotUrl != null,
+        planName: plan?.name ?? null,
+        planDurationDays: plan?.durationDays ?? null,
+      };
+    }),
+    availablePlans: plans.map((pl) => ({
+      id: pl.id,
+      name: pl.name,
+      description: pl.description,
+      durationDays: pl.durationDays,
+      price: pl.price.toString(),
+      maxBranches: pl.maxBranches,
+      maxUsers: pl.maxUsers,
+      modules: pl.modules,
     })),
   };
 }
 
-export async function recordSubscriptionPayment(ctx: TenantContext, body: { amount: number; method: 'UPI' | 'CASH' | 'BANK' | 'GATEWAY'; utr?: string; paidAt?: Date; subscriptionId?: number }): Promise<{ id: number }> {
+export async function recordSubscriptionPayment(ctx: TenantContext, body: { amount: number; method: 'UPI' | 'CASH' | 'BANK' | 'GATEWAY'; utr?: string; paidAt?: Date; subscriptionId?: number; planId?: number }): Promise<{ id: number }> {
+  // A requested plan must be one the platform still offers.
+  if (body.planId != null && !(await prisma.plan.findFirst({ where: { id: body.planId, isActive: true }, select: { id: true } }))) {
+    throw new HttpError(404, 'NOT_FOUND', 'Plan not found');
+  }
   // Only this business's own subscription may be referenced (a foreign subscriptionId is ignored).
   const sub = await prisma.subscription.findFirst({
     where: { businessId: ctx.businessId!, ...(body.subscriptionId ? { id: body.subscriptionId } : {}) },

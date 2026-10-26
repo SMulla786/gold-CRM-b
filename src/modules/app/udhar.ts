@@ -10,6 +10,7 @@ import { moneyToMetal } from '../../shared';
 import type {
   BalanceDto,
   BillListItemDto,
+  LedgerSource,
   PartyBalanceRowDto,
   PartyRefDto,
   PartyType,
@@ -87,7 +88,6 @@ async function postTxn(tx: Prisma.TransactionClient, ctx: TenantContext, h: { id
   const { branchId, txnDate } = h;
   const lctx = lctxOf(ctx);
   const sid = String(h.id);
-  const received = D(body.cashIn).plus(body.onlineIn);
 
   // 3. Shop assets → LedgerEntry (source UDHAR). Bhav cut moves no shop asset.
   const lrows: ledger.LedgerEntryInput[] = [];
@@ -133,16 +133,23 @@ async function postTxn(tx: Prisma.TransactionClient, ctx: TenantContext, h: { id
     ]);
   }
 
-  // 5. Settle a pending SELL bill: record the received money as BillPayment(s); step 3 already moved the cash,
-  // step 4 already reduced the party balance — so no extra ledger/udhar rows here.
+  // 5. Settle a pending bill: SELL takes the received money, PURCHASE the money paid out, as BillPayment(s).
+  // Step 3 already moved the cash and step 4 already moved the party balance — so no extra ledger/udhar rows here.
   if (body.settleBillId != null) {
     const b = await tx.bill.findUnique({ where: { id: body.settleBillId } }); // re-read inside tx: concurrency-safe checks + atomic paid
     if (!b) throw new HttpError(404, 'NOT_FOUND', 'Bill not found');
-    if (b.kind !== 'SELL' || b.partyId !== body.partyId || b.status !== 'ACTIVE') throw new HttpError(409, 'CONFLICT', 'Bill is not open for this party');
-    if (D(b.final).minus(b.paid).lte(0)) throw new HttpError(409, 'CONFLICT', 'Bill is already settled');
-    if (body.cashIn > 0) await tx.billPayment.create({ data: { billId: b.id, mode: 'CASH', amount: body.cashIn, txnDate, udharTxnId: h.id, createdById: ctx.userId } });
-    if (body.onlineIn > 0) await tx.billPayment.create({ data: { billId: b.id, mode: 'ONLINE', bankAccountId: body.inBankId!, amount: body.onlineIn, txnDate, udharTxnId: h.id, createdById: ctx.userId } });
-    await tx.bill.update({ where: { id: b.id }, data: { paid: { increment: received } } });
+    if (b.partyId !== body.partyId || b.status !== 'ACTIVE') throw new HttpError(409, 'CONFLICT', 'Bill is not open for this party');
+    const due = D(b.final).minus(b.paid);
+    if (due.lte(0)) throw new HttpError(409, 'CONFLICT', 'Bill is already settled');
+    const sell = b.kind === 'SELL';
+    const [cash, online, bankId] = sell ? [body.cashIn, body.onlineIn, body.inBankId] : [body.cashOut, body.onlineOut, body.outBankId];
+    const applied = D(cash).plus(online);
+    if (applied.lte(0)) throw new HttpError(400, 'VALIDATION', sell ? 'Enter the amount received to settle the bill' : 'Enter the amount paid to settle the bill');
+    // Paying a supplier more than the bill's due has no meaning on the bill (a sell overpay stays the customer's advance).
+    if (!sell && applied.gt(due)) throw new HttpError(409, 'CONFLICT', `Paid amount exceeds the bill due (${money(due)})`);
+    if (cash > 0) await tx.billPayment.create({ data: { billId: b.id, mode: 'CASH', amount: cash, txnDate, udharTxnId: h.id, createdById: ctx.userId } });
+    if (online > 0) await tx.billPayment.create({ data: { billId: b.id, mode: 'ONLINE', bankAccountId: bankId!, amount: online, txnDate, udharTxnId: h.id, createdById: ctx.userId } });
+    await tx.bill.update({ where: { id: b.id }, data: { paid: { increment: applied } } });
   }
 }
 
@@ -223,12 +230,16 @@ export async function getUdharTxn(ctx: TenantContext, id: number): Promise<Udhar
   const bName = new Map(banks.map((b) => [b.id, b.bankName]));
   const settle = t.settleBillId != null ? await sdb.bill.findUnique({ where: { id: t.settleBillId }, select: { id: true, billNo: true } }) : null;
 
-  // final = current party balance; old = final minus this txn's contribution (computed, not stored).
-  const [finalAgg, deltaAgg] = await Promise.all([
-    sdb.udharEntry.aggregate({ where: { partyId: t.partyId }, _sum: { amount: true, gold: true, silver: true } }),
-    sdb.udharEntry.aggregate({ where: { partyId: t.partyId, source: { in: ['UDHAR', 'BHAV_CUT'] }, sourceId: String(t.id) }, _sum: { amount: true, gold: true, silver: true } }),
+  // Balances as of this txn (reprints stay stable after later txns): old = party rows ordered before it
+  // (txnDate, then id vs this txn's first row), final = old + this txn's net rows (incl. edit/delete reversals).
+  const own = { source: { in: ['UDHAR', 'BHAV_CUT'] as LedgerSource[] }, sourceId: String(t.id) };
+  const first = await sdb.udharEntry.findFirst({ where: { partyId: t.partyId, ...own }, orderBy: { id: 'asc' }, select: { id: true } });
+  const sameDay = first ? { txnDate: t.txnDate, id: { lt: first.id } } : { txnDate: t.txnDate };
+  const [oldAgg, deltaAgg] = await Promise.all([
+    sdb.udharEntry.aggregate({ where: { partyId: t.partyId, NOT: own, OR: [{ txnDate: { lt: t.txnDate } }, sameDay] }, _sum: { amount: true, gold: true, silver: true } }),
+    sdb.udharEntry.aggregate({ where: { partyId: t.partyId, ...own }, _sum: { amount: true, gold: true, silver: true } }),
   ]);
-  const f = { amount: D(finalAgg._sum.amount), gold: D(finalAgg._sum.gold), silver: D(finalAgg._sum.silver) };
+  const o = { amount: D(oldAgg._sum.amount), gold: D(oldAgg._sum.gold), silver: D(oldAgg._sum.silver) };
   const d = { amount: D(deltaAgg._sum.amount), gold: D(deltaAgg._sum.gold), silver: D(deltaAgg._sum.silver) };
 
   return {
@@ -249,8 +260,8 @@ export async function getUdharTxn(ctx: TenantContext, id: number): Promise<Udhar
     silverIn: wt(D(t.silverIn)),
     bhav: t.bhavDirection ? { direction: t.bhavDirection, metal: t.bhavMetal!, amount: money(D(t.bhavAmount)), rate: money(D(t.bhavRate)), unitGrams: Number(t.bhavUnitGrams), weight: wt(D(t.bhavWeight)) } : null,
     settleBill: settle ? { id: settle.id, billNo: settle.billNo } : null,
-    old: bal(f.amount.minus(d.amount), f.gold.minus(d.gold), f.silver.minus(d.silver)),
-    final: bal(f.amount, f.gold, f.silver),
+    old: bal(o.amount, o.gold, o.silver),
+    final: bal(o.amount.plus(d.amount), o.gold.plus(d.gold), o.silver.plus(d.silver)),
     remark: t.remark,
     isDeleted: t.isDeleted,
     createdBy: await userName(ctx, t.createdById),

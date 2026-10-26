@@ -86,18 +86,18 @@ model District {
 // ───────────── Platform: plans, tenants, subscriptions ─────────────
 
 model Plan {
-  id            Int            @id @default(autoincrement())
-  name          String         @unique
+  id            Int                   @id @default(autoincrement())
+  name          String                @unique
   description   String?
   durationDays  Int
-  price         Decimal        @db.Decimal(12, 2)
+  price         Decimal               @db.Decimal(12, 2)
   maxBranches   Int
   maxUsers      Int
   /// module keys from @ju/shared MODULES (core modules are always on)
   modules       String[]
-  isActive      Boolean        @default(true)
-  createdAt     DateTime       @default(now())
-  updatedAt     DateTime       @updatedAt
+  isActive      Boolean               @default(true)
+  createdAt     DateTime              @default(now())
+  updatedAt     DateTime              @updatedAt
   subscriptions Subscription[]
   /// payments where a business requested this plan (renew / choose plan)
   payments      SubscriptionPayment[]
@@ -105,36 +105,36 @@ model Plan {
 
 /// Tenant = one jewellery business (customer of the platform).
 model Business {
-  id            Int                   @id @default(autoincrement())
-  name          String
-  ownerName     String
-  countryCode   String                @default("+91")
-  mobile        String
+  id              Int                   @id @default(autoincrement())
+  name            String
+  ownerName       String
+  countryCode     String                @default("+91")
+  mobile          String
   /// Shop Settings 'Alternate No' (submenu-audit Masters gap)
   alternateMobile String?
-  email         String?
-  gstin         String?
-  address       String?
-  stateId       Int?
-  districtId    Int?
-  status        BusinessStatus        @default(ACTIVE)
-  createdAt     DateTime              @default(now())
-  updatedAt     DateTime              @updatedAt
-  branches      Branch[]
-  users         User[]
-  roles         Role[]
-  subscriptions Subscription[]
-  payments      SubscriptionPayment[]
-  signupRequest SignupRequest?
-  parties       Party[]
-  bankAccounts  BankAccount[]
-  hsnCodes      BusinessHsn[]
-  settings      Setting[]
-  karats        KaratMapping[]
-  metalRates    MetalRate[]
-  rateLimits    RateLimit[]
-  state         State?                @relation(fields: [stateId], references: [id])
-  district      District?             @relation(fields: [districtId], references: [id])
+  email           String?
+  gstin           String?
+  address         String?
+  stateId         Int?
+  districtId      Int?
+  status          BusinessStatus        @default(ACTIVE)
+  createdAt       DateTime              @default(now())
+  updatedAt       DateTime              @updatedAt
+  branches        Branch[]
+  users           User[]
+  roles           Role[]
+  subscriptions   Subscription[]
+  payments        SubscriptionPayment[]
+  signupRequest   SignupRequest?
+  parties         Party[]
+  bankAccounts    BankAccount[]
+  hsnCodes        BusinessHsn[]
+  settings        Setting[]
+  karats          KaratMapping[]
+  metalRates      MetalRate[]
+  rateLimits      RateLimit[]
+  state           State?                @relation(fields: [stateId], references: [id])
+  district        District?             @relation(fields: [districtId], references: [id])
 }
 
 /// Subscription snapshots plan limits/modules so later plan edits don't change running subscriptions.
@@ -726,7 +726,7 @@ model TagSequence {
 
 /// One row = one tagged piece (TAG) or one loose lot (LOOSE, quantities decrease as it is sold/issued).
 model StockItem {
-  id           Int         @id @default(autoincrement())
+  id           Int           @id @default(autoincrement())
   businessId   Int
   branchId     Int
   stockClass   StockClass
@@ -736,21 +736,21 @@ model StockItem {
   tagNo        String?
   huid         String?
   karatCode    String?
-  pcs          Int         @default(0)
-  gross        Decimal     @default(0) @db.Decimal(14, 3)
-  less         Decimal     @default(0) @db.Decimal(14, 3)
-  net          Decimal     @default(0) @db.Decimal(14, 3)
-  tunch        Decimal     @default(0) @db.Decimal(6, 3)
-  wastage      Decimal     @default(0) @db.Decimal(6, 3)
-  fine         Decimal     @default(0) @db.Decimal(14, 3)
-  stoneCharge  Decimal     @default(0) @db.Decimal(14, 2)
-  labour       Decimal     @default(0) @db.Decimal(12, 2)
-  labourUnit   ChargeUnit  @default(PER_GRAM)
-  other        Decimal     @default(0) @db.Decimal(14, 2)
+  pcs          Int           @default(0)
+  gross        Decimal       @default(0) @db.Decimal(14, 3)
+  less         Decimal       @default(0) @db.Decimal(14, 3)
+  net          Decimal       @default(0) @db.Decimal(14, 3)
+  tunch        Decimal       @default(0) @db.Decimal(6, 3)
+  wastage      Decimal       @default(0) @db.Decimal(6, 3)
+  fine         Decimal       @default(0) @db.Decimal(14, 3)
+  stoneCharge  Decimal       @default(0) @db.Decimal(14, 2)
+  labour       Decimal       @default(0) @db.Decimal(12, 2)
+  labourUnit   ChargeUnit    @default(PER_GRAM)
+  other        Decimal       @default(0) @db.Decimal(14, 2)
   /// sale rate override (else today's rate); purchase cost for valuation/margin
-  rate         Decimal?    @db.Decimal(14, 2)
-  purchaseCost Decimal?    @db.Decimal(14, 2)
-  status       StockStatus @default(AVAILABLE)
+  rate         Decimal?      @db.Decimal(14, 2)
+  purchaseCost Decimal?      @db.Decimal(14, 2)
+  status       StockStatus   @default(AVAILABLE)
   /// LedgerSource that created it (PURCHASE_BILL, IMPORT, STOCK_INSERT, ORDER_RECEIVE, STOCK_TRANSFER) + document id
   source       String
   sourceId     String?
@@ -760,11 +760,15 @@ model StockItem {
   remarks      String?
   soldAt       DateTime?
   createdById  Int?
-  createdAt    DateTime    @default(now())
-  updatedAt    DateTime    @updatedAt
-  group        ItemGroup   @relation(fields: [groupId], references: [id])
-  itemName     ItemName    @relation(fields: [itemNameId], references: [id])
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+  /// TASK-98: label code printed on the tag (BARCODE default); RFID items carry an EPC code (unique per business; NULLs distinct)
+  codeType     StockCodeType @default(BARCODE)
+  epcCode      String?
+  group        ItemGroup     @relation(fields: [groupId], references: [id])
+  itemName     ItemName      @relation(fields: [itemNameId], references: [id])
 
+  @@unique([businessId, epcCode])
   @@unique([businessId, tagNo])
   @@index([businessId, branchId, stockClass, status])
   @@index([businessId, huid])
@@ -911,6 +915,10 @@ enum BillPaymentMode {
   CASH
   ONLINE
   METAL
+  /// TASK-98: redeems a scheme enrollment into the party's credit, then uses it on the bill (no cash/bank movement)
+  SCHEME
+  /// TASK-98: uses the party's existing udhar credit (advance) on the bill (no cash/bank movement)
+  UDHAR_ADVANCE
 }
 
 /// Gap-free per-branch document numbering (bills, udhar). key e.g. "SELL:GST:2026-27"; incremented by an atomic upsert inside the document tx.
@@ -1013,29 +1021,31 @@ model BillItem {
 }
 
 model BillPayment {
-  id            Int             @id @default(autoincrement())
-  billId        Int
-  mode          BillPaymentMode
-  bankAccountId Int?
+  id                 Int             @id @default(autoincrement())
+  billId             Int
+  mode               BillPaymentMode
+  bankAccountId      Int?
   /// METAL payments
-  metal         MetalKind?
-  metalForm     MetalForm?
-  gross         Decimal?        @db.Decimal(14, 3)
-  net           Decimal?        @db.Decimal(14, 3)
-  tunch         Decimal?        @db.Decimal(6, 3)
-  fine          Decimal?        @db.Decimal(14, 3)
-  rate          Decimal?        @db.Decimal(14, 2)
+  metal              MetalKind?
+  metalForm          MetalForm?
+  gross              Decimal?        @db.Decimal(14, 3)
+  net                Decimal?        @db.Decimal(14, 3)
+  tunch              Decimal?        @db.Decimal(6, 3)
+  fine               Decimal?        @db.Decimal(14, 3)
+  rate               Decimal?        @db.Decimal(14, 2)
   /// money value of the payment (METAL: fine x rate / unit)
-  amount        Decimal         @db.Decimal(14, 2)
-  remark        String?
-  txnDate       DateTime        @db.Date
+  amount             Decimal         @db.Decimal(14, 2)
+  remark             String?
+  txnDate            DateTime        @db.Date
   /// false after the bill is deleted (ledger reversed)
-  isActive      Boolean         @default(true)
+  isActive           Boolean         @default(true)
   /// set when the payment came from a New Udhar entry that settled this bill
-  udharTxnId    Int?
-  createdById   Int?
-  createdAt     DateTime        @default(now())
-  bill          Bill            @relation(fields: [billId], references: [id], onDelete: Cascade)
+  udharTxnId         Int?
+  /// SCHEME payments: the enrollment redeemed by this bill
+  schemeEnrollmentId Int?
+  createdById        Int?
+  createdAt          DateTime        @default(now())
+  bill               Bill            @relation(fields: [billId], references: [id], onDelete: Cascade)
 
   @@index([billId])
 }
@@ -1892,27 +1902,30 @@ model SchemeGroup {
 }
 
 model SchemeEnrollment {
-  id          Int                    @id @default(autoincrement())
-  businessId  Int
-  branchId    Int
-  schemeId    Int
-  groupId     Int?
-  partyId     Int
-  assignId    String
-  displayName String
-  emiAmount   Decimal                @db.Decimal(14, 2)
-  startDate   DateTime               @db.Date
-  status      SchemeEnrollmentStatus @default(ACTIVE)
+  id                 Int                     @id @default(autoincrement())
+  businessId         Int
+  branchId           Int
+  schemeId           Int
+  groupId            Int?
+  partyId            Int
+  assignId           String
+  displayName        String
+  emiAmount          Decimal                 @db.Decimal(14, 2)
+  startDate          DateTime                @db.Date
+  status             SchemeEnrollmentStatus  @default(ACTIVE)
   /// redeem / withdraw: ₹ credited to the party (udhar); GOLD also grams + rate used
-  redeemValue Decimal?               @db.Decimal(14, 2)
-  redeemFine  Decimal?               @db.Decimal(14, 3)
-  redeemRate  Decimal?               @db.Decimal(14, 2)
-  closedAt    DateTime?
-  createdById Int?
-  createdAt   DateTime               @default(now())
-  scheme      Scheme                 @relation(fields: [schemeId], references: [id])
-  group       SchemeGroup?           @relation(fields: [groupId], references: [id])
-  payments    SchemePayment[]
+  redeemValue        Decimal?                @db.Decimal(14, 2)
+  redeemFine         Decimal?                @db.Decimal(14, 3)
+  redeemRate         Decimal?                @db.Decimal(14, 2)
+  closedAt           DateTime?
+  /// TASK-98: set when a bill's SCHEME payment redeemed it — bill delete/edit reopens it to statusBeforeRedeem
+  redeemBillId       Int?
+  statusBeforeRedeem SchemeEnrollmentStatus?
+  createdById        Int?
+  createdAt          DateTime                @default(now())
+  scheme             Scheme                  @relation(fields: [schemeId], references: [id])
+  group              SchemeGroup?            @relation(fields: [groupId], references: [id])
+  payments           SchemePayment[]
 
   @@unique([schemeId, assignId])
   @@index([businessId, branchId, schemeId, status])
@@ -2066,4 +2079,58 @@ model RepairConsumable {
   updatedAt    DateTime @updatedAt
 
   @@index([businessId, branchId])
+}
+
+// ═════════════ TASK-98 — Samples / Tounch register + stock code type (custody only, no ledger posting) ═════════════
+
+enum StockCodeType {
+  BARCODE
+  QR
+  RFID
+}
+
+enum SampleStatus {
+  IN_HAND
+  ISSUED
+  RETURNED
+  MELTED
+}
+
+/// A tounch (purity-test) sample held in custody. Status changes are guarded updateMany flips + a SampleMovement row.
+model Sample {
+  id            Int              @id @default(autoincrement())
+  businessId    Int
+  branchId      Int
+  /// per-branch DocSequence key 'SAMPLE'
+  sampleNo      Int
+  partyId       Int?
+  karigarId     Int?
+  metal         MetalKind
+  grossWt       Decimal          @db.Decimal(14, 3)
+  tounchPercent Decimal          @db.Decimal(6, 3)
+  fine          Decimal          @db.Decimal(14, 3)
+  status        SampleStatus     @default(IN_HAND)
+  note          String?
+  createdById   Int?
+  createdAt     DateTime         @default(now())
+  updatedAt     DateTime         @updatedAt
+  movements     SampleMovement[]
+
+  @@unique([businessId, branchId, sampleNo])
+  @@index([businessId, branchId, status])
+}
+
+/// Custody log of a sample (CREATED | ISSUED | RETURNED | MELTED | EDITED); reached through its scoped Sample.
+model SampleMovement {
+  id        Int      @id @default(autoincrement())
+  sampleId  Int
+  action    String
+  partyId   Int?
+  karigarId Int?
+  note      String?
+  userId    Int?
+  createdAt DateTime @default(now())
+  sample    Sample   @relation(fields: [sampleId], references: [id], onDelete: Cascade)
+
+  @@index([sampleId])
 }

@@ -23,6 +23,21 @@ export interface DashboardDto {
   monthly: Array<{ month: string; sales: string; purchases: string }>;
   /** only with X-Branch-Id: all — per-branch sales today/month */
   byBranch: Array<{ branch: { id: number; name: string }; todayTotal: string; monthTotal: string }> | null;
+  /** TASK-97: Σ (paid − final) of ACTIVE sell bills paid in excess (overpay = customer advance, kept as party credit) */
+  billsAdvance?: string;
+  /** TASK-97: the same KPI windows shifted one calendar month back (today → same day last month, clamped; month-to-date → 1st..that day). UI shows % change; hide when 0. */
+  lastMonth?: {
+    todayTotal: string;
+    todayCount: number;
+    todayReceived: string;
+    monthTotal: string;
+    purchasesMonthTotal: string;
+    collectedThisMonth: string;
+    customersNewThisMonth: number;
+  };
+  /** TASK-97: parties with a receivable udhar balance whose oldest unpaid debit (FIFO) is older than 30 days, most overdue first (top 10).
+   *  amount/gold/silver = positive balance per asset (0 when not owed); since = that debit's date; daysOverdue = days past the 30-day due. */
+  udharOverdue?: Array<{ party: { id: number; name: string; mobile: string }; amount: string; gold: string; silver: string; since: string; daysOverdue: number }>;
 }
 
 export const activityQuery = pageQuery.extend({

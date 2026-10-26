@@ -2,6 +2,8 @@ import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { db, truncateAll } from '../../../test/helpers/db';
 import { createBranch, createBusiness, createUser } from '../../../test/helpers/factory';
 import * as svc from './service';
+import * as platform from '../platform/service';
+import { updateBusinessBody } from '../../shared/contracts/platform';
 import type { TenantContext } from '../../middleware/context';
 
 // Covers TASK-5b security fixes 1–4 at the service layer.
@@ -106,5 +108,18 @@ describe('TASK-5b(4) role management is owner/root-only', () => {
     const s = await setup();
     const role = await svc.createRole(s.ownerCtx, 'Floor Staff');
     expect(role.name).toBe('Floor Staff');
+  });
+});
+
+describe('Business alternateMobile (Shop Settings "Alternate No")', () => {
+  it('admin + platform save it, read it back, and null clears it', async () => {
+    const s = await setup();
+    const saved = await svc.updateBusiness(s.ownerCtx, updateBusinessBody.parse({ alternateMobile: '9876543210' }));
+    expect(saved.alternateMobile).toBe('9876543210');
+    expect((await svc.getBusiness(s.ownerCtx)).alternateMobile).toBe('9876543210');
+    expect((await platform.businessDetail(s.business.id)).alternateMobile).toBe('9876543210');
+    const cleared = await platform.updateBusiness(s.business.id, updateBusinessBody.parse({ alternateMobile: null }));
+    expect(cleared.alternateMobile).toBeNull();
+    expect(() => updateBusinessBody.parse({ alternateMobile: '123' })).toThrow();
   });
 });

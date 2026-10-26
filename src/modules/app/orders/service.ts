@@ -11,6 +11,7 @@ import type { OrderDto, OrderItemDto, KarigarIssueDto, BillPaymentInput } from '
 import { currentRates, getSettings } from '../service';
 import { computePayments, sumAmounts } from '../billing/service';
 import { nextTagNo } from '../inventory';
+import { filePath, removeFile, replaceFile } from './files';
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
@@ -35,7 +36,17 @@ async function nextNo(tx: Prisma.TransactionClient, businessId: number, branchId
 
 // ───────────── Orders ─────────────
 
-type OrderBody = { partyId: number; orderDate?: Date; deliveryDate?: Date; rateType: 'FIXED' | 'ON_DELIVERY'; isUrgent: boolean; remark?: string; items: any[]; payments: BillPaymentInput[] };
+type OrderBody = { partyId: number; orderDate?: Date; deliveryDate?: Date; rateType: 'FIXED' | 'ON_DELIVERY'; isUrgent: boolean; remark?: string; items: any[]; payments: BillPaymentInput[]; miscCharges?: number; goldRate?: number; silverRate?: number };
+
+/**
+ * TASK-97 extras on top of computeLine: wastageGm is fine grams added to the line fine (and to the metal value only when the
+ * sale basis is FINE, the same place wastage % reaches the money); labour is a flat Rs. Both 0 -> the computeLine result unchanged.
+ */
+export function orderLineExtras(calc: { fine: string; total: string }, x: { wastageGm?: number; labour?: number; rate: number; unitGrams: number; basis: string }): { fine: string; total: string } {
+  const wGm = D(x.wastageGm ?? 0);
+  const metal = x.basis === 'FINE' && x.unitGrams > 0 ? wGm.times(x.rate).div(x.unitGrams) : D(0);
+  return { fine: wt(D(calc.fine).plus(wGm)), total: money(D(calc.total).plus(metal).plus(x.labour ?? 0)) };
+}
 
 export async function createOrder(ctx: TenantContext, body: OrderBody): Promise<OrderDto> {
   const branchId = activeBranch(ctx);
@@ -47,9 +58,14 @@ export async function createOrder(ctx: TenantContext, body: OrderBody): Promise<
   const basis = s['calc.basis'].sale;
   const rateFor = (metal: 'GOLD' | 'SILVER', karatCode?: string | null) => {
     const m = metal === 'GOLD' ? rates.gold : rates.silver;
+    const override = metal === 'GOLD' ? body.goldRate : body.silverRate; // TASK-97: one override rate per metal (settings unit)
     const row = m.rows.find((r) => r.karatCode === karatCode) ?? m.rows[0];
-    return { rate: Number(row?.sellRate ?? 0), unitGrams: RATE_UNIT_GRAMS[m.rateUnit] };
+    return { rate: override ?? Number(row?.sellRate ?? 0), unitGrams: RATE_UNIT_GRAMS[m.rateUnit] };
   };
+  const jtIds = [...new Set(body.items.map((i) => i.jewelleryTypeId).filter((x) => x != null))] as number[];
+  if (jtIds.length && (await prisma.jewelleryType.count({ where: { id: { in: jtIds }, OR: [{ businessId: null }, { businessId: ctx.businessId! }] } })) !== jtIds.length) {
+    throw new HttpError(404, 'NOT_FOUND', 'Jewellery type not found');
+  }
 
   // resolve item names (tenant) + karat touch
   const nameIds = [...new Set(body.items.map((i) => i.itemNameId))];
@@ -65,13 +81,14 @@ export async function createOrder(ctx: TenantContext, body: OrderBody): Promise<
     if (n.group.stockClass !== it.metal) throw new HttpError(400, 'VALIDATION', `"${n.name}" is a ${n.group.stockClass} item, not ${it.metal}`);
     const touch = it.touch ?? (touchOf(it.metal, it.karatCode) != null ? Number(touchOf(it.metal, it.karatCode)) : 100);
     const { rate, unitGrams } = rateFor(it.metal, it.karatCode);
-    const calc = computeLine({ gross: it.gross, less: it.less, tunch: touch, wastage: it.wastage, rate, rateUnitGrams: unitGrams, labour: it.making, labourUnit: it.makingUnit, other: it.other, basis });
+    const base = computeLine({ gross: it.gross, less: it.less, tunch: touch, wastage: it.wastage, rate, rateUnitGrams: unitGrams, labour: it.making, labourUnit: it.makingUnit, other: it.other, basis });
+    const calc = { ...base, ...orderLineExtras(base, { wastageGm: it.wastageGm, labour: it.labour, rate, unitGrams, basis }) };
     return { it, n, touch, calc };
   });
-  const estTotal = lines.reduce((a, l) => a.plus(l.calc.total), new Prisma.Decimal(0));
-  // FIXED: lock today's per-unit rate for each metal present (shortcut: one rate per metal, not per karat)
-  const goldRate = body.rateType === 'FIXED' && lines.some((l) => l.it.metal === 'GOLD') ? rates.gold.rows[0]?.sellRate ?? null : null;
-  const silverRate = body.rateType === 'FIXED' && lines.some((l) => l.it.metal === 'SILVER') ? rates.silver.rows[0]?.sellRate ?? null : null;
+  const estTotal = lines.reduce((a, l) => a.plus(l.calc.total), new Prisma.Decimal(0)).plus(body.miscCharges ?? 0);
+  // FIXED: lock the per-unit rate (override, else today's) for each metal present (shortcut: one rate per metal, not per karat)
+  const goldRate = body.rateType === 'FIXED' && lines.some((l) => l.it.metal === 'GOLD') ? body.goldRate ?? rates.gold.rows[0]?.sellRate ?? null : null;
+  const silverRate = body.rateType === 'FIXED' && lines.some((l) => l.it.metal === 'SILVER') ? body.silverRate ?? rates.silver.rows[0]?.sellRate ?? null : null;
 
   const orderDate = ledger.businessDate(body.orderDate ?? new Date());
   const lctx = lctxOf(ctx);
@@ -82,11 +99,12 @@ export async function createOrder(ctx: TenantContext, body: OrderBody): Promise<
       data: {
         businessId: ctx.businessId!, branchId, orderNo, partyId: body.partyId, orderDate,
         deliveryDate: body.deliveryDate ? ledger.businessDate(body.deliveryDate) : null, rateType: body.rateType,
-        goldRate, silverRate, isUrgent: body.isUrgent, remark: body.remark ?? null, status: 'PENDING', estTotal, advance: 0, createdById: ctx.userId,
+        goldRate, silverRate, isUrgent: body.isUrgent, remark: body.remark ?? null, status: 'PENDING', estTotal, advance: 0, createdById: ctx.userId, miscCharges: body.miscCharges ?? 0,
         items: { create: lines.map((l) => ({
           itemNameId: l.n.id, metal: l.it.metal, karatCode: l.it.karatCode ?? null, touch: l.touch, size: l.it.size ?? null, pcs: l.it.pcs,
           gross: l.it.gross, less: l.it.less, net: l.calc.net, wastage: l.it.wastage, fine: l.calc.fine, making: l.it.making, makingUnit: l.it.makingUnit,
           other: l.it.other, estTotal: l.calc.total, remark: l.it.remark ?? null, status: 'PENDING',
+          labour: l.it.labour ?? 0, wastageGm: l.it.wastageGm ?? 0, jewelleryTypeId: l.it.jewelleryTypeId ?? null,
         })) },
       },
     });
@@ -164,7 +182,7 @@ function docNoOf(kw: string): number | null {
   return Number.isInteger(n) && n > 0 && n <= 2_147_483_647 ? n : null;
 }
 
-export async function listOrders(ctx: TenantContext, q: { page: number; pageSize: number; q?: string; status?: string; partyId?: number }): Promise<{ items: OrderDto[]; total: number; page: number; pageSize: number }> {
+export async function listOrders(ctx: TenantContext, q: { page: number; pageSize: number; q?: string; status?: string; statuses?: string[]; partyId?: number }): Promise<{ items: OrderDto[]; total: number; page: number; pageSize: number }> {
   const sdb = scopedDb(ctx);
   // keyword: order no / party name / party mobile
   const kw = q.q?.trim();
@@ -174,7 +192,9 @@ export async function listOrders(ctx: TenantContext, q: { page: number; pageSize
     const no = docNoOf(kw);
     kwWhere = { OR: [{ partyId: { in: partyIds } }, ...(no != null ? [{ orderNo: no }] : [])] };
   }
-  const where = { ...(q.status ? { status: q.status as any } : {}), ...(q.partyId ? { partyId: q.partyId } : {}), ...kwWhere };
+  // statuses (any of) narrows further by status when both are given
+  const statuses = q.statuses?.length ? (q.status ? q.statuses.filter((x) => x === q.status) : q.statuses) : null;
+  const where = { ...(statuses ? { status: { in: statuses as any } } : q.status ? { status: q.status as any } : {}), ...(q.partyId ? { partyId: q.partyId } : {}), ...kwWhere };
   const [rows, total] = await Promise.all([
     sdb.order.findMany({ where, orderBy: { id: 'desc' }, skip: (q.page - 1) * q.pageSize, take: q.pageSize, select: { id: true } }),
     sdb.order.count({ where }),
@@ -190,7 +210,7 @@ export async function getOrder(ctx: TenantContext, id: number): Promise<OrderDto
 
 // ───────────── Karigar issue / receive ─────────────
 
-type KarigarIssueBody = { karigarId: number; orderItemIds: number[]; dueDate?: Date; goldFine: number; silverFine: number; cash: number; online: number; bankAccountId?: number; remark?: string };
+type KarigarIssueBody = { karigarId: number; orderItemIds: number[]; dueDate?: Date; goldFine: number; silverFine: number; cash: number; online: number; bankAccountId?: number; remark?: string; wastagePercent?: number; wastageGm?: number };
 
 export async function createKarigarIssue(ctx: TenantContext, body: KarigarIssueBody): Promise<KarigarIssueDto> {
   const branchId = activeBranch(ctx);
@@ -209,7 +229,7 @@ export async function createKarigarIssue(ctx: TenantContext, body: KarigarIssueB
   const lctx = lctxOf(ctx);
   const issueId = await prisma.$transaction(async (tx) => {
     const issueNo = await nextNo(tx, ctx.businessId!, branchId, 'KARIGAR_ISSUE');
-    const issue = await tx.karigarIssue.create({ data: { businessId: ctx.businessId!, branchId, issueNo, karigarId: body.karigarId, issueDate, dueDate: body.dueDate ? ledger.businessDate(body.dueDate) : null, goldFine: body.goldFine, silverFine: body.silverFine, cash: body.cash, online: body.online, bankAccountId: body.bankAccountId ?? null, remark: body.remark ?? null, status: 'OPEN', createdById: ctx.userId } });
+    const issue = await tx.karigarIssue.create({ data: { businessId: ctx.businessId!, branchId, issueNo, karigarId: body.karigarId, issueDate, dueDate: body.dueDate ? ledger.businessDate(body.dueDate) : null, goldFine: body.goldFine, silverFine: body.silverFine, cash: body.cash, online: body.online, bankAccountId: body.bankAccountId ?? null, remark: body.remark ?? null, status: 'OPEN', createdById: ctx.userId, wastagePercent: body.wastagePercent ?? null, wastageGm: body.wastageGm ?? null } });
     // claim the items atomically on their PENDING status — a concurrent issue can't grab the same item twice
     const claim = await tx.orderItem.updateMany({ where: { id: { in: body.orderItemIds }, status: 'PENDING' }, data: { status: 'ASSIGNED', karigarIssueId: issue.id } });
     if (claim.count !== new Set(body.orderItemIds).size) throw new HttpError(409, 'CONFLICT', 'Some items were just assigned to another issue');
@@ -341,6 +361,7 @@ export async function getKarigarIssue(ctx: TenantContext, id: number): Promise<K
     id: issue.id, issueNo: issue.issueNo, issueDate: issue.issueDate.toISOString().slice(0, 10), dueDate: issue.dueDate?.toISOString().slice(0, 10) ?? null,
     karigar: karigar as any, goldFine: wt(issue.goldFine), silverFine: wt(issue.silverFine), cash: money(issue.cash), online: money(issue.online),
     bankAccount: bank ? { id: bank.id, name: bank.bankName } : null, remark: issue.remark, status: issue.status as any,
+    wastagePercent: issue.wastagePercent != null ? wt(issue.wastagePercent) : null, wastageGm: issue.wastageGm != null ? wt(issue.wastageGm) : null,
     items: items.map((it) => ({ ...orderItemDto(it, nameMap, null), order: { id: it.order.id, orderNo: it.order.orderNo, party: orderPartyMap.get(it.order.partyId) as any } })),
     createdAt: issue.createdAt.toISOString(),
   };
@@ -362,6 +383,7 @@ function orderItemDto(it: any, nameMap: Map<number, string>, issueRef: OrderItem
     karigarIssue: issueRef, stockItemId: it.stockItemId, returnedGross: it.returnedGross != null ? wt(it.returnedGross) : null,
     returnedNet: it.returnedNet != null ? wt(it.returnedNet) : null, returnedFine: it.returnedFine != null ? wt(it.returnedFine) : null,
     ghatAllowance: it.ghatAllowance != null ? wt(it.ghatAllowance) : null, karigarLabour: it.karigarLabour != null ? money(it.karigarLabour) : null,
+    labour: money(it.labour), wastageGm: wt(it.wastageGm), jewelleryTypeId: it.jewelleryTypeId ?? null,
   };
 }
 
@@ -392,6 +414,7 @@ async function buildOrders(ctx: TenantContext, ids: number[]): Promise<OrderDto[
     party: partyMap.get(o.partyId) as any, branch: { id: o.branchId, name: branchMap.get(o.branchId) ?? '' }, rateType: o.rateType,
     goldRate: o.goldRate != null ? money(o.goldRate) : null, silverRate: o.silverRate != null ? money(o.silverRate) : null, isUrgent: o.isUrgent,
     remark: o.remark, status: o.status, estTotal: money(o.estTotal), advance: money(o.advance), billId: o.billId,
+    miscCharges: money(o.miscCharges), designUrl: o.designUrl,
     items: o.items.map((it) => orderItemDto(it, nameMap, it.karigarIssueId != null && issueMap.has(it.karigarIssueId)
       ? { id: it.karigarIssueId, issueNo: issueMap.get(it.karigarIssueId)!.issueNo, karigar: { id: issueMap.get(it.karigarIssueId)!.karigarId, name: karigarMap.get(issueMap.get(it.karigarIssueId)!.karigarId) ?? '' } }
       : null)),
@@ -408,4 +431,24 @@ async function itemNameMapParties(ctx: TenantContext, ids: number[]): Promise<Ma
 
 function paymentDto(p: any) {
   return { id: p.id, mode: p.mode, bankAccountId: p.bankAccountId, metal: p.metal, metalForm: p.metalForm, gross: p.gross != null ? wt(p.gross) : null, net: p.net != null ? wt(p.net) : null, tunch: p.tunch != null ? wt(p.tunch) : null, fine: p.fine != null ? wt(p.fine) : null, rate: p.rate != null ? money(p.rate) : null, amount: money(p.amount), remark: p.remark, txnDate: p.txnDate.toISOString().slice(0, 10), isActive: p.isActive } as any;
+}
+
+// ───────────── Design file (TASK-97) ─────────────
+
+export async function saveOrderDesign(ctx: TenantContext, id: number, buffer: Buffer): Promise<void> {
+  const order = await scopedDb(ctx).order.findUnique({ where: { id }, select: { designUrl: true } });
+  if (!order) throw new HttpError(404, 'NOT_FOUND', 'Order not found');
+  await replaceFile(ctx, 'orders', buffer, order.designUrl, (rel) => scopedDb(ctx).order.update({ where: { id }, data: { designUrl: rel } }), true);
+}
+
+export async function orderDesignPath(ctx: TenantContext, id: number): Promise<string> {
+  return filePath((await scopedDb(ctx).order.findUnique({ where: { id }, select: { designUrl: true } }))?.designUrl);
+}
+
+export async function removeOrderDesign(ctx: TenantContext, id: number): Promise<void> {
+  const order = await scopedDb(ctx).order.findUnique({ where: { id }, select: { designUrl: true } });
+  if (!order) throw new HttpError(404, 'NOT_FOUND', 'Order not found');
+  if (!order.designUrl) return;
+  await scopedDb(ctx).order.update({ where: { id }, data: { designUrl: null } });
+  await removeFile(order.designUrl);
 }

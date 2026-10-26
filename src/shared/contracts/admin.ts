@@ -107,6 +107,21 @@ export interface SubscriptionViewDto {
   modules: string[];
   /** TASK-95: this business's payment submissions, newest first */
   payments?: SubscriptionPaymentRowDto[];
+  /** Plan of the current subscription (marks the "current" card in availablePlans). */
+  planId?: number;
+  /** ACTIVE platform plans the owner can renew or switch to (price as a decimal string). */
+  availablePlans?: AvailablePlanDto[];
+}
+
+export interface AvailablePlanDto {
+  id: number;
+  name: string;
+  description: string | null;
+  durationDays: number;
+  price: string;
+  maxBranches: number;
+  maxUsers: number;
+  modules: string[];
 }
 
 export interface SubscriptionPaymentRowDto {
@@ -118,6 +133,9 @@ export interface SubscriptionPaymentRowDto {
   paidAt: string | null;
   createdAt: string;
   hasProof: boolean;
+  /** Requested plan (payment.planId) or else the linked subscription's plan; null when neither. */
+  planName?: string | null;
+  planDurationDays?: number | null;
 }
 
 export interface CounterDto {
@@ -157,6 +175,7 @@ export interface BusinessProfileDto {
   name: string;
   ownerName: string;
   mobile: string;
+  alternateMobile: string | null;
   email: string | null;
   gstin: string | null;
   address: string | null;

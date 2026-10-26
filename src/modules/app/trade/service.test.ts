@@ -183,3 +183,145 @@ describe('bhav booking', () => {
     expect(await db.ledgerEntry.findMany({ where: { source: 'BHAV_BOOKING', reversalOfId: { not: null } } })).toHaveLength(1); // advance reversed
   });
 });
+
+// ───────────── TASK-97: split payments, ONLY_ENTRY, edit, undeliver ─────────────
+
+/** Net effect of a document: MONEY by bank ("null" = cash, + = IN), bulk-metal fine (+ = IN) and udhar totals. */
+async function netOf(source: string, sourceId: number) {
+  const rows = await db.ledgerEntry.findMany({ where: { source: source as never, sourceId: String(sourceId) } });
+  const sign = (d: string) => (d === 'IN' ? 1 : -1);
+  const moneyBy: Record<string, number> = {};
+  let fine = 0;
+  for (const r of rows) {
+    if (r.asset === 'MONEY') moneyBy[String(r.bankAccountId)] = Math.round(((moneyBy[String(r.bankAccountId)] ?? 0) + sign(r.direction) * Number(r.amount)) * 100) / 100;
+    else fine = Math.round((fine + sign(r.direction) * Number(r.fine)) * 1000) / 1000;
+  }
+  for (const k of Object.keys(moneyBy)) if (moneyBy[k] === 0) delete moneyBy[k];
+  const u = await db.udharEntry.findMany({ where: { source: source as never, sourceId: String(sourceId) } });
+  const sum = (k: 'amount' | 'gold' | 'silver') => Math.round(u.reduce((a, r) => a + Number(r[k]), 0) * 1000) / 1000;
+  return { moneyBy, fine, udhar: { amount: sum('amount'), gold: sum('gold'), silver: sum('silver') } };
+}
+
+describe('split payments', () => {
+  it('buy-sell payments[] has the same ledger + udhar effect as single cash + online', async () => {
+    const s = await setup();
+    const base = { partyId: s.party.id, metal: 'GOLD', side: 'BUY', lines: [{ weight: 10, rate: 60000 }] };
+    const single = await buysell.createBuySell(s.ctx, buySellBody.parse({ ...base, cash: 30000, online: 25000, bankAccountId: s.bank.id }));
+    const split = await buysell.createBuySell(s.ctx, buySellBody.parse({ ...base, payments: [{ mode: 'CASH', amount: 10000 }, { mode: 'CASH', amount: 20000 }, { mode: 'ONLINE', amount: 25000, bankAccountId: s.bank.id, reference: 'UTR1' }] }));
+    expect([split.cash, split.online, split.balance]).toEqual([single.cash, single.online, single.balance]);
+    expect(await netOf('BUY_SELL', split.id)).toEqual(await netOf('BUY_SELL', single.id));
+    expect(await led({ source: 'BUY_SELL', sourceId: String(split.id), asset: 'MONEY' })).toHaveLength(3); // one row per payment
+    expect(split.payments?.map((p) => [p.mode, p.amount, p.reference])).toEqual([['CASH', '10000.00', null], ['CASH', '20000.00', null], ['ONLINE', '25000.00', 'UTR1']]);
+    expect(single.payments).toEqual([]);
+  });
+
+  it('exchange + bhav payments[] match single cash + online', async () => {
+    const s = await setup();
+    const exA = await exchange.createExchange(s.ctx, ex({ partyId: s.party.id, side: 'BUY', rate: 60000, cash: 20000, online: 10000, bankAccountId: s.bank.id }));
+    const exB = await exchange.createExchange(s.ctx, ex({ partyId: s.party.id, side: 'BUY', rate: 60000, payments: [{ mode: 'ONLINE', amount: 10000, bankAccountId: s.bank.id }, { mode: 'CASH', amount: 20000 }] }));
+    expect(await netOf('EXCHANGE', exB.id)).toEqual(await netOf('EXCHANGE', exA.id));
+    const bk = { partyId: s.party.id, metal: 'GOLD', side: 'BUY', weight: 10, rate: 60000 };
+    const bA = await bhav.createBhav(s.ctx, bhavBookingBody.parse({ ...bk, cash: 3000, online: 2000, bankAccountId: s.bank.id }));
+    const bB = await bhav.createBhav(s.ctx, bhavBookingBody.parse({ ...bk, payments: [{ mode: 'CASH', amount: 3000 }, { mode: 'ONLINE', amount: 2000, bankAccountId: s.bank.id }] }));
+    expect(bB.advance).toBe(bA.advance);
+    expect(await netOf('BHAV_BOOKING', bB.id)).toEqual(await netOf('BHAV_BOOKING', bA.id));
+  });
+
+  it('payments[] with cash, or ONLINE without a bank → schema error', () => {
+    const base = { partyId: 1, metal: 'GOLD', side: 'BUY', lines: [{ weight: 1, rate: 1 }] };
+    expect(() => buySellBody.parse({ ...base, cash: 5, payments: [{ mode: 'CASH', amount: 5 }] })).toThrow();
+    expect(() => buySellBody.parse({ ...base, payments: [{ mode: 'ONLINE', amount: 5 }] })).toThrow();
+  });
+});
+
+describe('bhav entry type + rows', () => {
+  it('ONLY_ENTRY posts nothing; delete reverses nothing', async () => {
+    const s = await setup();
+    const b = await bhav.createBhav(s.ctx, bhavBookingBody.parse({ partyId: s.party.id, metal: 'GOLD', side: 'BUY', weight: 10, rate: 60000, cash: 5000, entryType: 'ONLY_ENTRY' }));
+    expect([b.entryType, b.advance]).toEqual(['ONLY_ENTRY', '5000.00']);
+    expect(await led({ source: 'BHAV_BOOKING' })).toHaveLength(0);
+    expect(await db.udharEntry.findMany({ where: { source: 'BHAV_BOOKING' } })).toHaveLength(0);
+    await bhav.deleteBhav(s.ctx, b.id);
+    expect(await led({ source: 'BHAV_BOOKING' })).toHaveLength(0);
+  });
+
+  it('lines[] → weight = sum, amount = sum of rows, rate = weight-weighted average (2 dp)', async () => {
+    const s = await setup();
+    const b = await bhav.createBhav(s.ctx, bhavBookingBody.parse({ partyId: s.party.id, metal: 'GOLD', side: 'BUY', lines: [{ weight: 10, rate: 60000 }, { weight: 5, rate: 61000 }] }));
+    expect([b.weight, b.amount, b.rate, b.pendingWeight]).toEqual(['15.000', '90500.00', '60333.33', '15.000']); // 60000 + 30500; 905000 / 15
+    expect(b.lines).toHaveLength(2);
+  });
+});
+
+describe('edit', () => {
+  it('exchange edit nets to the same ledger/udhar as a fresh create of the new body', async () => {
+    const s = await setup();
+    const edited = await exchange.createExchange(s.ctx, ex({ partyId: s.party.id, side: 'BUY', rate: 60000, cash: 50000 }));
+    const newBody = ex({ partyId: s.party.id, side: 'BUY', lines: [{ weight: 5, touch: 100 }], rate: 0 });
+    const after = await exchange.updateExchange(s.ctx, edited.id, newBody);
+    expect([after.id, after.exchangeNo, after.afterFine]).toEqual([edited.id, edited.exchangeNo, '5.000']);
+    const fresh = await exchange.createExchange(s.ctx, newBody);
+    expect(await netOf('EXCHANGE', edited.id)).toEqual(await netOf('EXCHANGE', fresh.id));
+    const hist = await exchange.exchangeHistory(s.ctx, edited.id);
+    expect(hist.map((h) => h.action)).toEqual(['CREATED', 'EDITED']);
+    const meta = hist[1]!.meta as { before: { afterFine: string }; after: { afterFine: string } };
+    expect([Number(meta.before.afterFine), Number(meta.after.afterFine)]).toEqual([10, 5]);
+  });
+
+  it('buy-sell edit gives the weight back to the booking and nets like a fresh create', async () => {
+    const s = await setup();
+    const bs = (o: Record<string, unknown>) => buySellBody.parse({ partyId: s.party.id, metal: 'GOLD', side: 'BUY', lines: [{ weight: 10, rate: 60000 }], ...o });
+    const book = await bhav.createBhav(s.ctx, bhavBookingBody.parse({ partyId: s.party.id, metal: 'GOLD', side: 'BUY', weight: 10, rate: 60000 }));
+    const t = await buysell.createBuySell(s.ctx, bs({ bhavBookingId: book.id, cash: 60000 }));
+    expect((await bhav.getBhav(s.ctx, book.id)).status).toBe('DELIVERED');
+    const newBody = bs({ lines: [{ weight: 4, rate: 62000 }], cash: 10000 });
+    await buysell.updateBuySell(s.ctx, t.id, newBody);
+    const back = await bhav.getBhav(s.ctx, book.id);
+    expect([back.status, back.pendingWeight]).toEqual(['PENDING', '10.000']);
+    const fresh = await buysell.createBuySell(s.ctx, newBody);
+    expect(await netOf('BUY_SELL', t.id)).toEqual(await netOf('BUY_SELL', fresh.id));
+  });
+
+  it('bhav edit nets like a fresh create; only PENDING is editable', async () => {
+    const s = await setup();
+    const b = await bhav.createBhav(s.ctx, bhavBookingBody.parse({ partyId: s.party.id, metal: 'GOLD', side: 'BUY', weight: 10, rate: 60000, cash: 5000 }));
+    const newBody = bhavBookingBody.parse({ partyId: s.party.id, metal: 'GOLD', side: 'BUY', weight: 8, rate: 61000, payments: [{ mode: 'ONLINE', amount: 7000, bankAccountId: s.bank.id }] });
+    await bhav.updateBhav(s.ctx, b.id, newBody);
+    const fresh = await bhav.createBhav(s.ctx, newBody);
+    expect(await netOf('BHAV_BOOKING', b.id)).toEqual(await netOf('BHAV_BOOKING', fresh.id));
+    await buysell.createBuySell(s.ctx, buySellBody.parse({ partyId: s.party.id, metal: 'GOLD', side: 'BUY', lines: [{ weight: 2, rate: 61000 }], bhavBookingId: b.id, cash: 12200 }));
+    await expect(bhav.updateBhav(s.ctx, b.id, newBody)).rejects.toMatchObject({ status: 409 }); // now PARTIAL
+  });
+
+  it('exchange edit after it was sent to melt → 409', async () => {
+    const s = await setup();
+    const e = await exchange.createExchange(s.ctx, ex({ partyId: s.party.id, side: 'BUY', rate: 0 }));
+    await kacha.processKacha(s.ctx, kachaProcessBody.parse({ type: 'MELT', metal: 'GOLD', inFine: 10, outFine: 9.8, exchangeId: e.id }));
+    await expect(exchange.updateExchange(s.ctx, e.id, ex({ partyId: s.party.id, side: 'BUY', rate: 0 }))).rejects.toMatchObject({ status: 409 });
+  });
+});
+
+describe('bhav undeliver / verify', () => {
+  it('undeliver → 409 while a buy-sell is linked; PENDING again once nothing is linked', async () => {
+    const s = await setup();
+    const book = await bhav.createBhav(s.ctx, bhavBookingBody.parse({ partyId: s.party.id, metal: 'GOLD', side: 'BUY', weight: 10, rate: 60000 }));
+    await buysell.createBuySell(s.ctx, buySellBody.parse({ partyId: s.party.id, metal: 'GOLD', side: 'BUY', lines: [{ weight: 10, rate: 60000 }], bhavBookingId: book.id, cash: 60000 }));
+    await expect(bhav.undeliverBhav(s.ctx, book.id)).rejects.toMatchObject({ status: 409 });
+
+    const orphan = await bhav.createBhav(s.ctx, bhavBookingBody.parse({ partyId: s.party.id, metal: 'GOLD', side: 'BUY', weight: 10, rate: 60000 }));
+    await db.bhavBooking.update({ where: { id: orphan.id }, data: { status: 'DELIVERED', pendingWeight: 0 } });
+    const back = await bhav.undeliverBhav(s.ctx, orphan.id);
+    expect([back.status, back.pendingWeight]).toEqual(['PENDING', '10.000']);
+    await expect(bhav.undeliverBhav(s.ctx, orphan.id)).rejects.toMatchObject({ status: 409 }); // already pending
+  });
+
+  it('verify is idempotent; unverify clears it', async () => {
+    const s = await setup();
+    const book = await bhav.createBhav(s.ctx, bhavBookingBody.parse({ partyId: s.party.id, metal: 'GOLD', side: 'BUY', weight: 10, rate: 60000 }));
+    const v1 = await bhav.verifyBhav(s.ctx, book.id, true);
+    const v2 = await bhav.verifyBhav(s.ctx, book.id, true);
+    expect(v1.verifiedAt).not.toBeNull();
+    expect(v2.verifiedAt).toBe(v1.verifiedAt);
+    expect((await bhav.verifyBhav(s.ctx, book.id, false)).verifiedAt).toBeNull();
+  });
+});

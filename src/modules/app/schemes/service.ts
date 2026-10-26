@@ -6,7 +6,7 @@ import * as udhar from '../../../lib/udhar';
 import { logActivity } from '../../../lib/activity';
 import { HttpError } from '../../../middleware/error';
 import type { TenantContext } from '../../../middleware/context';
-import { moneyToMetal, schemeMaturity } from '../../../shared';
+import { moneyToMetal, schemeMaturity, SCHEME_BANK_MEDIUMS } from '../../../shared';
 import type { SchemeDto, SchemeGroupDto, EnrollmentDto, EnrollmentDetailDto, SchemePaymentDto, SchemeDueRowDto, SchemeDueMonthRowDto, SchemeTxnRowDto, SchemeDayBookDto, SchemeDayBookDayDto } from '../../../shared';
 import { currentRates } from '../service';
 
@@ -75,7 +75,7 @@ export async function createScheme(ctx: TenantContext, body: any): Promise<Schem
   const branchId = activeBranch(ctx);
   const s = await scopedDb(ctx).scheme.create({
     data: {
-      businessId: ctx.businessId!, branchId, kind: body.kind, type: body.type, name: body.name, description: body.description ?? null,
+      businessId: ctx.businessId!, branchId, kind: body.kind, type: body.type, name: body.name, title: body.title ?? null, description: body.description ?? null,
       emiAmount: body.emiAmount, tenureMonths: body.tenureMonths, bonusType: body.bonusType, bonusValue: body.bonusValue,
       startDate: dateOnly(body.startDate), validityDate: body.validityDate ? dateOnly(body.validityDate) : null, createdById: ctx.userId,
     },
@@ -107,7 +107,7 @@ export async function patchScheme(ctx: TenantContext, id: number, body: any): Pr
   if (!(await scopedDb(ctx).scheme.findUnique({ where: { id } }))) throw new HttpError(404, 'NOT_FOUND', 'Scheme not found');
   await scopedDb(ctx).scheme.update({
     where: { id },
-    data: { ...(body.name !== undefined ? { name: body.name } : {}), ...(body.description !== undefined ? { description: body.description } : {}), ...(body.validityDate !== undefined ? { validityDate: body.validityDate ? dateOnly(body.validityDate) : null } : {}), ...(body.isActive !== undefined ? { isActive: body.isActive } : {}) },
+    data: { ...(body.name !== undefined ? { name: body.name } : {}), ...(body.title !== undefined ? { title: body.title } : {}), ...(body.description !== undefined ? { description: body.description } : {}), ...(body.validityDate !== undefined ? { validityDate: body.validityDate ? dateOnly(body.validityDate) : null } : {}), ...(body.isActive !== undefined ? { isActive: body.isActive } : {}) },
   });
   return getScheme(ctx, id);
 }
@@ -144,7 +144,7 @@ export async function enroll(ctx: TenantContext, body: any): Promise<EnrollmentD
   if (!scheme) throw new HttpError(404, 'NOT_FOUND', 'Scheme not found');
   if (!scheme.isActive) throw new HttpError(409, 'CONFLICT', 'Scheme is not active');
   if (!(await sdb.party.findUnique({ where: { id: body.partyId } }))) throw new HttpError(404, 'NOT_FOUND', 'Party not found');
-  if (Number(body.tokenAmount) > 0 && body.tokenMedium === 'ONLINE' && body.tokenBankAccountId == null) throw new HttpError(400, 'VALIDATION', 'Select a bank account for the token');
+  if (Number(body.tokenAmount) > 0 && SCHEME_BANK_MEDIUMS.includes(body.tokenMedium) && body.tokenBankAccountId == null) throw new HttpError(400, 'VALIDATION', 'Select a bank account for the token');
   const goldRate = scheme.type === 'GOLD' ? await todayGoldRate(ctx) : 0;
 
   const enrollmentId = await prisma.$transaction(async (tx) => {
@@ -175,7 +175,7 @@ export async function enroll(ctx: TenantContext, body: any): Promise<EnrollmentD
       // a token paid by another medium posts like an EMI of that medium (ledger/bank), but never takes an installment slot
       const token = tokenMedium === 'TOKEN'
         ? { amount: body.tokenAmount, medium: 'TOKEN' }
-        : { amount: body.tokenAmount, medium: tokenMedium, bankAccountId: tokenMedium === 'ONLINE' ? body.tokenBankAccountId : undefined, remark: 'Joining token', noSlot: true };
+        : { amount: body.tokenAmount, medium: tokenMedium, bankAccountId: SCHEME_BANK_MEDIUMS.includes(tokenMedium) ? body.tokenBankAccountId : undefined, remark: 'Joining token', noSlot: true };
       await postPayment(tx, ctx, enrollment, scheme, token, goldRate);
     }
     if (body.firstPayment) await postPayment(tx, ctx, enrollment, scheme, body.firstPayment, goldRate);
@@ -207,7 +207,7 @@ async function postPayment(tx: Prisma.TransactionClient, ctx: TenantContext, enr
   const gold = scheme.type === 'GOLD';
   const rate = gold ? (input.rate != null ? Number(input.rate) : goldRate) : null;
   const fine = gold ? moneyToMetal(input.amount, rate ?? 0, GOLD_UNIT) : null;
-  if (medium === 'ONLINE' && input.bankAccountId != null && !(await scopedDb(ctx).bankAccount.findUnique({ where: { id: input.bankAccountId } }))) throw new HttpError(404, 'NOT_FOUND', 'Bank account not found');
+  if (SCHEME_BANK_MEDIUMS.includes(medium) && input.bankAccountId != null && !(await scopedDb(ctx).bankAccount.findUnique({ where: { id: input.bankAccountId } }))) throw new HttpError(404, 'NOT_FOUND', 'Bank account not found');
 
   let pay;
   try {
@@ -218,9 +218,9 @@ async function postPayment(tx: Prisma.TransactionClient, ctx: TenantContext, enr
     if (isP2002(e)) throw new HttpError(409, 'CONFLICT', 'That installment is already paid');
     throw e;
   }
-  // CASH/ONLINE/TOKEN move money; DRAW/VENDOR are counted but move nothing
-  if (medium === 'CASH' || medium === 'ONLINE' || medium === 'TOKEN') {
-    await ledger.post(tx, lctxOf(ctx), [{ branchId: enrollment.branchId, txnDate, asset: 'MONEY', direction: 'IN', bankAccountId: medium === 'ONLINE' ? (input.bankAccountId ?? null) : null, amount: input.amount, source: 'SCHEME', sourceId: `${enrollment.id}-${pay.id}`, narration: `Scheme payment (${scheme.name})` }]);
+  // CASH/ONLINE/TOKEN/CHEQUE move money (ONLINE/CHEQUE into the bank); DRAW/VENDOR are counted but move nothing
+  if (medium === 'CASH' || medium === 'ONLINE' || medium === 'TOKEN' || medium === 'CHEQUE') {
+    await ledger.post(tx, lctxOf(ctx), [{ branchId: enrollment.branchId, txnDate, asset: 'MONEY', direction: 'IN', bankAccountId: SCHEME_BANK_MEDIUMS.includes(medium) ? (input.bankAccountId ?? null) : null, amount: input.amount, source: 'SCHEME', sourceId: `${enrollment.id}-${pay.id}`, narration: `Scheme payment (${scheme.name})` }]);
   }
   await logActivity(tx, ctx, { module: 'SCHEME', action: 'CREATED', entity: 'SchemePayment', entityId: String(pay.id), summary: `Scheme payment ₹${input.amount} on ${enrollment.assignId}` });
   return pay;
@@ -253,7 +253,7 @@ export async function reversePayment(ctx: TenantContext, paymentId: number): Pro
     if (status !== 'ACTIVE' && status !== 'WON') throw new HttpError(409, 'CONFLICT', 'Enrollment is closed');
     const r = await tx.schemePayment.updateMany({ where: { id: paymentId, isReversed: false }, data: { isReversed: true, emiNo: null } });
     if (r.count !== 1) throw new HttpError(409, 'CONFLICT', 'Payment already reversed');
-    if (pay.medium === 'CASH' || pay.medium === 'ONLINE' || pay.medium === 'TOKEN') await ledger.reverse(tx, lctxOf(ctx), { source: 'SCHEME', sourceId: `${pay.enrollmentId}-${pay.id}` });
+    if (pay.medium === 'CASH' || pay.medium === 'ONLINE' || pay.medium === 'TOKEN' || pay.medium === 'CHEQUE') await ledger.reverse(tx, lctxOf(ctx), { source: 'SCHEME', sourceId: `${pay.enrollmentId}-${pay.id}` });
     await logActivity(tx, ctx, { module: 'SCHEME', action: 'REVERSED', entity: 'SchemePayment', entityId: String(paymentId), summary: `Reversed scheme payment on ${pay.enrollment.assignId}` });
   });
   return getEnrollment(ctx, pay.enrollmentId);
@@ -409,7 +409,7 @@ async function buildSchemes(ctx: TenantContext, ids: number[]): Promise<SchemeDt
   const countMap = new Map(counts.map((c) => [c.schemeId, c._count._all]));
   const byId = new Map(schemes.map((s) => [s.id, s]));
   return ids.map((id) => byId.get(id)).filter((s): s is NonNullable<typeof s> => !!s).map((s) => ({
-    id: s.id, kind: s.kind, type: s.type, name: s.name, description: s.description, emiAmount: money(s.emiAmount), tenureMonths: s.tenureMonths,
+    id: s.id, kind: s.kind, type: s.type, name: s.name, title: s.title, description: s.description, emiAmount: money(s.emiAmount), tenureMonths: s.tenureMonths,
     bonusType: s.bonusType, bonusValue: s.type === 'GOLD' ? wt(s.bonusValue) : money(s.bonusValue), startDate: s.startDate.toISOString().slice(0, 10),
     validityDate: s.validityDate?.toISOString().slice(0, 10) ?? null, isActive: s.isActive, branch: { id: s.branchId, name: branchMap.get(s.branchId) ?? '' },
     memberCount: countMap.get(s.id) ?? 0, createdAt: s.createdAt.toISOString(),

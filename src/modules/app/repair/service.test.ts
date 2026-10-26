@@ -123,4 +123,47 @@ describe('repair', () => {
     const bParty = await db.party.create({ data: { businessId: other.business.id, type: 'CUSTOMER', name: 'B', mobile: '9111111111', countryCode: '+91' } });
     await expect(repair.createRepair(s.ctx, base({ partyId: bParty.id }) as any)).rejects.toMatchObject({ status: 404 });
   });
+
+  it('TASK-97: deliver with OTHER added metal → value billed, no metal ledger row; DTO shows OTHER + settlement', async () => {
+    const s = await setup();
+    const t = await repair.createRepair(s.ctx, base({ partyId: s.customer.id, labourCharge: 1000, otherCharge: 0, advanceCash: 0, purity: 91.6, subCategory: 'Clasp' }) as any);
+    expect(t.purity).toBe('91.60');
+    expect(t.subCategory).toBe('Clasp');
+    await repair.updateRepairStatus(s.ctx, t.id, { status: 'IN_PROGRESS' });
+    await repair.updateRepairStatus(s.ctx, t.id, { status: 'IN_REVIEW' });
+    await repair.updateRepairStatus(s.ctx, t.id, { status: 'READY', finalWeight: 12, remarks: 'ok' });
+    // 1000 + (1 g × 500) = 1500; − 200 cash − 300 online = 1000
+    const d = await repair.deliverRepair(s.ctx, t.id, { addedMetal: 'OTHER', addedFine: 1, addedRate: 500, cash: 200, online: 300, bankAccountId: s.bank.id } as any);
+    expect(Number(d.balance)).toBe(1000);
+    expect(d.addedMetal).toBe('OTHER');
+    expect(d.addedFine).toBe('1.000');
+    expect(d.deliveryCash).toBe('200.00');
+    expect(d.deliveryBank?.id).toBe(s.bank.id);
+    expect(await db.ledgerEntry.count({ where: { source: 'REPAIR', asset: { in: ['GOLD', 'SILVER'] } } })).toBe(0);
+    expect(await sumUdhar(s.customer.id)).toBe(1000);
+  });
+
+  it('TASK-97: list filters by metal and created date range', async () => {
+    const s = await setup();
+    const g = await repair.createRepair(s.ctx, base({ partyId: s.customer.id }) as any);
+    await repair.createRepair(s.ctx, base({ partyId: s.customer.id, metal: 'SILVER' }) as any);
+    const page = { page: 1, pageSize: 20 };
+    expect((await repair.listRepairs(s.ctx, { ...page, metal: 'GOLD' })).items.map((t) => t.id)).toEqual([g.id]);
+    const today = new Date(new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' }));
+    expect((await repair.listRepairs(s.ctx, { ...page, from: today, to: today })).total).toBe(2);
+    expect((await repair.listRepairs(s.ctx, { ...page, to: new Date(today.getTime() - 86_400_000) })).total).toBe(0);
+  });
+
+  it('TASK-97: consumables CRUD + adjust (never below zero) + status', async () => {
+    const s = await setup();
+    const c = await repair.createConsumable(s.ctx, { name: 'Solder wire', unit: 'g', currentStock: 5, minLevel: 2, isActive: true });
+    expect(c.status).toBe('OK');
+    expect((await repair.listConsumables(s.ctx)).map((x) => x.id)).toEqual([c.id]);
+    expect((await repair.updateConsumable(s.ctx, c.id, { minLevel: 6, category: 'Metal' })).status).toBe('LOW');
+    expect((await repair.adjustConsumable(s.ctx, c.id, { delta: -5, reason: 'used' })).status).toBe('OUT');
+    await expect(repair.adjustConsumable(s.ctx, c.id, { delta: -1 })).rejects.toMatchObject({ status: 409 });
+    expect((await repair.adjustConsumable(s.ctx, c.id, { delta: 10 })).currentStock).toBe('10.000');
+    const other = await createBusiness({ name: 'B' });
+    await expect(repair.updateConsumable(ctxFor(other.business.id, other.root.id), c.id, { name: 'x' })).rejects.toMatchObject({ status: 404 });
+  });
 });

@@ -9,6 +9,7 @@ const ctxFor = (businessId: number, branchIds: number[], activeBranchId: number 
   userId: 1, level: 'ADMIN', isOwner: true, businessId, scopeBranchId: branchIds[0]!, branchIds, activeBranchId,
   readOnly: false, modules: [], limits: null, permissions: {}, impersonatorId: null,
 });
+const dateOnlyStr = (d: Date) => d.toISOString().slice(0, 10);
 const party = (businessId: number, name = 'Cust', type: 'CUSTOMER' | 'SUPPLIER' = 'CUSTOMER') => db.party.create({ data: { businessId, type, name, mobile: '9000000000' } });
 
 async function sellBill(businessId: number, branchId: number, partyId: number, over: Partial<{ final: number; paid: number; billType: 'GST' | 'ROUGH'; cgst: number; sgst: number; billNo: string; seq: number }> = {}) {
@@ -67,6 +68,37 @@ describe('reports dashboard', () => {
     const d = await dashboard(ctxFor(business.id, [root.id], root.id));
     expect(d.udhari.amount).toBe('5000.00'); // −2000 party excluded
     expect(d.cash.inHand).toBe('6000.00'); // 7000 IN − 1000 OUT
+  });
+
+  it('TASK-97: billsAdvance, lastMonth comparables and udharOverdue (FIFO, 30-day rule)', async () => {
+    const { business, root } = await createBusiness({ name: 'A' });
+    const p = await party(business.id);
+    const today = businessDate();
+    const [y, m, d] = [today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate()];
+    const prevDay = new Date(Date.UTC(y, m - 1, Math.min(d, new Date(Date.UTC(y, m, 0)).getUTCDate())));
+    await sellBill(business.id, root.id, p.id, { final: 10300, paid: 12000, seq: 1, billNo: 'INV-1' }); // overpaid 1700 = advance
+    await db.bill.update({ where: { id: (await sellBill(business.id, root.id, p.id, { final: 5000, paid: 1000, seq: 2, billNo: 'INV-2' })).id }, data: { billDate: prevDay } });
+
+    const ago = (n: number) => new Date(today.getTime() - n * 86_400_000);
+    const late = await party(business.id, 'Late');
+    const fresh = await party(business.id, 'Fresh');
+    const metal = await party(business.id, 'Metal');
+    const e = (partyId: number, txnDate: Date, v: { amount?: number; gold?: number }, sourceId: string) => ({ businessId: business.id, branchId: root.id, partyId, txnDate, ...v, source: 'UDHAR', sourceId });
+    await db.udharEntry.createMany({
+      data: [
+        e(late.id, ago(60), { amount: 5000 }, '1'), e(late.id, ago(10), { amount: -1000 }, '2'), e(late.id, ago(5), { amount: 2000 }, '3'), // bal 6000 → 2000 newest covers part, 5000 @60d is oldest unpaid
+        e(fresh.id, ago(5), { amount: 3000 }, '4'), // not yet due
+        e(metal.id, ago(40), { gold: 2 }, '5'),
+      ],
+    });
+
+    const r = await dashboard(ctxFor(business.id, [root.id], root.id));
+    expect(r.billsAdvance).toBe('1700.00');
+    expect(r.lastMonth).toMatchObject({ todayTotal: '5000.00', todayCount: 1, todayReceived: '1000.00', monthTotal: '5000.00' });
+    expect(r.udharOverdue!.map((o) => [o.party.name, o.amount, o.gold, o.since, o.daysOverdue])).toEqual([
+      ['Late', '6000.00', '0.000', dateOnlyStr(ago(60)), 30],
+      ['Metal', '0.00', '2.000', dateOnlyStr(ago(40)), 10],
+    ]);
   });
 
   it('byBranch present only with X-Branch-Id: all', async () => {

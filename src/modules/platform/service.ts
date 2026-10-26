@@ -73,6 +73,8 @@ const subDto = (s: any): SubscriptionDto => ({
   notes: s.notes,
   createdAt: s.createdAt.toISOString(),
 });
+/** business name + the linked subscription's plan name for PaymentDto */
+const PAYMENT_INCLUDE = { business: true, subscription: { select: { plan: { select: { name: true } } } } } satisfies Prisma.SubscriptionPaymentInclude;
 const paymentDto = (p: any): PaymentDto => ({
   id: p.id,
   businessId: p.businessId,
@@ -85,6 +87,8 @@ const paymentDto = (p: any): PaymentDto => ({
   paidAt: p.paidAt ? p.paidAt.toISOString() : null,
   createdAt: p.createdAt.toISOString(),
   hasProof: p.screenshotUrl != null,
+  // PENDING-MIGRATION (subscription_payment_plan): prefer the requested plan (p.plan) once SubscriptionPayment.planId exists.
+  planName: p.subscription?.plan?.name ?? null,
 });
 const signupDto = (s: any, stateName: string, districtName: string | null): SignupRequestDto => ({
   id: s.id,
@@ -239,6 +243,7 @@ export async function createBusiness(superAdminId: number, body: CreateBusinessI
       name: body.name,
       ownerName: body.ownerName,
       mobile: body.mobile,
+      alternateMobile: body.alternateMobile,
       email: body.email,
       gstin: body.gstin,
       address: body.address,
@@ -260,7 +265,7 @@ export async function businessDetail(businessId: number): Promise<BusinessDetail
     where: { id: businessId },
     include: {
       subscriptions: { orderBy: { endsAt: 'desc' }, include: { plan: true } },
-      payments: { orderBy: { createdAt: 'desc' }, include: { business: true } },
+      payments: { orderBy: { createdAt: 'desc' }, include: PAYMENT_INCLUDE },
       users: { where: { isOwner: true }, take: 1 },
       _count: { select: { branches: true, users: true } },
     },
@@ -273,6 +278,7 @@ export async function businessDetail(businessId: number): Promise<BusinessDetail
   const owner = b.users[0];
   return {
     ...businessListItem(b, now, in15),
+    alternateMobile: b.alternateMobile,
     email: b.email,
     gstin: b.gstin,
     address: b.address,
@@ -347,7 +353,7 @@ export async function updateSubscription(subscriptionId: number, body: UpdateSub
 
 export async function listPayments(query: { page: number; pageSize: number }): Promise<Paged<PaymentDto>> {
   const [rows, total] = await Promise.all([
-    prisma.subscriptionPayment.findMany({ include: { business: true }, skip: (query.page - 1) * query.pageSize, take: query.pageSize, orderBy: { createdAt: 'desc' } }),
+    prisma.subscriptionPayment.findMany({ include: PAYMENT_INCLUDE, skip: (query.page - 1) * query.pageSize, take: query.pageSize, orderBy: { createdAt: 'desc' } }),
     prisma.subscriptionPayment.count(),
   ]);
   return { items: rows.map(paymentDto), total, page: query.page, pageSize: query.pageSize };
@@ -356,7 +362,7 @@ export async function listPayments(query: { page: number; pageSize: number }): P
 export async function recordPayment(businessId: number, body: RecordPaymentInput): Promise<PaymentDto> {
   const p = await prisma.subscriptionPayment.create({
     data: { businessId, subscriptionId: body.subscriptionId ?? null, amount: body.amount, method: body.method, utr: body.utr ?? null, status: body.status, paidAt: body.paidAt ?? (body.status === 'CONFIRMED' ? new Date() : null) },
-    include: { business: true },
+    include: PAYMENT_INCLUDE,
   });
   return paymentDto(p);
 }
@@ -371,7 +377,7 @@ export async function reviewPayment(paymentId: number, status: 'CONFIRMED' | 'RE
     const exists = await prisma.subscriptionPayment.findUnique({ where: { id: paymentId }, select: { id: true } });
     throw exists ? new HttpError(409, 'CONFLICT', 'Payment already reviewed') : new HttpError(404, 'NOT_FOUND', 'Payment not found');
   }
-  return paymentDto(await prisma.subscriptionPayment.findUniqueOrThrow({ where: { id: paymentId }, include: { business: true } }));
+  return paymentDto(await prisma.subscriptionPayment.findUniqueOrThrow({ where: { id: paymentId }, include: PAYMENT_INCLUDE }));
 }
 
 // ───────────── Impersonation ─────────────
@@ -407,6 +413,7 @@ interface CreateBusinessInput {
   name: string;
   ownerName: string;
   mobile: string;
+  alternateMobile?: string | null;
   email?: string;
   gstin?: string;
   address?: string;
@@ -458,6 +465,7 @@ async function provisionBusiness(
     name: string;
     ownerName: string;
     mobile: string;
+    alternateMobile?: string | null;
     email?: string;
     gstin?: string;
     address?: string;
@@ -473,7 +481,7 @@ async function provisionBusiness(
 ): Promise<{ id: number }> {
   const plan = await tx.plan.findUniqueOrThrow({ where: { id: data.planId } });
   const business = await tx.business.create({
-    data: { name: data.name, ownerName: data.ownerName, mobile: data.mobile, email: data.email ?? null, gstin: data.gstin ?? null, address: data.address ?? null, stateId: data.stateId ?? null, districtId: data.districtId ?? null },
+    data: { name: data.name, ownerName: data.ownerName, mobile: data.mobile, alternateMobile: data.alternateMobile ?? null, email: data.email ?? null, gstin: data.gstin ?? null, address: data.address ?? null, stateId: data.stateId ?? null, districtId: data.districtId ?? null },
   });
   const root = await tx.branch.create({ data: { businessId: business.id, name: data.rootBranchName ?? data.name, isAdminNode: true, depth: 0, path: '' } });
   await tx.branch.update({ where: { id: root.id }, data: { path: `/${root.id}/` } });

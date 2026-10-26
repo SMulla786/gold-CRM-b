@@ -36,7 +36,7 @@ export const udharBody = z
         unitGrams: z.union([z.literal(1), z.literal(10), z.literal(1000)]),
       })
       .optional(),
-    /** apply (cashIn + onlineIn) to this pending SELL bill of the same party (adds a BillPayment) */
+    /** apply (cashIn + onlineIn) to this pending SELL bill, or (cashOut + onlineOut) to this pending PURCHASE bill, of the same party (adds BillPayments) */
     settleBillId: id.optional(),
     remark: z.string().trim().max(300).optional(),
   })
@@ -45,7 +45,7 @@ export const udharBody = z
   .refine((b) => b.cashOut + b.onlineOut + b.cashIn + b.onlineIn + b.goldOut + b.goldIn + b.silverOut + b.silverIn > 0 || b.bhav != null, {
     message: 'Enter an amount, a metal weight or a bhav cut',
   })
-  .refine((b) => b.settleBillId == null || b.cashIn + b.onlineIn > 0, { message: 'Enter the amount received to settle the bill', path: ['settleBillId'] });
+  .refine((b) => b.settleBillId == null || b.cashIn + b.onlineIn + b.cashOut + b.onlineOut > 0, { message: 'Enter the amount received or paid to settle the bill', path: ['settleBillId'] });
 export type UdharBody = z.infer<typeof udharBody>;
 
 export interface BalanceDto {

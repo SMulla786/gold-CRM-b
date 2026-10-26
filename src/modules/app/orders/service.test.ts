@@ -136,4 +136,43 @@ describe('orders', () => {
     const order = await makeOrder(s.ctx, s.itemName.id, s.customer.id);
     await expect(orders.createKarigarIssue(s.ctx, { karigarId: s.customer.id, orderItemIds: [order.items[0]!.id], goldFine: 1, silverFine: 0, cash: 0, online: 0 } as any)).rejects.toMatchObject({ status: 400 });
   });
+
+  it('TASK-97: estTotal unchanged without the new fields; adds labour + misc, wastageGm adds fine (NET basis)', async () => {
+    const s = await setup();
+    const plain = await makeOrder(s.ctx, s.itemName.id, s.customer.id);
+    // 10 g net × 60000/10 g = 60000 metal + 10 g × 500 making = 65000 (default NET basis)
+    expect(plain.estTotal).toBe('65000.00');
+    expect(plain.miscCharges).toBe('0.00');
+    expect(plain.items[0]!.labour).toBe('0.00');
+    expect(plain.items[0]!.wastageGm).toBe('0.000');
+    const extra = await orders.createOrder(s.ctx, { partyId: s.customer.id, rateType: 'ON_DELIVERY', isUrgent: false, miscCharges: 150, items: [orderItem({ itemNameId: s.itemName.id, labour: 300, wastageGm: 0.5 })], payments: [] } as any);
+    expect(extra.estTotal).toBe('65450.00');
+    expect(extra.items[0]!.estTotal).toBe('65300.00');
+    expect(Number(extra.items[0]!.fine)).toBeCloseTo(Number(plain.items[0]!.fine) + 0.5, 3);
+    expect(extra.miscCharges).toBe('150.00');
+  });
+
+  it('TASK-97: wastageGm reaches the money only on FINE basis; rate override drives estTotal + FIXED lock', async () => {
+    const s = await setup();
+    expect(orders.orderLineExtras({ fine: '9.167', total: '1000.00' }, { wastageGm: 0, labour: 0, rate: 60000, unitGrams: 10, basis: 'FINE' })).toEqual({ fine: '9.167', total: '1000.00' });
+    expect(orders.orderLineExtras({ fine: '9.167', total: '1000.00' }, { wastageGm: 0.5, labour: 100, rate: 60000, unitGrams: 10, basis: 'FINE' })).toEqual({ fine: '9.667', total: '4100.00' });
+    const o = await orders.createOrder(s.ctx, { partyId: s.customer.id, rateType: 'FIXED', isUrgent: false, goldRate: 70000, items: [orderItem({ itemNameId: s.itemName.id })], payments: [] } as any);
+    expect(o.estTotal).toBe('75000.00'); // 10 g × 7000 + 5000 making
+    expect(o.goldRate).toBe('70000.00');
+  });
+
+  it('TASK-97: karigar wastage stored; list statuses filter', async () => {
+    const s = await setup();
+    const o1 = await makeOrder(s.ctx, s.itemName.id, s.customer.id);
+    const o2 = await makeOrder(s.ctx, s.itemName.id, s.customer.id);
+    const issue = await orders.createKarigarIssue(s.ctx, { karigarId: s.karigar.id, orderItemIds: [o1.items[0]!.id], goldFine: 0, silverFine: 0, cash: 0, online: 0, wastagePercent: 2.5, wastageGm: 0.2 } as any);
+    expect(issue.wastagePercent).toBe('2.500');
+    expect(issue.wastageGm).toBe('0.200');
+    await orders.cancelOrder(s.ctx, o2.id);
+    const page = { page: 1, pageSize: 20 };
+    expect((await orders.listOrders(s.ctx, { ...page, statuses: ['IN_PROCESS', 'CANCELLED'] })).total).toBe(2);
+    expect((await orders.listOrders(s.ctx, { ...page, statuses: ['PENDING'] })).total).toBe(0);
+    expect((await orders.listOrders(s.ctx, { ...page, status: 'CANCELLED', statuses: ['IN_PROCESS', 'CANCELLED'] })).items.map((o) => o.id)).toEqual([o2.id]);
+  });
 });
+

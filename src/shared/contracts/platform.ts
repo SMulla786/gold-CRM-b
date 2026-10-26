@@ -39,6 +39,8 @@ export const createBusinessBody = z.object({
   name: z.string().trim().min(2).max(120),
   ownerName: z.string().trim().min(2).max(120),
   mobile,
+  /** Shop 'Alternate No'; null clears it on update. */
+  alternateMobile: mobile.nullable().optional(),
   email: z.string().email().optional(),
   gstin: gstin.optional(),
   address: z.string().max(500).optional(),
@@ -75,14 +77,26 @@ export const updateSubscriptionBody = z.object({
   notes: z.string().max(500).optional(),
 });
 
-export const recordPaymentBody = z.object({
-  amount: z.number().positive(),
-  method: z.enum(['UPI', 'CASH', 'BANK', 'GATEWAY']),
-  utr: z.string().trim().max(40).optional(),
-  paidAt: z.coerce.date().optional(),
-  subscriptionId: id.optional(),
-  status: z.enum(['PENDING', 'CONFIRMED', 'REJECTED']).default('CONFIRMED'),
-});
+/** A UPI transaction reference (UTR / RRN) is exactly 12 digits. */
+export const UPI_UTR_RE = /^\d{12}$/;
+
+export const recordPaymentBody = z
+  .object({
+    amount: z.number().positive(),
+    method: z.enum(['UPI', 'CASH', 'BANK', 'GATEWAY']),
+    utr: z.string().trim().max(40).optional(),
+    paidAt: z.coerce.date().optional(),
+    subscriptionId: id.optional(),
+    /** Plan the business is paying for (renew / choose plan). Must be an active plan. */
+    planId: id.optional(),
+    status: z.enum(['PENDING', 'CONFIRMED', 'REJECTED']).default('CONFIRMED'),
+  })
+  // A UPI UTR, when given, must be exactly 12 digits; other methods keep the free-form reference.
+  .superRefine((b, ctx) => {
+    if (b.method === 'UPI' && b.utr && !UPI_UTR_RE.test(b.utr)) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['utr'], message: 'UPI UTR must be exactly 12 digits' });
+    }
+  });
 
 /** TASK-95: Super Admin decides a business-submitted payment (only while PENDING). */
 export const reviewPaymentBody = z.object({ status: z.enum(['CONFIRMED', 'REJECTED']) });
@@ -163,6 +177,8 @@ export interface PaymentDto {
   createdAt: string;
   /** TASK-95: a payment screenshot was uploaded (GET /platform/payments/:id/proof) */
   hasProof: boolean;
+  /** Plan the business asked for when submitting, else the linked subscription's plan. */
+  planName?: string | null;
 }
 
 /** Row in /platform/businesses. subscriptionState: active | expiring (≤15 days) | expired | none */
@@ -181,6 +197,7 @@ export interface BusinessListItemDto {
 }
 
 export interface BusinessDetailDto extends BusinessListItemDto {
+  alternateMobile: string | null;
   email: string | null;
   gstin: string | null;
   address: string | null;

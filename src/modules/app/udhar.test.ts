@@ -2,7 +2,7 @@ import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { db, truncateAll } from '../../../test/helpers/db';
 import { createBusiness } from '../../../test/helpers/factory';
 import type { TenantContext } from '../../middleware/context';
-import { createUdharTxn, deleteUdharTxn, listEntries, listLedger, partyBalance, updateUdharTxn } from './udhar';
+import { createUdharTxn, deleteUdharTxn, getUdharTxn, listEntries, listLedger, partyBalance, updateUdharTxn } from './udhar';
 
 const ctxFor = (businessId: number, branchIds: number[], activeBranchId: number): TenantContext => ({
   userId: 1,
@@ -37,6 +37,26 @@ describe('udhar txn posting', () => {
     expect(rows.filter((r) => r.asset === 'MONEY' && r.direction === 'IN')).toHaveLength(1);
     expect(dto.final).toEqual({ amount: '3000.00', gold: '0.000', silver: '0.000' }); // 5000 given − 2000 received
     expect(dto.old).toEqual({ amount: '0.00', gold: '0.000', silver: '0.000' });
+  });
+
+  it('reprint keeps old/final as of that txn: later txns ignored, backdated ones and edits counted', async () => {
+    const { business, root } = await createBusiness({ name: 'A' });
+    const ctx = ctxFor(business.id, [root.id], root.id);
+    const p = await makeParty(business.id);
+    const num = { onlineOut: 0, cashIn: 0, onlineIn: 0, goldOut: 0, goldIn: 0, silverOut: 0, silverIn: 0 };
+    await createUdharTxn(ctx, { partyId: p.id, cashOut: 1000, ...num, txnDate: new Date('2026-05-01') } as never);
+    const b = await createUdharTxn(ctx, { partyId: p.id, cashOut: 500, ...num, txnDate: new Date('2026-05-10') } as never);
+    await createUdharTxn(ctx, { partyId: p.id, cashOut: 300, ...num, txnDate: new Date('2026-05-10') } as never); // same day, after b
+    await createUdharTxn(ctx, { partyId: p.id, cashOut: 700, ...num, txnDate: new Date('2026-06-01') } as never); // later
+
+    const again = await getUdharTxn(ctx, b.id);
+    expect(again.old.amount).toBe('1000.00');
+    expect(again.final.amount).toBe('1500.00'); // not today's 2500
+
+    await createUdharTxn(ctx, { partyId: p.id, cashOut: 0, ...num, cashIn: 200, txnDate: new Date('2026-05-05') } as never); // backdated before b
+    const edited = await updateUdharTxn(ctx, b.id, { partyId: p.id, cashOut: 600, ...num, txnDate: new Date('2026-05-10') } as never);
+    expect(edited.old.amount).toBe('800.00');
+    expect(edited.final.amount).toBe('1400.00');
   });
 
   it('online payment needs a valid bank account (404)', async () => {
@@ -141,6 +161,68 @@ describe('udhar txn posting', () => {
     expect(await partyBalance(ctx, p.id)).toEqual({ amount: '0.00', gold: '0.000', silver: '0.000' });
     expect((await db.bill.findUniqueOrThrow({ where: { id: bill.id } })).paid.toString()).toBe('0');
     await expect(updateUdharTxn(ctx, dto.id, { partyId: p.id, ...zero, cashOut: 1 } as never)).rejects.toMatchObject({ status: 404 }); // deleted → not editable
+  });
+
+  describe('settle a pending PURCHASE bill (money paid out to the supplier)', () => {
+    const zero = { cashOut: 0, onlineOut: 0, cashIn: 0, onlineIn: 0, goldOut: 0, goldIn: 0, silverOut: 0, silverIn: 0 };
+    const setup = async () => {
+      const { business, root } = await createBusiness({ name: 'A' });
+      const ctx = ctxFor(business.id, [root.id], root.id);
+      const p = await db.party.create({ data: { businessId: business.id, type: 'SUPPLIER', name: 'Supp', mobile: '9999999998' } });
+      const bill = await db.bill.create({
+        data: { businessId: business.id, branchId: root.id, kind: 'PURCHASE', billType: 'GST', billNo: 'PUR-1', seq: 1, partyId: p.id, billDate: new Date('2026-01-01'), sub: 10000, taxable: 10000, total: 10000, final: 10000 },
+      });
+      // the unpaid purchase bill leaves the shop owing the supplier (− = shop owes party)
+      await db.udharEntry.create({ data: { businessId: business.id, branchId: root.id, partyId: p.id, txnDate: new Date('2026-01-01'), amount: -10000, gold: 0, silver: 0, source: 'PURCHASE_BILL', sourceId: String(bill.id) } });
+      return { business, root, ctx, p, bill };
+    };
+    const paid = async (billId: number) => (await db.bill.findUniqueOrThrow({ where: { id: billId } })).paid.toString();
+
+    it('post: BillPayment for the paid-out money, bill.paid up, shop owes less, MONEY OUT ledger', async () => {
+      const { business, ctx, p, bill } = await setup();
+      const dto = await createUdharTxn(ctx, { partyId: p.id, ...zero, cashOut: 4000, settleBillId: bill.id } as never);
+      expect(await paid(bill.id)).toBe('4000');
+      const pays = await db.billPayment.findMany({ where: { billId: bill.id } });
+      expect(pays.map((x) => [x.mode, x.amount.toString(), x.udharTxnId])).toEqual([['CASH', '4000', dto.id]]);
+      expect(dto.final.amount).toBe('-6000.00'); // owed 10000, paid 4000
+      const rows = await ledgerRows(business.id, String(dto.id));
+      expect(rows.map((r) => [r.asset, r.direction, r.amount?.toString()])).toEqual([['MONEY', 'OUT', '4000']]);
+    });
+
+    it('received money is not applied to a purchase bill (400)', async () => {
+      const { ctx, p, bill } = await setup();
+      await expect(createUdharTxn(ctx, { partyId: p.id, ...zero, cashIn: 500, settleBillId: bill.id } as never)).rejects.toMatchObject({ status: 400 });
+      expect(await paid(bill.id)).toBe('0');
+    });
+
+    it('over-balance: paying more than the bill due is 409 and nothing is posted', async () => {
+      const { business, ctx, p, bill } = await setup();
+      await createUdharTxn(ctx, { partyId: p.id, ...zero, cashOut: 7000, settleBillId: bill.id } as never);
+      await expect(createUdharTxn(ctx, { partyId: p.id, ...zero, cashOut: 3001, settleBillId: bill.id } as never)).rejects.toMatchObject({ status: 409 });
+      expect(await paid(bill.id)).toBe('7000');
+      expect(await db.ledgerEntry.count({ where: { businessId: business.id, source: 'UDHAR' } })).toBe(1); // rolled back
+    });
+
+    it('edit re-applies the settlement; delete reverses everything back to zero', async () => {
+      const { ctx, p, bill } = await setup();
+      const dto = await createUdharTxn(ctx, { partyId: p.id, ...zero, cashOut: 4000, settleBillId: bill.id } as never);
+      const edited = await updateUdharTxn(ctx, dto.id, { partyId: p.id, ...zero, cashOut: 2500, settleBillId: bill.id } as never);
+      expect(edited.final.amount).toBe('-7500.00');
+      expect(await paid(bill.id)).toBe('2500');
+      expect(await db.billPayment.count({ where: { billId: bill.id, isActive: true } })).toBe(1);
+
+      await deleteUdharTxn(ctx, dto.id);
+      expect(await paid(bill.id)).toBe('0');
+      expect(await db.billPayment.count({ where: { billId: bill.id, isActive: true } })).toBe(0);
+      expect(await partyBalance(ctx, p.id)).toEqual({ amount: '-10000.00', gold: '0.000', silver: '0.000' }); // back to the bill's own balance
+    });
+
+    it('DAY_CLOSED: a closed branch-day blocks the settlement (403) and the bill stays unpaid', async () => {
+      const { business, root, ctx, p, bill } = await setup();
+      await db.dayBook.create({ data: { businessId: business.id, branchId: root.id, date: new Date('2026-02-01'), status: 'CLOSED' } });
+      await expect(createUdharTxn(ctx, { partyId: p.id, ...zero, cashOut: 1000, settleBillId: bill.id, txnDate: new Date('2026-02-01') } as never)).rejects.toMatchObject({ status: 403, code: 'DAY_CLOSED' });
+      expect(await paid(bill.id)).toBe('0');
+    });
   });
 
   it('udhar list: BHAV_CUT rows describe the conversion in narration', async () => {

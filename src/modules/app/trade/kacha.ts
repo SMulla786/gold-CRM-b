@@ -57,8 +57,16 @@ export async function revertKacha(ctx: TenantContext, id: number): Promise<Kacha
 
 export async function kachaBalanceCard(ctx: TenantContext, query: z.infer<typeof kachaBalanceQuery>): Promise<KachaBalanceDto> {
   const branchId = activeBranch(ctx);
-  const { kacha, bullion } = await kachaBalance(prisma, branchId, query.metal);
-  return { metal: query.metal, kachaFine: wt(kacha), bullionFine: wt(bullion) };
+  if (query.metal) {
+    const { kacha, bullion } = await kachaBalance(prisma, branchId, query.metal);
+    return { metal: query.metal, kachaFine: wt(kacha), bullionFine: wt(bullion) };
+  }
+  // All metals: each metal separately (never summed across metals); top level stays GOLD for older readers.
+  const byMetal = await Promise.all((['GOLD', 'SILVER'] as const).map(async (metal) => {
+    const { kacha, bullion } = await kachaBalance(prisma, branchId, metal);
+    return { metal, kachaFine: wt(kacha), bullionFine: wt(bullion) };
+  }));
+  return { ...byMetal[0]!, byMetal };
 }
 
 // ───────────── DTO + list/get ─────────────
@@ -79,7 +87,7 @@ async function getKacha(ctx: TenantContext, id: number): Promise<KachaProcessDto
 
 export async function listKacha(ctx: TenantContext, query: z.infer<typeof kachaListQuery>): Promise<Paged<KachaProcessDto>> {
   const sdb = scopedDb(ctx);
-  const where: any = { ...(query.metal ? { metal: query.metal } : {}) };
+  const where: any = { ...(query.metal ? { metal: query.metal } : {}), ...(query.type ? { type: query.type } : {}) };
   const [rows, total] = await Promise.all([
     sdb.kachaProcess.findMany({ where, orderBy: { id: 'desc' }, skip: (query.page - 1) * query.pageSize, take: query.pageSize }),
     sdb.kachaProcess.count({ where }),

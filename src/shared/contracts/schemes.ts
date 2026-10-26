@@ -13,14 +13,18 @@ export const SCHEME_KINDS = ['SAVING', 'ANJUMAN'] as const;
 export const SCHEME_TYPES = ['CASH', 'GOLD'] as const;
 export const SCHEME_BONUS_TYPES = ['NONE', 'ONE_EMI', 'PERCENT', 'FIXED'] as const;
 export const ENROLLMENT_STATUSES = ['ACTIVE', 'WON', 'WITHDRAWN', 'CLOSED'] as const;
-/** CASH/ONLINE/TOKEN = money in (ledger SCHEME IN); DRAW/VENDOR = counted as paid, no money moved */
-export const SCHEME_PAY_MEDIUMS = ['CASH', 'ONLINE', 'TOKEN', 'DRAW', 'VENDOR'] as const;
+/** CASH/ONLINE/TOKEN/CHEQUE = money in (ledger SCHEME IN; ONLINE/CHEQUE into the chosen bank); DRAW/VENDOR = counted as paid, no money moved */
+export const SCHEME_PAY_MEDIUMS = ['CASH', 'ONLINE', 'TOKEN', 'DRAW', 'VENDOR', 'CHEQUE'] as const;
+/** media that need a bank account */
+export const SCHEME_BANK_MEDIUMS: readonly string[] = ['ONLINE', 'CHEQUE'];
 
 export const schemeBody = z
   .object({
     kind: z.enum(SCHEME_KINDS).default('SAVING'),
     type: z.enum(SCHEME_TYPES),
     name: z.string().trim().min(2).max(80),
+    /** optional display title (Anjuman: Title + Scheme Name) */
+    title: z.string().trim().min(1).max(80).optional(),
     description: z.string().trim().max(300).optional(),
     /** 0 allowed for an ad-hoc Anjuman (no fixed EMI) */
     emiAmount: decimalInput,
@@ -38,6 +42,8 @@ export const schemeBody = z
 /** PATCH /app/schemes/:id — rename / describe / validity / active toggle (amounts and bonus are fixed once members exist) */
 export const schemePatchBody = z.object({
   name: z.string().trim().min(2).max(80).optional(),
+  /** null clears it */
+  title: z.string().trim().min(1).max(80).nullable().optional(),
   description: z.string().trim().max(300).optional(),
   validityDate: z.coerce.date().nullable().optional(),
   isActive: z.boolean().optional(),
@@ -57,7 +63,7 @@ export const schemePaymentInput = z
     rate: decimalInput.optional(),
     remark: z.string().trim().max(200).optional(),
   })
-  .refine((p) => p.medium !== 'ONLINE' || p.bankAccountId != null, { message: 'Select a bank account', path: ['bankAccountId'] });
+  .refine((p) => !SCHEME_BANK_MEDIUMS.includes(p.medium) || p.bankAccountId != null, { message: 'Select a bank account', path: ['bankAccountId'] });
 
 export const enrollmentBody = z.object({
   schemeId: id,
@@ -139,6 +145,7 @@ export interface SchemeDto {
   kind: (typeof SCHEME_KINDS)[number];
   type: (typeof SCHEME_TYPES)[number];
   name: string;
+  title?: string | null;
   description: string | null;
   emiAmount: string;
   tenureMonths: number;

@@ -246,6 +246,28 @@ describe('schemes', () => {
     expect(book.days![2]!.txnCount).toBe(1);
   });
 
+  it('CHEQUE posts money IN to the chosen bank like ONLINE (bank required); reversal undoes it', async () => {
+    const { addSchemePaymentBody } = await import('../../../shared');
+    expect(addSchemePaymentBody.safeParse({ enrollmentId: 1, amount: 100, medium: 'CHEQUE' }).success).toBe(false);
+    const s = await setup();
+    const scheme = await cashScheme(s.ctx);
+    const e = await schemes.enroll(s.ctx, { schemeId: scheme.id, partyId: s.party.id, assignId: 'C1', displayName: 'C', tokenAmount: 0 } as any);
+    const paid = await schemes.addPayment(s.ctx, { enrollmentId: e.id, emiNo: 1, amount: 2000, medium: 'CHEQUE', bankAccountId: s.bank.id } as any);
+    expect(paid.emisPaid).toBe(1);
+    const rows = await db.ledgerEntry.findMany({ where: { source: 'SCHEME', asset: 'MONEY' } });
+    expect(rows.map((r) => [r.direction, r.bankAccountId])).toEqual([['IN', s.bank.id]]);
+    await schemes.reversePayment(s.ctx, paid.payments[0]!.id);
+    expect(await db.ledgerEntry.count({ where: { source: 'SCHEME', asset: 'MONEY' } })).toBeGreaterThan(1); // reversal row posted
+  });
+
+  it('scheme title: set on create, changed and cleared by patch', async () => {
+    const s = await setup();
+    const scheme = await cashScheme(s.ctx, { kind: 'ANJUMAN', title: 'Ramzan 2027' });
+    expect(scheme.title).toBe('Ramzan 2027');
+    expect((await schemes.patchScheme(s.ctx, scheme.id, { title: 'Eid' })).title).toBe('Eid');
+    expect((await schemes.patchScheme(s.ctx, scheme.id, { title: null })).title).toBeNull();
+  });
+
   it('cross-tenant party / scheme → 404', async () => {
     const s = await setup();
     const scheme = await cashScheme(s.ctx);
