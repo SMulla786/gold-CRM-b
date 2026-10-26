@@ -21,6 +21,7 @@ import type {
   StockEntryResultDto,
   StockImportResultDto,
   StockItemDto,
+  StockListPage,
   StockSummaryDto,
   StockTransferDetailDto,
   StockTransferDto,
@@ -304,7 +305,9 @@ export async function createStockEntry(ctx: TenantContext, body: { stockClass: S
 /** Shared stockListQuery → where (item list + group-wise roll-up). q matches tag no, HUID or item name. */
 function stockWhere(query: any): any {
   return {
-    status: query.status,
+    // ALL = every status except DELETED (deleted rows only show when asked for explicitly).
+    status: query.status === 'ALL' ? { not: 'DELETED' } : query.status,
+    ...(query.jewelleryTypeId ? { group: { jewelleryTypeId: query.jewelleryTypeId } } : {}),
     ...(query.stockClass ? { stockClass: query.stockClass } : {}),
     ...(query.method ? { method: query.method } : {}),
     ...(query.groupId ? { groupId: query.groupId } : {}),
@@ -316,14 +319,16 @@ function stockWhere(query: any): any {
   };
 }
 
-export async function listStock(ctx: TenantContext, query: any): Promise<Paged<StockItemDto>> {
+export async function listStock(ctx: TenantContext, query: any): Promise<StockListPage> {
   const sdb = scopedDb(ctx);
   const where = stockWhere(query);
-  const [rows, total] = await Promise.all([
+  const [rows, total, sums] = await Promise.all([
     sdb.stockItem.findMany({ where, include: { group: true, itemName: true }, skip: (query.page - 1) * query.pageSize, take: query.pageSize, orderBy: { id: 'desc' } }),
     sdb.stockItem.count({ where }),
+    sdb.stockItem.aggregate({ where, _sum: { pcs: true, gross: true, net: true, fine: true } }),
   ]);
-  return { items: await decorateStock(ctx, rows), total, page: query.page, pageSize: query.pageSize };
+  const totals = { pcs: sums._sum.pcs ?? 0, gross: num(sums._sum.gross ?? 0), net: num(sums._sum.net ?? 0), fine: num(sums._sum.fine ?? 0) };
+  return { items: await decorateStock(ctx, rows), total, page: query.page, pageSize: query.pageSize, totals };
 }
 
 export async function getStock(ctx: TenantContext, id: number): Promise<StockItemDto> {

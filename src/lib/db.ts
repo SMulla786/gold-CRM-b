@@ -70,6 +70,11 @@ const TENANT_MODELS: Record<string, Scope> = {
   Scheme: 'branch',
   SchemeEnrollment: 'branch',
   ActivityLog: 'branch',
+  // TASK-97 additions (BhavBookingLine goes through its scoped BhavBooking):
+  RepairConsumable: 'branch',
+  SetStockLog: 'branch',
+  TagTemplate: 'business',
+  TradePayment: 'business',
   // BillItem/BillPayment have no businessId — always reached through a scoped Bill (handled in services).
   // JewelleryType omitted (nullable businessId: global + custom) — scoped in its service like Role.
   // TagSequence omitted — incremented via a raw locked UPDATE inside the stock-entry tx with explicit businessId.

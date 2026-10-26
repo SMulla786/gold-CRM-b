@@ -13,18 +13,24 @@ import {
   itemNameBody,
   itemNameListQuery,
   jewelleryTypeBody,
+  printerSettingsBody,
+  setStockBody,
+  setStockLogQuery,
   shortageQuery,
   stockEntryBody,
   stockImportFields,
   stockListQuery,
   stockTransferBody,
   stockTransferListQuery,
+  tagTemplateBody,
   updateItemGroupBody,
   updateItemNameBody,
   updateStockItemBody,
+  updateTagTemplateBody,
 } from '../../shared';
 import type { StockClass } from '../../shared';
 import * as inv from './inventory';
+import * as extras from './inventory-extras';
 
 export const inventoryRouter = Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 2 * 1024 * 1024 } });
@@ -41,7 +47,24 @@ inventoryRouter.get('/item-names', requirePermission(MASTERS, 'view'), async (re
 inventoryRouter.post('/item-names', requirePermission(MASTERS, 'edit'), async (req, res) => res.status(201).json(await inv.createItemName(req.ctx!, itemNameBody.parse(req.body))));
 inventoryRouter.patch('/item-names/:id', requirePermission(MASTERS, 'edit'), async (req, res) => res.json(await inv.updateItemName(req.ctx!, idSchema.parse(req.params.id), updateItemNameBody.parse(req.body))));
 
+// Printer settings + tag templates (task97). Tag templates share the printer-setting permission (label layout).
+const PRINTER = 'inventory.printer_setting';
+inventoryRouter.get('/inventory/printer-settings', requirePermission(PRINTER, 'view'), async (req, res) => res.json(await extras.getPrinterSettings(req.ctx!)));
+inventoryRouter.put('/inventory/printer-settings', requirePermission(PRINTER, 'edit'), async (req, res) => res.json(await extras.putPrinterSettings(req.ctx!, printerSettingsBody.parse(req.body))));
+inventoryRouter.get('/tag-templates', requirePermission(PRINTER, 'view'), async (req, res) => res.json(await extras.listTagTemplates(req.ctx!)));
+inventoryRouter.post('/tag-templates', requirePermission(PRINTER, 'edit'), async (req, res) => res.status(201).json(await extras.createTagTemplate(req.ctx!, tagTemplateBody.parse(req.body))));
+inventoryRouter.get('/tag-templates/:id', requirePermission(PRINTER, 'view'), async (req, res) => res.json(await extras.getTagTemplate(req.ctx!, idSchema.parse(req.params.id))));
+inventoryRouter.patch('/tag-templates/:id', requirePermission(PRINTER, 'edit'), async (req, res) => res.json(await extras.updateTagTemplate(req.ctx!, idSchema.parse(req.params.id), updateTagTemplateBody.parse(req.body))));
+inventoryRouter.delete('/tag-templates/:id', requirePermission(PRINTER, 'delete'), async (req, res) => {
+  await extras.deleteTagTemplate(req.ctx!, idSchema.parse(req.params.id));
+  res.status(204).end();
+});
+inventoryRouter.post('/tag-templates/:id/activate', requirePermission(PRINTER, 'edit'), async (req, res) => res.json(await extras.activateTagTemplate(req.ctx!, idSchema.parse(req.params.id))));
+
 // Stock — specific paths before /stock/:id so they aren't captured as an id.
+inventoryRouter.get('/stock/all-summary', requirePermission('inventory.all_stock', 'view'), async (req, res) => res.json(await extras.allStockSummary(req.ctx!)));
+inventoryRouter.post('/stock/all-summary/set', requirePermission('inventory.all_stock', 'edit'), requireMpin, async (req, res) => res.status(201).json(await extras.setStock(req.ctx!, setStockBody.parse(req.body))));
+inventoryRouter.get('/stock/set-stock-logs', requirePermission('inventory.all_stock', 'view'), async (req, res) => res.json(await extras.listSetStockLogs(req.ctx!, setStockLogQuery.parse(req.query))));
 inventoryRouter.post('/stock/entries', requirePermission('inventory.new_stock', 'edit'), async (req, res) => res.status(201).json(await inv.createStockEntry(req.ctx!, stockEntryBody.parse(req.body))));
 inventoryRouter.get('/stock/summary', requirePermission('inventory.all_stock', 'view'), async (req, res) => res.json(await inv.stockSummary(req.ctx!)));
 inventoryRouter.get('/stock/groups', requirePermission('inventory.all_stock', 'view'), async (req, res) => res.json(await inv.stockGroups(req.ctx!, stockListQuery.parse(req.query))));

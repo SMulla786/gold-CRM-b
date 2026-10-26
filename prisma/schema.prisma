@@ -99,6 +99,8 @@ model Plan {
   createdAt     DateTime       @default(now())
   updatedAt     DateTime       @updatedAt
   subscriptions Subscription[]
+  /// payments where a business requested this plan (renew / choose plan)
+  payments      SubscriptionPayment[]
 }
 
 /// Tenant = one jewellery business (customer of the platform).
@@ -108,6 +110,8 @@ model Business {
   ownerName     String
   countryCode   String                @default("+91")
   mobile        String
+  /// Shop Settings 'Alternate No' (submenu-audit Masters gap)
+  alternateMobile String?
   email         String?
   gstin         String?
   address       String?
@@ -167,9 +171,12 @@ model SubscriptionPayment {
   status         PaymentStatus @default(PENDING)
   paidAt         DateTime?
   recordedById   Int?
+  /// plan the business asked for when submitting (renew / choose plan); null = legacy / platform-recorded
+  planId         Int?
   createdAt      DateTime      @default(now())
   business       Business      @relation(fields: [businessId], references: [id])
   subscription   Subscription? @relation(fields: [subscriptionId], references: [id])
+  plan           Plan?         @relation(fields: [planId], references: [id])
 
   @@index([businessId])
 }
@@ -1841,6 +1848,8 @@ enum SchemePayMedium {
   TOKEN
   DRAW
   VENDOR
+  /// money in to the chosen bank account, like ONLINE
+  CHEQUE
 }
 
 model Scheme {
@@ -1850,6 +1859,8 @@ model Scheme {
   kind         SchemeKind         @default(SAVING)
   type         SchemeType
   name         String
+  /// optional display title (Anjuman forms show Title + Scheme Name)
+  title        String?
   description  String?
   emiAmount    Decimal            @db.Decimal(14, 2)
   tenureMonths Int
