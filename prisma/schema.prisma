@@ -1484,33 +1484,36 @@ enum GirviTxnType {
 
 /// One loan agreement with pledged items. Interest accrues on the outstanding principal from interestFrom.
 model GirviBatch {
-  id           Int            @id @default(autoincrement())
-  businessId   Int
-  branchId     Int
-  girviNo      Int
-  partyId      Int
-  issueDate    DateTime       @db.Date
-  tenureMonths Int            @default(12)
-  returnDate   DateTime       @db.Date
-  ratePercent  Decimal        @db.Decimal(6, 3)
-  ratePeriod   InterestPeriod @default(MONTHLY)
-  interestType InterestType   @default(SI)
-  ciPeriod     CiPeriod?
-  method       InterestMethod @default(DAY_WISE)
-  valuation    Decimal        @db.Decimal(14, 2)
+  id                 Int            @id @default(autoincrement())
+  businessId         Int
+  branchId           Int
+  girviNo            Int
+  partyId            Int
+  issueDate          DateTime       @db.Date
+  tenureMonths       Int            @default(12)
+  returnDate         DateTime       @db.Date
+  ratePercent        Decimal        @db.Decimal(6, 3)
+  ratePeriod         InterestPeriod @default(MONTHLY)
+  interestType       InterestType   @default(SI)
+  ciPeriod           CiPeriod?
+  method             InterestMethod @default(DAY_WISE)
+  valuation          Decimal        @db.Decimal(14, 2)
   /// outstanding principal (grant + top-ups − principal repaid)
-  principal    Decimal        @db.Decimal(14, 2)
+  principal          Decimal        @db.Decimal(14, 2)
   /// interest is settled up to this date; accrues from here
-  interestFrom DateTime       @db.Date
-  status       GirviStatus    @default(ACTIVE)
-  docUrl       String?
-  remark       String?
-  closedAt     DateTime?
-  createdById  Int?
-  createdAt    DateTime       @default(now())
-  updatedAt    DateTime       @updatedAt
-  items        GirviItem[]
-  txns         GirviTxn[]
+  interestFrom       DateTime       @db.Date
+  /// owner-approved extras (2026-10-26): fixed first-month interest; penalty % per month after returnDate
+  firstMonthInterest Decimal        @default(0) @db.Decimal(14, 2)
+  penaltyRatePercent Decimal        @default(0) @db.Decimal(6, 3)
+  status             GirviStatus    @default(ACTIVE)
+  docUrl             String?
+  remark             String?
+  closedAt           DateTime?
+  createdById        Int?
+  createdAt          DateTime       @default(now())
+  updatedAt          DateTime       @updatedAt
+  items              GirviItem[]
+  txns               GirviTxn[]
 
   @@unique([businessId, branchId, girviNo])
   @@index([businessId, branchId, status])
@@ -1518,22 +1521,24 @@ model GirviBatch {
 }
 
 model GirviItem {
-  id         Int                 @id @default(autoincrement())
-  batchId    Int
-  category   String
-  name       String
-  photoUrl   String?
-  gross      Decimal             @db.Decimal(14, 3)
-  net        Decimal             @db.Decimal(14, 3)
-  purity     Decimal             @db.Decimal(6, 3)
-  fine       Decimal             @db.Decimal(14, 3)
+  id          Int                 @id @default(autoincrement())
+  batchId     Int
+  category    String
+  name        String
+  photoUrl    String?
+  gross       Decimal             @db.Decimal(14, 3)
+  net         Decimal             @db.Decimal(14, 3)
+  purity      Decimal             @db.Decimal(6, 3)
+  fine        Decimal             @db.Decimal(14, 3)
   /// valuation rate per gram of fine
-  rate       Decimal             @db.Decimal(14, 2)
-  valuation  Decimal             @db.Decimal(14, 2)
-  status     GirviItemStatus     @default(PLEDGED)
-  releasedAt DateTime?
-  batch      GirviBatch          @relation(fields: [batchId], references: [id], onDelete: Cascade)
-  transfers  GirviTransferItem[]
+  rate        Decimal             @db.Decimal(14, 2)
+  valuation   Decimal             @db.Decimal(14, 2)
+  /// per-item interest % (overrides the loan rate, valuation-weighted)
+  ratePercent Decimal?            @db.Decimal(6, 3)
+  status      GirviItemStatus     @default(PLEDGED)
+  releasedAt  DateTime?
+  batch       GirviBatch          @relation(fields: [batchId], references: [id], onDelete: Cascade)
+  transfers   GirviTransferItem[]
 
   @@index([batchId])
 }

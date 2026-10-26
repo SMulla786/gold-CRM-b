@@ -293,6 +293,8 @@ export const SETTING_SCHEMAS = {
     /** loan = stdPercent % of valuation by default */
     stdPercent: z.number().min(1).max(100).default(60),
     tenureMonths: z.number().int().min(1).max(120).default(12),
+    /** owner-approved: penalty % per month after the return date (0 = off) */
+    penaltyRatePercent: z.number().min(0).max(100).default(0),
     categories: z.array(z.string().trim().min(1).max(40)).default(['Gold', 'Silver']),
     /** categories kept for old loans but hidden on New Girvi (Manage Item Categories: Activate/Deactivate) */
     inactiveCategories: z.array(z.string().trim().min(1).max(40)).default([]),

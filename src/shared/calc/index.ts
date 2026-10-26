@@ -220,6 +220,57 @@ export function girviInterest(i: GirviInterestInput): { interest: string; months
   return { interest: M(interest), months: months.toDecimalPlaces(4).toString(), days };
 }
 
+/** Owner-approved girvi extras (2026-10-26): per-item rate, first-month fixed interest, penalty after the return date. */
+export interface GirviDueInput extends Omit<GirviInterestInput, 'from' | 'to'> {
+  /** still-pledged items; an item's own ratePercent overrides the loan rate, weighted by valuation */
+  items?: Array<{ valuation: Num; ratePercent?: Num | null }>;
+  issueDate: string;
+  /** interest is settled up to here */
+  interestFrom: string;
+  returnDate: string;
+  /** as-of date */
+  to: string;
+  /** fixed interest for the first month; applies only while nothing has been settled (interestFrom = issueDate) */
+  firstMonthInterest?: Num;
+  /** % per month, simple, on the principal, from max(returnDate, interestFrom) to `to` */
+  penaltyRatePercent?: Num;
+}
+
+const plusMonths = (iso: string, n: number): string => {
+  const d = new Date(`${iso}T00:00:00Z`);
+  d.setUTCMonth(d.getUTCMonth() + n);
+  return d.toISOString().slice(0, 10);
+};
+
+/** Effective loan rate: valuation-weighted average of item rates (loan rate where an item has none). */
+export function girviEffectiveRate(ratePercent: Num, items?: GirviDueInput['items']): string {
+  const list = (items ?? []).filter((it) => D(it.valuation).gt(0));
+  if (!list.some((it) => it.ratePercent != null && it.ratePercent !== '')) return D(ratePercent).toString();
+  const total = list.reduce((a, it) => a.plus(D(it.valuation)), new Decimal(0));
+  const weighted = list.reduce((a, it) => a.plus(D(it.valuation).times(it.ratePercent != null && it.ratePercent !== '' ? D(it.ratePercent) : D(ratePercent))), new Decimal(0));
+  return weighted.div(total).toDecimalPlaces(4).toString();
+}
+
+/** Interest due on a girvi = regular (shared girviInterest at the effective rate) + first-month fixed + penalty. */
+export function girviDue(i: GirviDueInput): { interest: string; regular: string; firstMonth: string; penalty: string } {
+  const rate = girviEffectiveRate(i.ratePercent, i.items);
+  const base = { principal: i.principal, ratePercent: rate, ratePeriod: i.ratePeriod, interestType: i.interestType, ciPeriod: i.ciPeriod, method: i.method };
+  let firstMonth = new Decimal(0);
+  let regularFrom = i.interestFrom;
+  if (D(i.firstMonthInterest).gt(0) && i.interestFrom === i.issueDate && ymd(i.to).t > ymd(i.issueDate).t) {
+    firstMonth = D(i.firstMonthInterest);
+    regularFrom = plusMonths(i.issueDate, 1);
+  }
+  const regular = ymd(i.to).t > ymd(regularFrom).t ? D(girviInterest({ ...base, from: regularFrom, to: i.to }).interest) : new Decimal(0);
+  let penalty = new Decimal(0);
+  if (D(i.penaltyRatePercent).gt(0)) {
+    const from = ymd(i.returnDate).t > ymd(i.interestFrom).t ? i.returnDate : i.interestFrom;
+    const days = Math.max(0, Math.round((ymd(i.to).t - ymd(from).t) / dayMs));
+    penalty = D(i.principal).times(D(i.penaltyRatePercent).div(100)).times(new Decimal(days).div(30));
+  }
+  return { interest: M(regular.plus(firstMonth).plus(penalty)), regular: M(regular), firstMonth: M(firstMonth), penalty: M(penalty) };
+}
+
 export interface SchemeMaturityInput {
   type: 'CASH' | 'GOLD';
   /** non-reversed payments; GOLD: fine = the stored 3-dp grams (passbook = math) */

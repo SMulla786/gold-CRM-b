@@ -5,7 +5,7 @@ import * as ledger from '../../../lib/ledger';
 import { logActivity } from '../../../lib/activity';
 import { HttpError } from '../../../middleware/error';
 import type { z } from 'zod';
-import { girviBody, girviInterest, girviItemReplaceBody, girviReleaseBody } from '../../../shared';
+import { girviBody, girviDue, girviEffectiveRate, girviItemReplaceBody, girviReleaseBody } from '../../../shared';
 import type { GirviBatchDto, GirviItemDto, GirviListItemDto, GirviTxnDto, Paged, PartyRefDto } from '../../../shared';
 import type { TenantContext } from '../../../middleware/context';
 
@@ -30,9 +30,18 @@ const addMonths = (d: Date, n: number): Date => {
   return r;
 };
 
-/** Interest due on a batch's outstanding principal from interestFrom up to `to` — always via the shared calc, never re-implemented. */
-const dueOf = (b: { principal: unknown; ratePercent: unknown; ratePeriod: any; interestType: any; ciPeriod: any; method: any; interestFrom: Date }, to: Date): string =>
-  girviInterest({ principal: b.principal as any, ratePercent: b.ratePercent as any, ratePeriod: b.ratePeriod, interestType: b.interestType, ciPeriod: b.ciPeriod ?? undefined, method: b.method, from: dateOnly(b.interestFrom), to: dateOnly(to) }).interest;
+/** Interest due on a batch up to `to` — shared girviDue (effective per-item rate + first-month + penalty), never re-implemented.
+ *  `b.items` must be loaded (pledged items carry the per-item rates). */
+const dueParts = (b: any, to: Date) => {
+  const items = (b.items ?? []).filter((i: any) => i.status === 'PLEDGED').map((i: any) => ({ valuation: i.valuation, ratePercent: i.ratePercent }));
+  const parts = girviDue({
+    principal: b.principal, ratePercent: b.ratePercent, ratePeriod: b.ratePeriod, interestType: b.interestType, ciPeriod: b.ciPeriod ?? undefined, method: b.method, items,
+    issueDate: dateOnly(b.issueDate), interestFrom: dateOnly(b.interestFrom), returnDate: dateOnly(b.returnDate), to: dateOnly(to),
+    firstMonthInterest: b.firstMonthInterest ?? 0, penaltyRatePercent: b.penaltyRatePercent ?? 0,
+  });
+  return { ...parts, effectiveRate: girviEffectiveRate(b.ratePercent, items) };
+};
+const dueOf = (b: any, to: Date): string => dueParts(b, to).interest;
 
 /** MONEY ledger rows for a girvi cash/online movement (OUT = paid to customer, IN = received). source GIRVI, sourceId = batch id. */
 function girviMoneyRows(branchId: number, txnDate: Date, direction: 'IN' | 'OUT', cash: number, online: number, bankAccountId: number | null, batchId: number, narration: string): ledger.LedgerEntryInput[] {
@@ -73,9 +82,10 @@ export async function createGirvi(ctx: TenantContext, body: GirviBody): Promise<
         businessId: ctx.businessId!, branchId, girviNo, partyId: body.partyId, issueDate, tenureMonths: body.tenureMonths, returnDate,
         ratePercent: body.ratePercent, ratePeriod: body.ratePeriod, interestType: body.interestType, ciPeriod: body.ciPeriod ?? null, method: body.method,
         valuation, principal: body.principal, interestFrom: issueDate, status: 'ACTIVE', remark: body.remark ?? null, createdById: ctx.userId,
+        firstMonthInterest: body.firstMonthInterest, penaltyRatePercent: body.penaltyRatePercent,
       },
     });
-    for (const it of items) await tx.girviItem.create({ data: { batchId: batch.id, category: it.category, name: it.name, gross: it.gross, net: it.net, purity: it.purity, fine: it.fine, rate: it.rate, valuation: it.valuation, status: 'PLEDGED' } });
+    for (const it of items) await tx.girviItem.create({ data: { batchId: batch.id, category: it.category, name: it.name, gross: it.gross, net: it.net, purity: it.purity, fine: it.fine, rate: it.rate, valuation: it.valuation, ratePercent: it.ratePercent ?? null, status: 'PLEDGED' } });
     await tx.girviTxn.create({ data: { batchId: batch.id, type: 'GRANT', txnDate: issueDate, principal: body.principal, cash: body.cash, online: body.online, bankAccountId: body.online > 0 ? body.bankAccountId! : null, createdById: ctx.userId } });
     await ledger.post(tx, lctx, girviMoneyRows(branchId, issueDate, 'OUT', body.cash, body.online, body.bankAccountId ?? null, batch.id, `Girvi #${girviNo} grant`));
     await logActivity(tx, ctx, { module: 'GIRVI', action: 'CREATED', entity: 'GIRVI', entityId: String(batch.id), summary: `Girvi #${girviNo} ₹${body.principal}`, partyName: party.name });
@@ -94,7 +104,7 @@ export async function payInterest(ctx: TenantContext, id: number, body: { txnDat
   const lctx = lctxOf(ctx);
 
   await prisma.$transaction(async (tx) => {
-    const fresh = await tx.girviBatch.findUniqueOrThrow({ where: { id } });
+    const fresh = await tx.girviBatch.findUniqueOrThrow({ where: { id }, include: { items: true } });
     if (fresh.status !== 'ACTIVE') throw new HttpError(409, 'CONFLICT', 'Girvi is not active');
     const due = dueOf(fresh, txnDate);
     if (D(body.interest).plus(body.discount).gt(due)) throw new HttpError(400, 'VALIDATION', 'Interest paid exceeds the due', { due });
@@ -117,7 +127,7 @@ export async function topupGirvi(ctx: TenantContext, id: number, body: { txnDate
   const lctx = lctxOf(ctx);
 
   await prisma.$transaction(async (tx) => {
-    const fresh = await tx.girviBatch.findUniqueOrThrow({ where: { id } });
+    const fresh = await tx.girviBatch.findUniqueOrThrow({ where: { id }, include: { items: true } });
     if (fresh.status !== 'ACTIVE') throw new HttpError(409, 'CONFLICT', 'Girvi is not active');
     if (D(dueOf(fresh, txnDate)).gt(0)) throw new HttpError(409, 'CONFLICT', 'Pay interest up to date before a top-up');
     await tx.girviTxn.create({ data: { batchId: id, type: 'TOPUP', txnDate, principal: body.principal, cash: body.cash, online: body.online, bankAccountId: body.online > 0 ? body.bankAccountId! : null, createdById: ctx.userId } });
@@ -139,7 +149,7 @@ export async function releaseGirvi(ctx: TenantContext, id: number, body: GirviRe
   const lctx = lctxOf(ctx);
 
   await prisma.$transaction(async (tx) => {
-    const fresh = await tx.girviBatch.findUniqueOrThrow({ where: { id } });
+    const fresh = await tx.girviBatch.findUniqueOrThrow({ where: { id }, include: { items: true } });
     if (fresh.status !== 'ACTIVE') throw new HttpError(409, 'CONFLICT', 'Girvi is not active');
     const due = dueOf(fresh, txnDate);
     if (!D(body.interestPaid).plus(body.discount).equals(due)) throw new HttpError(400, 'VALIDATION', 'Settle the exact interest due to release', { due });
@@ -180,7 +190,7 @@ export async function replaceGirviItem(ctx: TenantContext, batchId: number, item
     if (await tx.girviTransferItem.count({ where: { girviItemId: itemId, transfer: { status: 'ACTIVE' } } })) {
       throw new HttpError(409, 'CONFLICT', 'Item is with a lender (girvi transfer); receive it back first');
     }
-    await tx.girviItem.update({ where: { id: itemId }, data: { category: body.category, name: body.name, gross: body.gross, net: body.net, purity: body.purity, fine, rate: body.rate, valuation } });
+    await tx.girviItem.update({ where: { id: itemId }, data: { category: body.category, name: body.name, gross: body.gross, net: body.net, purity: body.purity, fine, rate: body.rate, valuation, ratePercent: body.ratePercent ?? null } });
     const total = (await tx.girviItem.aggregate({ where: { batchId }, _sum: { valuation: true } }))._sum.valuation ?? new Prisma.Decimal(0);
     if (D(fresh.principal).gt(total)) throw new HttpError(400, 'VALIDATION', 'The outstanding loan would exceed the new valuation', { valuation: money(total) });
     await tx.girviBatch.update({ where: { id: batchId }, data: { valuation: total } });
@@ -208,7 +218,7 @@ export async function deleteGirvi(ctx: TenantContext, id: number): Promise<void>
 // ───────────── DTO mappers + list/get ─────────────
 
 const partyRef = (p: any): PartyRefDto => ({ id: p.id, type: p.type, name: p.name, mobile: p.mobile, shopName: p.shopName });
-const itemDto = (i: any): GirviItemDto => ({ id: i.id, category: i.category, name: i.name, photoUrl: i.photoUrl, gross: wt(i.gross), net: wt(i.net), purity: String(i.purity), fine: wt(i.fine), rate: money(i.rate), valuation: money(i.valuation), status: i.status, releasedAt: i.releasedAt ? dateOnly(i.releasedAt) : null });
+const itemDto = (i: any): GirviItemDto => ({ id: i.id, category: i.category, name: i.name, photoUrl: i.photoUrl, gross: wt(i.gross), net: wt(i.net), purity: String(i.purity), fine: wt(i.fine), rate: money(i.rate), valuation: money(i.valuation), ratePercent: i.ratePercent != null ? String(i.ratePercent) : null, status: i.status, releasedAt: i.releasedAt ? dateOnly(i.releasedAt) : null });
 const txnDto = (t: any, baMap: Map<number, string>, uMap: Map<number, string>): GirviTxnDto => ({
   id: t.id, type: t.type, txnDate: dateOnly(t.txnDate), principal: money(t.principal), interest: money(t.interest), discount: money(t.discount), cash: money(t.cash), online: money(t.online),
   bankAccount: t.bankAccountId != null ? { id: t.bankAccountId, name: baMap.get(t.bankAccountId) ?? '' } : null, itemIds: t.itemIds, remark: t.remark,
@@ -231,12 +241,15 @@ export async function getGirvi(ctx: TenantContext, id: number, asOf: Date): Prom
   const baMap = new Map((baIds.length ? await sdb.bankAccount.findMany({ where: { id: { in: baIds } }, select: { id: true, bankName: true } }) : []).map((x) => [x.id, x.bankName]));
   const uMap = await userNames(ctx, b.txns.map((t) => t.createdById));
   const onDate = ledger.businessDate(asOf);
-  const interestDue = dueOf(b, onDate);
+  const parts = dueParts(b, onDate);
+  const interestDue = parts.interest;
   return {
     id: b.id, girviNo: b.girviNo, party: partyRef(party), branch: { id: b.branchId, name: branch?.name ?? '' },
     issueDate: dateOnly(b.issueDate), returnDate: dateOnly(b.returnDate), tenureMonths: b.tenureMonths, ratePercent: String(b.ratePercent), ratePeriod: b.ratePeriod,
     interestType: b.interestType, ciPeriod: b.ciPeriod, method: b.method, valuation: money(b.valuation), principal: money(b.principal), interestFrom: dateOnly(b.interestFrom),
     interestDue, payable: D(b.principal).plus(interestDue).toFixed(2), overdue: b.status === 'ACTIVE' && onDate.getTime() > b.returnDate.getTime(),
+    interestBreakdown: { regular: parts.regular, firstMonth: parts.firstMonth, penalty: parts.penalty, effectiveRate: parts.effectiveRate },
+    firstMonthInterest: money(b.firstMonthInterest), penaltyRatePercent: String(b.penaltyRatePercent),
     status: b.status, remark: b.remark, items: b.items.map(itemDto), txns: b.txns.map((t) => txnDto(t, baMap, uMap)), createdAt: b.createdAt.toISOString(),
   };
 }
@@ -262,7 +275,7 @@ export async function listGirvi(ctx: TenantContext, query: any): Promise<Paged<G
     where.AND = [query.q && Number.isInteger(asNo) && !query.partyType ? { OR: [{ girviNo: asNo }, ids] } : ids];
   }
   const [rows, total] = await Promise.all([
-    sdb.girviBatch.findMany({ where, include: { items: { select: { name: true, status: true } } }, orderBy: { id: 'desc' }, skip: (query.page - 1) * query.pageSize, take: query.pageSize }),
+    sdb.girviBatch.findMany({ where, include: { items: { select: { name: true, status: true, valuation: true, ratePercent: true } } }, orderBy: { id: 'desc' }, skip: (query.page - 1) * query.pageSize, take: query.pageSize }),
     sdb.girviBatch.count({ where }),
   ]);
   const parties = new Map((await sdb.party.findMany({ where: { id: { in: [...new Set(rows.map((b) => b.partyId))] } } })).map((p) => [p.id, p]));

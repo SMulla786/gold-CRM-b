@@ -1,6 +1,6 @@
 // Baseline self-check by lead (hand-computed with the fixture-verified formulas).
 import { describe, expect, it } from 'vitest';
-import { computeBill, computeJustLine, computeLine, girviInterest, metalToMoney, moneyToMetal, schemeMaturity } from './index';
+import { computeBill, computeJustLine, computeLine, girviDue, girviEffectiveRate, girviInterest, metalToMoney, moneyToMetal, schemeMaturity } from './index';
 
 describe('computeLine', () => {
   it('22K ring: multiplicative wastage, per-gram labour on gross, % discount on metal', () => {
@@ -109,5 +109,28 @@ describe('schemeMaturity', () => {
     const payments = [60000, 62500, 65000].map((r) => ({ amount: 10000, fine: moneyToMetal(10000, r, 10) }));
     expect(payments.map((p) => p.fine)).toEqual(['1.667', '1.600', '1.538']);
     expect(schemeMaturity({ type: 'GOLD', payments, bonusType: 'PERCENT', bonusValue: 2, emiAmount: 10000, redeemRate: 65000 })).toEqual({ paid: '30000.00', fine: '4.805', bonus: '0.096', maturity: '4.901', maturityValue: '31856.50' });
+  });
+});
+
+describe('girviDue (owner-approved extras: per-item rate, first-month interest, penalty)', () => {
+  const base = { principal: 100000, ratePercent: 2, ratePeriod: 'MONTHLY' as const, interestType: 'SI' as const, method: 'DAY_WISE' as const, issueDate: '2026-01-15', interestFrom: '2026-01-15', returnDate: '2026-07-15' };
+  it('no extras = plain girviInterest', () => {
+    expect(girviDue({ ...base, to: '2026-03-01' })).toEqual({ interest: '3000.00', regular: '3000.00', firstMonth: '0.00', penalty: '0.00' });
+  });
+  it('per-item rate: valuation-weighted (3% and loan 2% on equal values = 2.5%)', () => {
+    const items = [{ valuation: 100000, ratePercent: 3 }, { valuation: 100000, ratePercent: null }];
+    expect(girviEffectiveRate(2, items)).toBe('2.5');
+    expect(girviDue({ ...base, items, to: '2026-03-01' }).interest).toBe('3750.00');
+  });
+  it('first-month fixed interest replaces month one, regular accrues after', () => {
+    expect(girviDue({ ...base, firstMonthInterest: 1500, to: '2026-03-01' })).toEqual({ interest: '2433.33', regular: '933.33', firstMonth: '1500.00', penalty: '0.00' });
+    expect(girviDue({ ...base, firstMonthInterest: 1500, to: '2026-01-20' }).interest).toBe('1500.00');
+  });
+  it('first-month interest no longer applies once interest was settled', () => {
+    expect(girviDue({ ...base, interestFrom: '2026-02-10', firstMonthInterest: 1500, to: '2026-03-12' }).firstMonth).toBe('0.00');
+  });
+  it('penalty: simple % per month on principal after the return date', () => {
+    expect(girviDue({ ...base, penaltyRatePercent: 1, to: '2026-08-14' })).toEqual({ interest: '15066.67', regular: '14066.67', firstMonth: '0.00', penalty: '1000.00' });
+    expect(girviDue({ ...base, penaltyRatePercent: 1, to: '2026-07-01' }).penalty).toBe('0.00');
   });
 });
