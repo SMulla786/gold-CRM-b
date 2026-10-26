@@ -23,7 +23,8 @@ export function createApp() {
   if (env.NODE_ENV === 'production') app.set('trust proxy', 1);
   app.use(requestLog);
   app.use(helmet());
-  app.use(cors({ origin: env.WEB_ORIGIN, credentials: true }));
+  app.use(cors({ origin: true, credentials: true }));
+  // app.use(cors({ origin: env.WEB_ORIGIN, credentials: true }));
   app.use(express.json({ limit: '2mb' }));
   app.use(cookieParser());
 
@@ -36,7 +37,14 @@ export function createApp() {
   app.use('/api/public', publicRouter);
   app.use('/api/platform', requireAuth, loadContext, requireLevel('SUPER_ADMIN'), platformRouter);
   app.use('/api/admin', requireAuth, loadContext, requireLevel('ADMIN'), adminRouter);
-  app.use('/api/app', requireAuth, loadContext, requireLevel('ADMIN', 'BRANCH_USER'), requireWrite, appRouter);
+  app.use(
+    '/api/app',
+    requireAuth,
+    loadContext,
+    requireLevel('ADMIN', 'BRANCH_USER'),
+    requireWrite,
+    appRouter,
+  );
 
   app.use(errorHandler);
   return app;

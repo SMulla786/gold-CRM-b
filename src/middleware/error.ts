@@ -2,6 +2,7 @@ import type { ErrorRequestHandler } from 'express';
 import { Prisma } from '@prisma/client';
 import { ZodError } from 'zod';
 import { env } from '../config/env';
+import { istTimestamp } from '../shared/date';
 
 /** Throw this from services/routes for expected failures. */
 export class HttpError extends Error {
@@ -35,6 +36,6 @@ export const errorHandler: ErrorRequestHandler = (err, req, res, _next) => {
     }
   }
   // Unexpected: log the full stack server-side (with the request id); never leak it to the client in production.
-  console.error(JSON.stringify({ t: new Date().toISOString(), id: req.id, status: 500, error: String(err), stack: err instanceof Error ? err.stack : undefined }));
+  console.error(JSON.stringify({ t: istTimestamp(), id: req.id, status: 500, error: String(err), stack: err instanceof Error ? err.stack : undefined }));
   res.status(500).json({ error: { code: 'INTERNAL', message: 'Something went wrong', ...(env.NODE_ENV === 'production' ? {} : { stack: err instanceof Error ? err.stack : String(err) }) } });
 };

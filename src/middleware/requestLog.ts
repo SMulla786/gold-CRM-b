@@ -1,6 +1,7 @@
 import type { RequestHandler } from 'express';
 import { randomUUID } from 'node:crypto';
 import { env } from '../config/env';
+import { istTimestamp } from '../shared/date';
 
 declare global {
   // eslint-disable-next-line @typescript-eslint/no-namespace
@@ -22,7 +23,7 @@ export const requestLog: RequestHandler = (req, res, next) => {
   const start = performance.now();
   res.on('finish', () => {
     console.log(
-      JSON.stringify({ t: new Date().toISOString(), id: req.id, method: req.method, path: req.originalUrl, status: res.statusCode, ms: Math.round(performance.now() - start) }),
+      JSON.stringify({ t: istTimestamp(), id: req.id, method: req.method, path: req.originalUrl, status: res.statusCode, ms: Math.round(performance.now() - start) }),
     );
   });
   next();
