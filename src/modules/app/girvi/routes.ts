@@ -1,3 +1,4 @@
+import path from 'node:path';
 import { Router } from 'express';
 import multer from 'multer';
 import { HttpError } from '../../../middleware/error';
@@ -18,6 +19,7 @@ import {
 import * as girvi from './service';
 import * as transfer from './transfer';
 import { girviImportSampleCsv, importGirvi } from './import';
+import { girviItemPhotoPath, saveGirviItemPhoto } from '../uploads';
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 2 * 1024 * 1024 } });
 
@@ -32,6 +34,17 @@ girviRouter.post('/girvi/import', requirePermission(ENTRY, 'edit'), upload.singl
   if (!req.file) throw new HttpError(400, 'VALIDATION', 'No CSV file uploaded (field "file")');
   const f = girviImportFields.parse(req.body);
   res.json(await importGirvi(req.ctx!, req.file.buffer.toString('utf8'), { dryRun: f.dryRun === 'true', bankAccountId: f.bankAccountId }));
+});
+// Item photo (JPEG/PNG/WebP, magic-byte checked)
+girviRouter.post('/girvi/items/:itemId/photo', requirePermission(ENTRY, 'edit'), upload.single('file'), async (req, res) => {
+  if (!req.file) throw new HttpError(400, 'VALIDATION', 'No file uploaded (field "file")');
+  const itemId = idSchema.parse(req.params.itemId);
+  await saveGirviItemPhoto(req.ctx!, itemId, req.file.buffer);
+  res.status(201).json({ url: `/api/app/girvi/items/${itemId}/photo` });
+});
+girviRouter.get('/girvi/items/:itemId/photo', requirePermission(LEDGER, 'view'), async (req, res) => {
+  const abs = await girviItemPhotoPath(req.ctx!, idSchema.parse(req.params.itemId));
+  res.type({ '.jpg': 'image/jpeg', '.png': 'image/png', '.webp': 'image/webp' }[path.extname(abs)] ?? 'application/octet-stream').sendFile(abs);
 });
 // Phase 9b — transfers (re-pledge to a lender); registered before /girvi/:id
 girviRouter.get('/girvi/transfers', requirePermission(TRANSFER, 'view'), async (req, res) => res.json(await transfer.listTransfers(req.ctx!, girviTransferListQuery.parse(req.query))));

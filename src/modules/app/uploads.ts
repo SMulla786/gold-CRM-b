@@ -98,3 +98,12 @@ export const paymentProofPath = (ctx: TenantContext, paymentId: number): Promise
 /** Super Admin (no tenant) — any business's proof. */
 export const platformPaymentProofPath = (paymentId: number): Promise<string> =>
   imagePath(() => prisma.subscriptionPayment.findUnique({ where: { id: paymentId } }), 'screenshotUrl');
+
+// Girvi item photo — GirviItem has no tenant columns, so it is visible only when its batch is in the caller's scope.
+async function scopedGirviItem(ctx: TenantContext, itemId: number) {
+  const item = await prisma.girviItem.findUnique({ where: { id: itemId } });
+  return item && (await scopedDb(ctx).girviBatch.findFirst({ where: { id: item.batchId }, select: { id: true } })) ? item : null;
+}
+export const saveGirviItemPhoto = (ctx: TenantContext, itemId: number, buffer: Buffer): Promise<string> =>
+  saveImage(ctx, () => scopedGirviItem(ctx, itemId), (rel) => prisma.girviItem.update({ where: { id: itemId }, data: { photoUrl: rel } }), 'girvi', 'photoUrl', buffer, 'Girvi item not found');
+export const girviItemPhotoPath = (ctx: TenantContext, itemId: number): Promise<string> => imagePath(() => scopedGirviItem(ctx, itemId), 'photoUrl');
