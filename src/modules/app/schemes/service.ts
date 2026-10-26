@@ -277,25 +277,48 @@ export async function redeem(ctx: TenantContext, id: number, body: any): Promise
   if (!e) throw new HttpError(404, 'NOT_FOUND', 'Enrollment not found');
   if (e.status !== 'ACTIVE' && e.status !== 'WON') throw new HttpError(409, 'CONFLICT', `A ${e.status.toLowerCase()} enrollment cannot be redeemed`);
   const scheme = await sdb.scheme.findUniqueOrThrow({ where: { id: e.schemeId } });
-  const gold = scheme.type === 'GOLD';
-  const redeemRate = gold ? (body.redeemRate != null ? Number(body.redeemRate) : await todayGoldRate(ctx)) : 0;
-  const newStatus = body.early ? 'WITHDRAWN' : 'CLOSED';
-
-  await prisma.$transaction(async (tx) => {
-    // lock the row BEFORE reading payments, so a concurrent addPayment is either included here or blocked out (BUG-13)
-    const status = await lockEnrollment(tx, id);
-    if (status !== 'ACTIVE' && status !== 'WON') throw new HttpError(409, 'CONFLICT', 'Enrollment was just closed');
-    const payments = await tx.schemePayment.findMany({ where: { enrollmentId: id, isReversed: false } });
-    const emisPaid = payments.filter((p) => p.emiNo != null).length;
-    if (!body.early && emisPaid < scheme.tenureMonths) throw new HttpError(409, 'CONFLICT', 'Not matured — withdraw instead');
-    const m = schemeMaturity({ type: scheme.type, payments: payments.map((p) => ({ amount: p.amount, fine: p.fine })), bonusType: scheme.bonusType, bonusValue: scheme.bonusValue, emiAmount: e.emiAmount, redeemRate, rateUnitGrams: GOLD_UNIT, early: body.early });
-    const r = await tx.schemeEnrollment.updateMany({ where: { id, status: { in: ['ACTIVE', 'WON'] } }, data: { status: newStatus, redeemValue: m.maturityValue, redeemFine: gold ? m.maturity : null, redeemRate: gold ? redeemRate : null, closedAt: new Date() } });
-    if (r.count !== 1) throw new HttpError(409, 'CONFLICT', 'Enrollment was just closed');
-    // credit the customer (shop owes them the maturity value); a Sell Bill nets it like an order advance
-    if (Number(m.maturityValue) > 0) await udhar.post(tx, lctxOf(ctx), [{ branchId: e.branchId, partyId: e.partyId, txnDate: ledger.businessDate(), amount: D(m.maturityValue).negated(), source: 'SCHEME', sourceId: String(id), narration: `Scheme ${body.early ? 'withdrawal' : 'maturity'} ${e.assignId}` }]);
-    await logActivity(tx, ctx, { module: 'SCHEME', action: body.early ? 'DELETED' : 'EDITED', entity: 'SchemeEnrollment', entityId: String(id), summary: `Enrollment ${e.assignId} ${body.early ? 'withdrawn' : 'redeemed'} (₹${m.maturityValue})` });
-  });
+  const redeemRate = scheme.type === 'GOLD' ? (body.redeemRate != null ? Number(body.redeemRate) : await todayGoldRate(ctx)) : 0;
+  await prisma.$transaction((tx) => redeemInTx(tx, ctx, e, scheme, { early: !!body.early, redeemRate }));
   return getEnrollment(ctx, id);
+}
+
+/** Today's gold rate for redeeming a GOLD enrollment (0 for CASH schemes) — read before the tx. */
+export const redeemRateFor = async (ctx: TenantContext, scheme: { type: string }) => (scheme.type === 'GOLD' ? todayGoldRate(ctx) : 0);
+
+/**
+ * The redeem tx body (scheme page + TASK-98 bill SCHEME payments): lock, maturity, close, credit the party's udhar with the maturity value.
+ * early 'auto' (bills) = withdraw when not matured yet. billId (bills) is stored with the pre-redeem status so the bill can reopen it.
+ */
+export async function redeemInTx(tx: Prisma.TransactionClient, ctx: TenantContext, e: any, scheme: any, opts: { early: boolean | 'auto'; redeemRate: number; billId?: number }): Promise<Prisma.Decimal> {
+  const id = e.id;
+  const gold = scheme.type === 'GOLD';
+  // lock the row BEFORE reading payments, so a concurrent addPayment is either included here or blocked out (BUG-13)
+  const status = await lockEnrollment(tx, id);
+  if (status !== 'ACTIVE' && status !== 'WON') throw new HttpError(409, 'CONFLICT', 'Enrollment was just closed');
+  const payments = await tx.schemePayment.findMany({ where: { enrollmentId: id, isReversed: false } });
+  const emisPaid = payments.filter((p) => p.emiNo != null).length;
+  const early = opts.early === 'auto' ? emisPaid < scheme.tenureMonths : opts.early;
+  if (!early && emisPaid < scheme.tenureMonths) throw new HttpError(409, 'CONFLICT', 'Not matured — withdraw instead');
+  const m = schemeMaturity({ type: scheme.type, payments: payments.map((p) => ({ amount: p.amount, fine: p.fine })), bonusType: scheme.bonusType, bonusValue: scheme.bonusValue, emiAmount: e.emiAmount, redeemRate: opts.redeemRate, rateUnitGrams: GOLD_UNIT, early });
+  const r = await tx.schemeEnrollment.updateMany({
+    where: { id, status: { in: ['ACTIVE', 'WON'] } },
+    data: { status: early ? 'WITHDRAWN' : 'CLOSED', redeemValue: m.maturityValue, redeemFine: gold ? m.maturity : null, redeemRate: gold ? opts.redeemRate : null, closedAt: new Date(), ...(opts.billId != null ? { redeemBillId: opts.billId, statusBeforeRedeem: status as any } : {}) },
+  });
+  if (r.count !== 1) throw new HttpError(409, 'CONFLICT', 'Enrollment was just closed');
+  // credit the customer (shop owes them the maturity value); a Sell Bill nets it like an order advance
+  if (Number(m.maturityValue) > 0) await udhar.post(tx, lctxOf(ctx), [{ branchId: e.branchId, partyId: e.partyId, txnDate: ledger.businessDate(), amount: D(m.maturityValue).negated(), source: 'SCHEME', sourceId: String(id), narration: `Scheme ${early ? 'withdrawal' : 'maturity'} ${e.assignId}` }]);
+  await logActivity(tx, ctx, { module: 'SCHEME', action: early ? 'DELETED' : 'EDITED', entity: 'SchemeEnrollment', entityId: String(id), summary: `Enrollment ${e.assignId} ${early ? 'withdrawn' : 'redeemed'} (₹${m.maturityValue})` });
+  return D(m.maturityValue);
+}
+
+/** TASK-98: undo a bill's SCHEME redemption (bill delete / edit): reverse the maturity credit and restore the pre-redeem status. */
+export async function reopenForBill(tx: Prisma.TransactionClient, ctx: TenantContext, enrollmentId: number, billId: number): Promise<void> {
+  await lockEnrollment(tx, enrollmentId);
+  const e = await tx.schemeEnrollment.findUniqueOrThrow({ where: { id: enrollmentId } });
+  if (e.redeemBillId !== billId || e.statusBeforeRedeem == null) throw new HttpError(409, 'CONFLICT', 'Scheme enrollment was not redeemed by this bill');
+  await udhar.reverse(tx, lctxOf(ctx), { source: 'SCHEME', sourceId: String(enrollmentId) });
+  await tx.schemeEnrollment.update({ where: { id: enrollmentId }, data: { status: e.statusBeforeRedeem, redeemValue: null, redeemFine: null, redeemRate: null, closedAt: null, redeemBillId: null, statusBeforeRedeem: null } });
+  await logActivity(tx, ctx, { module: 'SCHEME', action: 'EDITED', entity: 'SchemeEnrollment', entityId: String(enrollmentId), summary: `Enrollment ${e.assignId} reopened (bill #${billId} undone)` });
 }
 
 export async function listEnrollments(ctx: TenantContext, q: any): Promise<{ items: EnrollmentDto[]; total: number; page: number; pageSize: number }> {

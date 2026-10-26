@@ -6,11 +6,12 @@ import * as udhar from '../../../lib/udhar';
 import { logActivity } from '../../../lib/activity';
 import { HttpError } from '../../../middleware/error';
 import { computeBill, computeLine, fineWeight, metalToMoney, moneyToMetal, netWeight, PAN_CASH_LIMIT, RATE_UNIT_GRAMS } from '../../../shared';
-import type { BillBody, BillDto, BillKind, BillLineDto, BillListItemDto, BillPaymentDto, BillPaymentInput, BillType, LedgerSource, Paged, PartyRefDto, StockClass } from '../../../shared';
+import type { BillBody, BillDto, BillKind, BillLineDto, BillListItemDto, BillPayInput, BillPaymentDto, BillType, LedgerSource, Paged, PartyRefDto, StockClass } from '../../../shared';
 import type { TenantContext } from '../../../middleware/context';
 import { getSettings } from '../service';
 import { nextTagNo } from '../inventory';
 import { docKey, formatBillNo, seriesStart } from './numbering';
+import { redeemInTx, redeemRateFor, reopenForBill } from '../schemes/service';
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
@@ -33,7 +34,7 @@ const metalUnitGrams = (metal: 'GOLD' | 'SILVER', s: Settings): number => RATE_U
 // ───────────── Payments (shared by create + add-payments) ─────────────
 
 export interface PayCalc {
-  input: BillPaymentInput;
+  input: BillPayInput;
   amount: string;
   bankAccountId?: number;
   metal?: 'GOLD' | 'SILVER';
@@ -43,9 +44,13 @@ export interface PayCalc {
   fine?: string;
   tunch?: number;
   rate?: number;
+  /** SCHEME: the scoped enrollment + its scheme + redeem rate, loaded by checkNoCashPays */
+  enrollment?: any;
+  scheme?: any;
+  redeemRate?: number;
 }
 
-export async function computePayments(ctx: TenantContext, payments: BillPaymentInput[], s: Settings): Promise<PayCalc[]> {
+export async function computePayments(ctx: TenantContext, payments: BillPayInput[], s: Settings): Promise<PayCalc[]> {
   const bankIds = [...new Set(payments.flatMap((p) => (p.mode === 'ONLINE' ? [p.bankAccountId] : [])))];
   if (bankIds.length) {
     const have = new Set((await scopedDb(ctx).bankAccount.findMany({ where: { id: { in: bankIds } }, select: { id: true } })).map((b) => b.id));
@@ -54,6 +59,7 @@ export async function computePayments(ctx: TenantContext, payments: BillPaymentI
   return payments.map((p): PayCalc => {
     if (p.mode === 'CASH') return { input: p, amount: String(p.amount) };
     if (p.mode === 'ONLINE') return { input: p, amount: String(p.amount), bankAccountId: p.bankAccountId };
+    if (p.mode === 'SCHEME' || p.mode === 'UDHAR_ADVANCE') return { input: p, amount: String(p.amount) };
     const net = netWeight(p.gross, p.less);
     const fine = fineWeight(net, p.tunch, 0); // payments: no wastage
     return { input: p, amount: metalToMoney(fine, p.rate, metalUnitGrams(p.metal, s)), metal: p.metal, metalForm: p.metalForm, gross: p.gross, net: net.toFixed(3), fine: fine.toFixed(3), tunch: p.tunch, rate: p.rate };
@@ -69,6 +75,63 @@ function paymentLedgerRow(pc: PayCalc, paymentId: number, billId: number, kind: 
 }
 
 export const sumAmounts = (pcs: PayCalc[]) => pcs.reduce((a, pc) => a.plus(D(pc.amount)), new Prisma.Decimal(0));
+
+// ───────────── TASK-98 no-cash pay modes (SCHEME / UDHAR_ADVANCE) ─────────────
+
+const isNoCash = (pc: PayCalc) => pc.input.mode === 'SCHEME' || pc.input.mode === 'UDHAR_ADVANCE';
+
+/** Pre-tx: SELL bills only; each SCHEME enrollment in scope, this party's, used once; loads scheme + redeem rate onto the PayCalc. */
+async function checkNoCashPays(ctx: TenantContext, kind: BillKind, partyId: number, payCalcs: PayCalc[]): Promise<void> {
+  const special = payCalcs.filter(isNoCash);
+  if (!special.length) return;
+  if (kind !== 'SELL') throw new HttpError(400, 'VALIDATION', 'Scheme / udhar advance payments are for sell bills only');
+  const seen = new Set<number>();
+  for (const pc of special) {
+    if (pc.input.mode !== 'SCHEME') continue;
+    const enrollmentId = pc.input.enrollmentId;
+    if (seen.has(enrollmentId)) throw new HttpError(400, 'VALIDATION', 'The same scheme enrollment is used twice');
+    seen.add(enrollmentId);
+    const e = await scopedDb(ctx).schemeEnrollment.findUnique({ where: { id: enrollmentId } });
+    if (!e) throw new HttpError(404, 'NOT_FOUND', 'Enrollment not found');
+    if (e.partyId !== partyId) throw new HttpError(409, 'CONFLICT', 'Scheme enrollment belongs to another party');
+    pc.enrollment = e;
+    pc.scheme = await scopedDb(ctx).scheme.findUniqueOrThrow({ where: { id: e.schemeId } });
+    pc.redeemRate = await redeemRateFor(ctx, pc.scheme);
+  }
+}
+
+/**
+ * In-tx effects of the no-cash payments on a SELL bill (no ledger row — nothing enters the shop):
+ * UDHAR_ADVANCE uses the party's credit; SCHEME first redeems the enrollment (credit = maturity value, existing redeem path) and uses that.
+ * Either way the bill takes `amount` of the party's credit: a +amount udhar row under sourceId `<billId>-A` (reversed by undoBill / deleteBill).
+ * Over-balance → 409. The advance check excludes the bill's own `<billId>` rows (its outstanding is not credit) but counts earlier `-A` uses.
+ */
+async function postNoCashPays(tx: Prisma.TransactionClient, ctx: TenantContext, bill: { id: number; billNo: string; branchId: number; partyId: number }, payCalcs: PayCalc[], txnDate: Date, lctx: ledger.LedgerContext): Promise<void> {
+  const special = payCalcs.filter(isNoCash);
+  if (!special.length) return;
+  await ledger.assertDaysOpen(tx, lctx, [{ branchId: bill.branchId, txnDate }]);
+  const advance = special.filter((pc) => pc.input.mode === 'UDHAR_ADVANCE').reduce((a, pc) => a.plus(D(pc.amount)), new Prisma.Decimal(0));
+  if (advance.gt(0)) {
+    await tx.$queryRaw`SELECT id FROM "Party" WHERE id = ${bill.partyId} FOR UPDATE`; // serialize concurrent uses of the same credit
+    const sum = await tx.udharEntry.aggregate({ where: { businessId: ctx.businessId!, partyId: bill.partyId, NOT: { source: 'SELL_BILL', sourceId: String(bill.id) } }, _sum: { amount: true } });
+    const credit = Prisma.Decimal.max(D(sum._sum.amount).negated(), 0);
+    if (advance.gt(credit)) throw new HttpError(409, 'CONFLICT', `Udhar advance available is ₹${credit.toFixed(2)}`, { code: 'OVER_BALANCE' });
+  }
+  for (const pc of special) {
+    let narration = `${bill.billNo} udhar advance`;
+    if (pc.input.mode === 'SCHEME') {
+      const value = await redeemInTx(tx, ctx, pc.enrollment, pc.scheme, { early: 'auto', redeemRate: pc.redeemRate!, billId: bill.id });
+      if (D(pc.amount).gt(value)) throw new HttpError(409, 'CONFLICT', `Scheme ${pc.enrollment.assignId} value is ₹${value.toFixed(2)}`, { code: 'OVER_BALANCE' });
+      narration = `${bill.billNo} scheme ${pc.enrollment.assignId}`;
+    }
+    await udhar.post(tx, lctx, [{ branchId: bill.branchId, partyId: bill.partyId, txnDate, amount: D(pc.amount), source: 'SELL_BILL', sourceId: `${bill.id}-A`, narration }]);
+  }
+}
+
+/** Bill delete / edit: reopen every enrollment the bill's active SCHEME payments redeemed. */
+async function reopenSchemes(tx: Prisma.TransactionClient, ctx: TenantContext, bill: { id: number; payments: any[] }): Promise<void> {
+  for (const p of bill.payments) if (p.mode === 'SCHEME' && p.isActive && p.schemeEnrollmentId != null) await reopenForBill(tx, ctx, p.schemeEnrollmentId, bill.id);
+}
 
 // ───────────── Line resolution ─────────────
 
@@ -181,6 +244,7 @@ async function prepareBill(ctx: TenantContext, body: BillBody, branchId: number,
 
   const lines = await resolveLines(ctx, body, branchId, s, allowSold);
   const payCalcs = await computePayments(ctx, body.payments, s);
+  await checkNoCashPays(ctx, body.kind, party.id, payCalcs);
   const paid = sumAmounts(payCalcs);
 
   if (body.kind === 'SELL') {
@@ -253,9 +317,10 @@ async function writeBillContents(tx: Prisma.TransactionClient, ctx: TenantContex
   }
   if (stockLedger.length) await ledger.post(tx, lctx, stockLedger);
 
+  await postNoCashPays(tx, ctx, { id: billId, billNo, branchId, partyId: prep.party.id }, prep.payCalcs, billDate, lctx);
   for (const pc of prep.payCalcs) {
-    const pay = await tx.billPayment.create({ data: { billId, mode: pc.input.mode, bankAccountId: pc.bankAccountId ?? null, metal: pc.metal ?? null, metalForm: pc.metalForm ?? null, gross: pc.gross ?? null, net: pc.net ?? null, tunch: pc.tunch ?? null, fine: pc.fine ?? null, rate: pc.rate ?? null, amount: pc.amount, remark: pc.input.remark ?? null, txnDate: billDate, isActive: true, createdById: ctx.userId } });
-    await ledger.post(tx, lctx, [paymentLedgerRow(pc, pay.id, billId, body.kind, branchId, billDate)]);
+    const pay = await tx.billPayment.create({ data: { billId, mode: pc.input.mode, bankAccountId: pc.bankAccountId ?? null, metal: pc.metal ?? null, metalForm: pc.metalForm ?? null, gross: pc.gross ?? null, net: pc.net ?? null, tunch: pc.tunch ?? null, fine: pc.fine ?? null, rate: pc.rate ?? null, amount: pc.amount, remark: pc.input.remark ?? null, schemeEnrollmentId: pc.enrollment?.id ?? null, txnDate: billDate, isActive: true, createdById: ctx.userId } });
+    if (!isNoCash(pc)) await ledger.post(tx, lctx, [paymentLedgerRow(pc, pay.id, billId, body.kind, branchId, billDate)]);
   }
 
   if (!prep.bal.isZero()) {
@@ -271,9 +336,11 @@ async function writeBillContents(tx: Prisma.TransactionClient, ctx: TenantContex
 
 /** Reverse a bill's effects, keeping the Bill row: payment ledger + udhar always; stock ledger + stock restore only when returnStock. Shared by delete and edit. */
 async function undoBill(tx: Prisma.TransactionClient, ctx: TenantContext, bill: any, lctx: ledger.LedgerContext, returnStock: boolean): Promise<void> {
+  await reopenSchemes(tx, ctx, bill);
   await tx.billPayment.updateMany({ where: { billId: bill.id }, data: { isActive: false } });
   for (const p of bill.payments) await ledger.reverse(tx, lctx, { source: billSource(bill.kind), sourceId: `${bill.id}-P${p.id}` });
   await udhar.reverse(tx, lctx, { source: billSource(bill.kind), sourceId: String(bill.id) });
+  await udhar.reverse(tx, lctx, { source: billSource(bill.kind), sourceId: `${bill.id}-A` }); // TASK-98 advance / scheme uses
   if (!returnStock) return;
   await ledger.reverse(tx, lctx, { source: billSource(bill.kind), sourceId: String(bill.id) }); // stock rows
   if (bill.kind === 'PURCHASE') {
@@ -405,13 +472,14 @@ export async function editBill(ctx: TenantContext, id: number, body: BillBody): 
 
 // ───────────── Add payments ─────────────
 
-export async function addBillPayments(ctx: TenantContext, id: number, body: { payments: BillPaymentInput[]; txnDate?: Date }): Promise<BillDto> {
+export async function addBillPayments(ctx: TenantContext, id: number, body: { payments: BillPayInput[]; txnDate?: Date }): Promise<BillDto> {
   const sdb = scopedDb(ctx);
   const bill = await sdb.bill.findFirst({ where: { id } });
   if (!bill) throw new HttpError(404, 'NOT_FOUND', 'Bill not found');
   if (bill.status !== 'ACTIVE') throw new HttpError(409, 'CONFLICT', 'Bill is not active');
   const s = await getSettings(ctx);
   const payCalcs = await computePayments(ctx, body.payments, s);
+  await checkNoCashPays(ctx, bill.kind, bill.partyId, payCalcs);
   const added = sumAmounts(payCalcs);
   const txnDate = ledger.businessDate(body.txnDate ?? new Date());
   const lctx = lctxOf(ctx);
@@ -419,9 +487,10 @@ export async function addBillPayments(ctx: TenantContext, id: number, body: { pa
   await prisma.$transaction(async (tx) => {
     const fresh = await tx.bill.findUnique({ where: { id }, select: { status: true } });
     if (!fresh || fresh.status !== 'ACTIVE') throw new HttpError(409, 'CONFLICT', 'Bill is not active');
+    await postNoCashPays(tx, ctx, bill, payCalcs, txnDate, lctx);
     for (const pc of payCalcs) {
-      const pay = await tx.billPayment.create({ data: { billId: id, mode: pc.input.mode, bankAccountId: pc.bankAccountId ?? null, metal: pc.metal ?? null, metalForm: pc.metalForm ?? null, gross: pc.gross ?? null, net: pc.net ?? null, tunch: pc.tunch ?? null, fine: pc.fine ?? null, rate: pc.rate ?? null, amount: pc.amount, remark: pc.input.remark ?? null, txnDate, isActive: true, createdById: ctx.userId } });
-      await ledger.post(tx, lctx, [paymentLedgerRow(pc, pay.id, id, bill.kind, bill.branchId, txnDate)]);
+      const pay = await tx.billPayment.create({ data: { billId: id, mode: pc.input.mode, bankAccountId: pc.bankAccountId ?? null, metal: pc.metal ?? null, metalForm: pc.metalForm ?? null, gross: pc.gross ?? null, net: pc.net ?? null, tunch: pc.tunch ?? null, fine: pc.fine ?? null, rate: pc.rate ?? null, amount: pc.amount, remark: pc.input.remark ?? null, schemeEnrollmentId: pc.enrollment?.id ?? null, txnDate, isActive: true, createdById: ctx.userId } });
+      if (!isNoCash(pc)) await ledger.post(tx, lctx, [paymentLedgerRow(pc, pay.id, id, bill.kind, bill.branchId, txnDate)]);
     }
     await tx.bill.update({ where: { id }, data: { paid: { increment: added } } }); // atomic — no lost update under concurrent payments
     if (!added.isZero()) {
@@ -446,9 +515,11 @@ export async function deleteBill(ctx: TenantContext, id: number, returnStock: bo
     // Flip ACTIVE→DELETED atomically FIRST — two concurrent deletes can't both run the return (double stock).
     const flipped = await tx.bill.updateMany({ where: { id, status: 'ACTIVE' }, data: { status: 'DELETED', deletedAt: new Date(), deletedWithStock: returnStock } });
     if (flipped.count !== 1) throw new HttpError(409, 'CONFLICT', 'Bill is not active');
+    await reopenSchemes(tx, ctx, bill);
     await tx.billPayment.updateMany({ where: { billId: id }, data: { isActive: false } });
     for (const p of bill.payments) await ledger.reverse(tx, lctx, { source: billSource(bill.kind), sourceId: `${id}-P${p.id}` });
     await udhar.reverse(tx, lctx, { source: billSource(bill.kind), sourceId: String(id) });
+    await udhar.reverse(tx, lctx, { source: billSource(bill.kind), sourceId: `${id}-A` }); // TASK-98 advance / scheme uses
 
     if (returnStock) {
       await ledger.reverse(tx, lctx, { source: billSource(bill.kind), sourceId: String(id) }); // stock rows
@@ -490,7 +561,7 @@ const lineDto = (i: any): BillLineDto => ({
 const paymentDto = (p: any, baMap: Map<number, string>): BillPaymentDto => ({
   id: p.id, mode: p.mode, bankAccount: p.bankAccountId != null ? { id: p.bankAccountId, name: baMap.get(p.bankAccountId) ?? '' } : null, metal: p.metal, metalForm: p.metalForm,
   gross: p.gross != null ? String(p.gross) : null, net: p.net != null ? String(p.net) : null, tunch: p.tunch != null ? String(p.tunch) : null, fine: p.fine != null ? String(p.fine) : null, rate: p.rate != null ? String(p.rate) : null,
-  amount: String(p.amount), remark: p.remark, txnDate: p.txnDate.toISOString().slice(0, 10), isActive: p.isActive, createdAt: p.createdAt.toISOString(),
+  amount: String(p.amount), remark: p.remark, schemeEnrollmentId: p.schemeEnrollmentId ?? null, txnDate: p.txnDate.toISOString().slice(0, 10), isActive: p.isActive, createdAt: p.createdAt.toISOString(),
 });
 
 const listItemFields = (b: any, party: PartyRefDto, branchName: string, createdBy: string | null): BillListItemDto => ({
