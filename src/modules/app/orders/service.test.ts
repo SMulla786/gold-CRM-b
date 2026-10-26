@@ -3,6 +3,7 @@ import { db, truncateAll } from '../../../../test/helpers/db';
 import { createBusiness } from '../../../../test/helpers/factory';
 import * as inv from '../inventory';
 import * as orders from './service';
+import * as samples from '../samples/service';
 import type { TenantContext } from '../../../middleware/context';
 
 const ctxFor = (businessId: number, branchId: number): TenantContext => ({
@@ -208,5 +209,73 @@ describe('orders', () => {
     expect((await orders.getOrder(s.ctx, ok2.id)).status).toBe('CANCELLED');
     expect((await orders.getOrder(s.ctx, busy.id)).status).toBe('IN_PROCESS');
   });
-});
 
+  describe('karigar issue with samples (sampleIds — atomic issue + link)', () => {
+    const issueBody = (karigarId: number, orderItemId: number, sampleIds: number[]): Parameters<typeof orders.createKarigarIssue>[1] =>
+      ({ karigarId, orderItemIds: [orderItemId], goldFine: 0, silverFine: 0, cash: 0, online: 0, sampleIds });
+
+    it('issues both samples in the same tx, links them to the issue, writes ISSUED movements; DTO lists them (detail + list)', async () => {
+      const s = await setup();
+      const order = await makeOrder(s.ctx, s.itemName.id, s.customer.id);
+      const a = await samples.createSample(s.ctx, { metal: 'GOLD', grossWt: 2, tounchPercent: 90 });
+      const b = await samples.createSample(s.ctx, { metal: 'SILVER', grossWt: 5, tounchPercent: 80, partyId: s.customer.id });
+      const issue = await orders.createKarigarIssue(s.ctx, issueBody(s.karigar.id, order.items[0]!.id, [b.id, a.id]));
+
+      expect(issue.samples).toEqual([
+        { id: a.id, sampleNo: a.sampleNo, metal: 'GOLD', grossWt: '2.000', tounchPercent: '90.000', fine: '1.800' },
+        { id: b.id, sampleNo: b.sampleNo, metal: 'SILVER', grossWt: '5.000', tounchPercent: '80.000', fine: '4.000' },
+      ]);
+      for (const id of [a.id, b.id]) {
+        const d = await samples.getSample(s.ctx, id);
+        expect(d.status).toBe('ISSUED');
+        expect(d.karigar?.id).toBe(s.karigar.id);
+        expect(d.karigarIssueId).toBe(issue.id);
+        const last = d.movements.at(-1)!;
+        expect(last.action).toBe('ISSUED');
+        expect(last.karigar?.id).toBe(s.karigar.id);
+        expect(last.note).toBe(`Karigar issue #${issue.issueNo}`);
+      }
+      expect((await samples.getSample(s.ctx, b.id)).party?.id).toBe(s.customer.id); // party kept
+      expect((await orders.getKarigarIssue(s.ctx, issue.id)).samples?.map((x) => x.id)).toEqual([a.id, b.id]);
+      const listed = await orders.listKarigarIssues(s.ctx, { page: 1, pageSize: 20 });
+      expect(listed.items.find((i) => i.id === issue.id)!.samples?.map((x) => x.id)).toEqual([a.id, b.id]);
+
+      // return keeps the link (history)
+      await samples.returnSample(s.ctx, a.id, {});
+      expect((await samples.getSample(s.ctx, a.id)).karigarIssueId).toBe(issue.id);
+    });
+
+    it('a non-available sample → 409 and the whole issue rolls back (no issue row, item still PENDING, other sample still IN_HAND)', async () => {
+      const s = await setup();
+      const order = await makeOrder(s.ctx, s.itemName.id, s.customer.id);
+      const ok = await samples.createSample(s.ctx, { metal: 'GOLD', grossWt: 1, tounchPercent: 90 });
+      const melted = await samples.createSample(s.ctx, { metal: 'GOLD', grossWt: 1, tounchPercent: 90 });
+      await samples.meltSample(s.ctx, melted.id, {});
+
+      await expect(orders.createKarigarIssue(s.ctx, issueBody(s.karigar.id, order.items[0]!.id, [ok.id, melted.id])))
+        .rejects.toMatchObject({ status: 409, message: `Sample #${melted.sampleNo} is not available` });
+
+      expect(await db.karigarIssue.count({ where: { businessId: s.business.id } })).toBe(0);
+      expect((await orders.getOrder(s.ctx, order.id)).items[0]!.status).toBe('PENDING');
+      const okNow = await samples.getSample(s.ctx, ok.id);
+      expect(okNow.status).toBe('IN_HAND');
+      expect(okNow.karigarIssueId).toBeNull();
+      expect(okNow.movements.map((m) => m.action)).toEqual(['CREATED']);
+      expect(await db.ledgerEntry.count({ where: { source: 'KARIGAR_ISSUE' } })).toBe(0);
+    });
+
+    it('a cross-tenant sample → 404 and nothing is written', async () => {
+      const s = await setup();
+      const other = await createBusiness({ name: 'B' });
+      const foreign = await samples.createSample(ctxFor(other.business.id, other.root.id), { metal: 'GOLD', grossWt: 1, tounchPercent: 90 });
+      const order = await makeOrder(s.ctx, s.itemName.id, s.customer.id);
+
+      await expect(orders.createKarigarIssue(s.ctx, issueBody(s.karigar.id, order.items[0]!.id, [foreign.id]))).rejects.toMatchObject({ status: 404 });
+
+      expect(await db.karigarIssue.count()).toBe(0);
+      const f = await db.sample.findUniqueOrThrow({ where: { id: foreign.id } });
+      expect(f.status).toBe('IN_HAND');
+      expect(f.karigarIssueId).toBeNull();
+    });
+  });
+});

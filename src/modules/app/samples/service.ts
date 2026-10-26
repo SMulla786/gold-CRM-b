@@ -41,6 +41,8 @@ export const defaultFine = (gross: Prisma.Decimal.Value, tounch: Prisma.Decimal.
   D(gross).times(D(tounch)).div(100).toDecimalPlaces(3, Prisma.Decimal.ROUND_HALF_UP);
 
 const EDITABLE: SampleStatus[] = ['IN_HAND', 'RETURNED'];
+/** statuses a sample can be issued from */
+const ISSUABLE: SampleStatus[] = ['IN_HAND', 'RETURNED'];
 
 function activeBranch(ctx: TenantContext): number {
   if (ctx.activeBranchId == null) throw new HttpError(400, 'VALIDATION', 'Select one branch for samples (set X-Branch-Id)');
@@ -113,6 +115,7 @@ async function toDtos(ctx: TenantContext, rows: any[]): Promise<SampleDto[]> {
   return rows.map((s) => ({
     id: s.id, sampleNo: s.sampleNo, metal: s.metal, grossWt: wt(s.grossWt), tounchPercent: wt(s.tounchPercent), fine: wt(s.fine), status: s.status, note: s.note,
     party: refOf(s.partyId, names.party), karigar: refOf(s.karigarId, names.party), branch: { id: s.branchId, name: names.branch.get(s.branchId) ?? '' },
+    karigarIssueId: s.karigarIssueId ?? null,
     createdAt: s.createdAt.toISOString(), updatedAt: s.updatedAt.toISOString(),
   }));
 }
@@ -172,27 +175,65 @@ export async function updateSample(ctx: TenantContext, id: number, body: UpdateB
 
 // ───────────── status changes (custody only) ─────────────
 
+type FlipRow = { id: number; sampleNo: number; partyId: number | null; karigarId: number | null };
+type FlipOpts = { partyId?: number | null; karigarId?: number | null; karigarIssueId?: number; note?: string | null; partyName?: string | null; conflict?: string };
+
+/**
+ * Tx-aware status flip for a sample already resolved through scopedDb: guarded updateMany on the expected current status
+ * (+ business + branch scope; count must be 1, else 409 — the caller's tx rolls back) → SampleMovement → activity row.
+ */
+async function flipSampleTx(tx: Prisma.TransactionClient, ctx: TenantContext, s: FlipRow, from: SampleStatus[], to: SampleStatus, action: SampleAction, x: FlipOpts): Promise<void> {
+  const assign = {
+    ...(x.partyId != null ? { partyId: x.partyId } : {}),
+    ...(x.karigarId != null ? { karigarId: x.karigarId } : {}),
+    ...(x.karigarIssueId != null ? { karigarIssueId: x.karigarIssueId } : {}),
+  };
+  // guard on the expected current status so two concurrent flips can't both run
+  const { count } = await tx.sample.updateMany({ where: { id: s.id, businessId: ctx.businessId!, branchId: { in: ctx.branchIds }, status: { in: from } }, data: { status: to, ...assign } });
+  if (count !== 1) throw new HttpError(409, 'CONFLICT', x.conflict ?? 'Sample status changed concurrently — reload and retry');
+  await tx.sampleMovement.create({ data: movementRow(s.id, action, ctx, { partyId: x.partyId ?? s.partyId, karigarId: x.karigarId ?? s.karigarId, note: x.note }) });
+  await logActivity(tx, ctx, { module: 'SAMPLE', action: 'EDITED', entity: 'Sample', entityId: String(s.id), summary: `Sample #${s.sampleNo} ${action.toLowerCase()}${x.note ? ` — ${x.note}` : ''}`, partyName: x.partyName ?? null });
+}
+
 async function transition(
   ctx: TenantContext, id: number, from: SampleStatus[], to: SampleStatus, action: SampleAction,
   x: { partyId?: number | null; karigarId?: number | null; note?: string | null; partyName?: string | null },
 ): Promise<SampleDetailDto> {
   const s = await findSample(ctx, id);
   if (!from.includes(s.status as SampleStatus)) throw new HttpError(409, 'CONFLICT', `A ${s.status.toLowerCase().replace('_', ' ')} sample cannot be ${action.toLowerCase()}`);
-  const assign = { ...(x.partyId != null ? { partyId: x.partyId } : {}), ...(x.karigarId != null ? { karigarId: x.karigarId } : {}) };
-  await prisma.$transaction(async (tx) => {
-    // guard on the expected current status so two concurrent flips can't both run
-    const { count } = await tx.sample.updateMany({ where: { id, businessId: ctx.businessId!, status: { in: from } }, data: { status: to, ...assign } });
-    if (count !== 1) throw new HttpError(409, 'CONFLICT', 'Sample status changed concurrently — reload and retry');
-    await tx.sampleMovement.create({ data: movementRow(id, action, ctx, { partyId: x.partyId ?? s.partyId, karigarId: x.karigarId ?? s.karigarId, note: x.note }) });
-    await logActivity(tx, ctx, { module: 'SAMPLE', action: 'EDITED', entity: 'Sample', entityId: String(id), summary: `Sample #${s.sampleNo} ${action.toLowerCase()}${x.note ? ` — ${x.note}` : ''}`, partyName: x.partyName ?? null });
-  });
+  await prisma.$transaction((tx) => flipSampleTx(tx, ctx, s, from, to, action, x));
   return getSample(ctx, id);
+}
+
+/** Scoped read of the samples to hand over with a karigar issue (missing / other tenant / other branch → 404). Call before the tx. */
+export async function findIssuableSamples(ctx: TenantContext, ids: number[]): Promise<FlipRow[]> {
+  const u = [...new Set(ids)];
+  if (!u.length) return [];
+  const rows = await scopedDb(ctx).sample.findMany({ where: { id: { in: u } }, select: { id: true, sampleNo: true, partyId: true, karigarId: true }, orderBy: { sampleNo: 'asc' } });
+  if (rows.length !== u.length) throw new HttpError(404, 'NOT_FOUND', 'Sample not found');
+  return rows;
+}
+
+/**
+ * Inside the karigar-issue tx: IN_HAND | RETURNED → ISSUED for each sample, karigarId = the issue's karigar, karigarIssueId = the issue.
+ * Any sample no longer available → 409 'Sample #n is not available' and the caller's whole tx (the issue) rolls back.
+ */
+export async function issueSamplesToKarigarTx(
+  tx: Prisma.TransactionClient, ctx: TenantContext, rows: FlipRow[],
+  x: { karigarId: number; karigarName: string; karigarIssueId: number; issueNo: number },
+): Promise<void> {
+  for (const s of rows) {
+    await flipSampleTx(tx, ctx, s, ISSUABLE, 'ISSUED', 'ISSUED', {
+      karigarId: x.karigarId, karigarIssueId: x.karigarIssueId, note: `Karigar issue #${x.issueNo}`, partyName: x.karigarName,
+      conflict: `Sample #${s.sampleNo} is not available`,
+    });
+  }
 }
 
 /** IN_HAND | RETURNED → ISSUED. Given party/karigar replace the sample's. */
 export async function issueSample(ctx: TenantContext, id: number, body: IssueBody): Promise<SampleDetailDto> {
   const { party, karigar } = await assertParties(ctx, body.partyId, body.karigarId);
-  return transition(ctx, id, ['IN_HAND', 'RETURNED'], 'ISSUED', 'ISSUED', { partyId: party?.id, karigarId: karigar?.id, note: body.note, partyName: karigar?.name ?? party?.name ?? null });
+  return transition(ctx, id, ISSUABLE, 'ISSUED', 'ISSUED', { partyId: party?.id, karigarId: karigar?.id, note: body.note, partyName: karigar?.name ?? party?.name ?? null });
 }
 
 /** ISSUED → RETURNED */

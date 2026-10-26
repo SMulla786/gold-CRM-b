@@ -239,8 +239,11 @@ export const repairBody = z
     /** TASK-97: purity % and sub-category */
     purity: z.coerce.number().min(0).max(100).optional(),
     subCategory: z.string().trim().max(40).optional(),
+    /** starting status; IN_PROGRESS (work begins at intake) needs a karigar */
+    initialStatus: z.enum(['RECEIVED', 'IN_PROGRESS']).default('RECEIVED'),
   })
-  .refine((b) => b.advanceOnline === 0 || b.advanceBankId != null, { message: 'Select a bank account', path: ['advanceBankId'] });
+  .refine((b) => b.advanceOnline === 0 || b.advanceBankId != null, { message: 'Select a bank account', path: ['advanceBankId'] })
+  .refine((b) => b.initialStatus !== 'IN_PROGRESS' || b.karigarId != null, { message: 'Assign a karigar to start work on intake', path: ['initialStatus'] });
 
 export const repairStatusBody = z.object({
   status: z.enum(['IN_PROGRESS', 'IN_REVIEW', 'READY', 'CANCELLED']),
@@ -248,6 +251,11 @@ export const repairStatusBody = z.object({
   /** IN_REVIEW → READY (quality audit) */
   finalWeight: weight.optional(),
   remarks: z.string().trim().max(300).optional(),
+});
+
+/** QA "return to bench": IN_REVIEW → IN_PROGRESS (the only backward move); remarks appended to the ticket */
+export const repairRejectBody = z.object({
+  remarks: z.string().trim().min(1).max(300),
 });
 
 export const repairDeliverBody = z

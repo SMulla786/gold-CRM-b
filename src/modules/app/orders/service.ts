@@ -12,6 +12,7 @@ import { currentRates, getSettings } from '../service';
 import { computePayments, sumAmounts } from '../billing/service';
 import { nextTagNo } from '../inventory';
 import { filePath, removeFile, replaceFile } from './files';
+import { findIssuableSamples, issueSamplesToKarigarTx } from '../samples/service';
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
@@ -238,7 +239,7 @@ export async function getOrder(ctx: TenantContext, id: number): Promise<OrderDto
 
 // ───────────── Karigar issue / receive ─────────────
 
-type KarigarIssueBody = { karigarId: number; orderItemIds: number[]; dueDate?: Date; goldFine: number; silverFine: number; cash: number; online: number; bankAccountId?: number; remark?: string; wastagePercent?: number; wastageGm?: number };
+type KarigarIssueBody = { karigarId: number; orderItemIds: number[]; dueDate?: Date; goldFine: number; silverFine: number; cash: number; online: number; bankAccountId?: number; remark?: string; wastagePercent?: number; wastageGm?: number; sampleIds?: number[] };
 
 export async function createKarigarIssue(ctx: TenantContext, body: KarigarIssueBody): Promise<KarigarIssueDto> {
   const branchId = activeBranch(ctx);
@@ -252,6 +253,8 @@ export async function createKarigarIssue(ctx: TenantContext, body: KarigarIssueB
   const items = await prisma.orderItem.findMany({ where: { id: { in: body.orderItemIds }, order: { businessId: ctx.businessId!, branchId } }, include: { order: true } });
   if (items.length !== new Set(body.orderItemIds).size) throw new HttpError(409, 'CONFLICT', 'Some order items are not in this branch');
   if (items.some((it) => it.status !== 'PENDING')) throw new HttpError(409, 'CONFLICT', 'Some items are already assigned or received');
+  // samples handed over with the issue: scoped read first (cross-tenant / other branch → 404); issued inside the tx below
+  const samples = await findIssuableSamples(ctx, body.sampleIds ?? []);
 
   const issueDate = ledger.businessDate();
   const lctx = lctxOf(ctx);
@@ -262,6 +265,8 @@ export async function createKarigarIssue(ctx: TenantContext, body: KarigarIssueB
     const claim = await tx.orderItem.updateMany({ where: { id: { in: body.orderItemIds }, status: 'PENDING' }, data: { status: 'ASSIGNED', karigarIssueId: issue.id } });
     if (claim.count !== new Set(body.orderItemIds).size) throw new HttpError(409, 'CONFLICT', 'Some items were just assigned to another issue');
     await tx.order.updateMany({ where: { id: { in: [...new Set(items.map((i) => i.orderId))] }, status: 'PENDING' }, data: { status: 'IN_PROCESS' } });
+    // samples go out with the issue atomically — any one no longer IN_HAND/RETURNED → 409 and the whole issue rolls back
+    if (samples.length) await issueSamplesToKarigarTx(tx, ctx, samples, { karigarId: body.karigarId, karigarName: karigar.name, karigarIssueId: issue.id, issueNo });
 
     const ledRows: ledger.LedgerEntryInput[] = [];
     const sourceId = String(issue.id);
@@ -275,7 +280,7 @@ export async function createKarigarIssue(ctx: TenantContext, body: KarigarIssueB
     if (!(amount.isZero() && body.goldFine === 0 && body.silverFine === 0)) {
       await udhar.post(tx, lctx, [{ branchId, partyId: body.karigarId, txnDate: issueDate, amount, gold: body.goldFine, silver: body.silverFine, source: 'KARIGAR_ISSUE', sourceId, narration: `Karigar issue #${issueNo}` }]);
     }
-    await logActivity(tx, ctx, { module: 'ORDER', action: 'CREATED', entity: 'KarigarIssue', entityId: String(issue.id), summary: `Karigar issue #${issueNo} (${items.length} item${items.length === 1 ? '' : 's'})` });
+    await logActivity(tx, ctx, { module: 'ORDER', action: 'CREATED', entity: 'KarigarIssue', entityId: String(issue.id), summary: `Karigar issue #${issueNo} (${items.length} item${items.length === 1 ? '' : 's'}${samples.length ? `, ${samples.length} sample${samples.length === 1 ? '' : 's'}` : ''})` });
     return issue.id;
   });
   return getKarigarIssue(ctx, issueId);
@@ -377,10 +382,11 @@ export async function getKarigarIssue(ctx: TenantContext, id: number): Promise<K
   const sdb = scopedDb(ctx);
   const issue = await sdb.karigarIssue.findUnique({ where: { id } });
   if (!issue) throw new HttpError(404, 'NOT_FOUND', 'Karigar issue not found');
-  const [karigar, bank, items] = await Promise.all([
+  const [karigar, bank, items, samples] = await Promise.all([
     sdb.party.findUnique({ where: { id: issue.karigarId }, select: { id: true, name: true, type: true, mobile: true, shopName: true } }),
     issue.bankAccountId != null ? sdb.bankAccount.findUnique({ where: { id: issue.bankAccountId }, select: { id: true, bankName: true } }) : null,
     prisma.orderItem.findMany({ where: { karigarIssueId: id, order: { businessId: ctx.businessId! } }, include: { order: true } }),
+    sdb.sample.findMany({ where: { karigarIssueId: id }, orderBy: { sampleNo: 'asc' }, select: { id: true, sampleNo: true, metal: true, grossWt: true, tounchPercent: true, fine: true } }),
   ]);
   const nameMap = await itemNameMap(ctx, items.map((i) => i.itemNameId));
   const orderParties = await sdb.party.findMany({ where: { id: { in: [...new Set(items.map((it) => it.order.partyId))] } }, select: { id: true, name: true, type: true, mobile: true, shopName: true } });
@@ -391,6 +397,7 @@ export async function getKarigarIssue(ctx: TenantContext, id: number): Promise<K
     bankAccount: bank ? { id: bank.id, name: bank.bankName } : null, remark: issue.remark, status: issue.status as any,
     wastagePercent: issue.wastagePercent != null ? wt(issue.wastagePercent) : null, wastageGm: issue.wastageGm != null ? wt(issue.wastageGm) : null,
     items: items.map((it) => ({ ...orderItemDto(it, nameMap, null), order: { id: it.order.id, orderNo: it.order.orderNo, party: orderPartyMap.get(it.order.partyId) as any } })),
+    samples: samples.map((x) => ({ id: x.id, sampleNo: x.sampleNo, metal: x.metal as any, grossWt: wt(x.grossWt), tounchPercent: wt(x.tounchPercent), fine: wt(x.fine) })),
     createdAt: issue.createdAt.toISOString(),
   };
 }
