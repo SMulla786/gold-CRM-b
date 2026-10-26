@@ -298,6 +298,15 @@ async function undoBill(tx: Prisma.TransactionClient, ctx: TenantContext, bill: 
   }
 }
 
+/** TASK-97 GST reporting fields — stored only (no calc/posting effect); omitted → schema default on create, unchanged on edit. */
+const gstMeta = (b: BillBody) => ({
+  itcEligibility: b.itcEligibility,
+  itcBlockReason: b.itcBlockReason === undefined ? undefined : b.itcBlockReason || null,
+  supplierInvoiceNo: b.supplierInvoiceNo === undefined ? undefined : b.supplierInvoiceNo || null,
+  supplyCategory: b.supplyCategory,
+  reverseCharge: b.reverseCharge,
+});
+
 export async function createBill(ctx: TenantContext, body: BillBody): Promise<BillDto> {
   const branchId = activeBranch(ctx);
   const s = await getSettings(ctx);
@@ -337,6 +346,7 @@ export async function createBill(ctx: TenantContext, body: BillBody): Promise<Bi
         gstPercent: body.billType === 'ROUGH' ? 0 : body.gstPercent, taxable: prep.billCalc.taxable, cgst: prep.billCalc.cgst, sgst: prep.billCalc.sgst, igst: prep.billCalc.igst,
         total: prep.billCalc.total, round: prep.billCalc.round, final: prep.billCalc.final, paid: prep.paid, keepBalanceAs: body.keepBalanceAs,
         keepRate: body.keepBalanceAs !== 'MONEY' ? (body.keepRate ?? null) : null, keepWeight: prep.keepWeight, remark: body.remark ?? null, status: 'ACTIVE', createdById: ctx.userId,
+        ...gstMeta(body),
       },
     });
     await writeBillContents(tx, ctx, bill, body, prep, lctx, reservedIds);
@@ -384,6 +394,7 @@ export async function editBill(ctx: TenantContext, id: number, body: BillBody): 
         gstPercent: body.billType === 'ROUGH' ? 0 : body.gstPercent, taxable: prep.billCalc.taxable, cgst: prep.billCalc.cgst, sgst: prep.billCalc.sgst, igst: prep.billCalc.igst,
         total: prep.billCalc.total, round: prep.billCalc.round, final: prep.billCalc.final, paid: prep.paid, keepBalanceAs: body.keepBalanceAs,
         keepRate: body.keepBalanceAs !== 'MONEY' ? (body.keepRate ?? null) : null, keepWeight: prep.keepWeight, remark: body.remark ?? null,
+        ...gstMeta(body),
       },
     });
     await writeBillContents(tx, ctx, { id: bill.id, branchId: bill.branchId, billNo: bill.billNo, billDate: bill.billDate }, body, prep, lctx);
@@ -517,7 +528,9 @@ export async function getBill(ctx: TenantContext, id: number): Promise<BillDto> 
     ...listItemFields(bill, partyRef(party), branch?.name ?? '', creator),
     dueDate: bill.dueDate ? bill.dueDate.toISOString().slice(0, 10) : null, interState: bill.interState, sub: String(bill.sub), discount: String(bill.discount), discountUnit: bill.discountUnit, discountAmount: String(bill.discountAmount),
     gstPercent: String(bill.gstPercent), taxable: String(bill.taxable), cgst: String(bill.cgst), sgst: String(bill.sgst), igst: String(bill.igst), total: String(bill.total), round: String(bill.round),
-    keepRate: bill.keepRate != null ? String(bill.keepRate) : null, remark: bill.remark, deletedWithStock: bill.deletedWithStock, items: bill.items.map(lineDto), payments: bill.payments.map((p) => paymentDto(p, baMap)),
+    keepRate: bill.keepRate != null ? String(bill.keepRate) : null, remark: bill.remark, deletedWithStock: bill.deletedWithStock,
+    itcEligibility: bill.itcEligibility, itcBlockReason: bill.itcBlockReason, supplierInvoiceNo: bill.supplierInvoiceNo, supplyCategory: bill.supplyCategory, reverseCharge: bill.reverseCharge,
+    items: bill.items.map(lineDto), payments: bill.payments.map((p) => paymentDto(p, baMap)),
   };
 }
 

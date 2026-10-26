@@ -46,6 +46,7 @@ async function mkBill(s: Awaited<ReturnType<typeof setup>>, o: any) {
       billNo: o.billNo ?? `INV/25-26/${String(seq).padStart(4, '0')}`, seq, partyId: o.partyId, billDate: o.billDate ?? from,
       interState: o.interState ?? false, sub: taxable, taxable, gstPercent: o.gstPercent ?? 3, cgst, sgst, igst, total: final, final,
       status: o.status ?? 'ACTIVE', deletedAt: o.deletedAt ?? null,
+      itcEligibility: o.itcEligibility, supplyCategory: o.supplyCategory, reverseCharge: o.reverseCharge, // undefined → schema defaults
       items: { create: [{ stockClass: o.stockClass ?? 'GOLD', description: 'ring', hsnCode: o.hsnCode ?? '7113', net: o.net ?? 10, gross: o.net ?? 10, fine: o.net ?? 10, pcs: o.pcs ?? 1, metalAmount: 0, labourAmount: 0, total: final }] },
     },
   });
@@ -123,6 +124,48 @@ describe('GSTR-3B', () => {
     expect([Number(r3.itc.cgst), Number(r3.itc.sgst)]).toEqual([30, 30]);
     expect(Number(r3.nonGst)).toBe(800);
     expect(Number(r3.netPayableIndicative)).toBe(180 - 60); // output 180 − itc 60
+  });
+
+  it('all-default bills: TASK-97 split leaves the previous totals identical', async () => {
+    const s = await setup();
+    await mkBill(s, { partyId: s.reg.id, taxable: 1000, cgst: 15, sgst: 15 });
+    await mkBill(s, { partyId: s.regInter.id, interState: true, taxable: 3000, igst: 90 });
+    await mkBill(s, { partyId: s.reg.id, kind: 'PURCHASE', taxable: 2000, cgst: 30, sgst: 30, billNo: 'PUR/1' });
+    await mkBill(s, { partyId: s.unregIntra.id, kind: 'PURCHASE', taxable: 500, cgst: 7.5, sgst: 7.5, billNo: 'PUR/2' }); // no GSTIN → no ITC (as before)
+    const r = await svc.gstr3b(s.ctx, q);
+    expect([r.outward.taxable, r.outward.cgst, r.outward.sgst, r.outward.igst]).toEqual(['4000.00', '15.00', '15.00', '90.00']);
+    expect([r.itc.cgst, r.itc.sgst, r.itc.igst]).toEqual(['30.00', '30.00', '0.00']);
+    expect(r.itc.eligible).toEqual({ cgst: '30.00', sgst: '30.00', igst: '0.00' });
+    expect(r.itc.reversed).toEqual({ cgst: '0.00', sgst: '0.00', igst: '0.00' });
+    expect(r.itc.ineligible).toEqual({ cgst: '0.00', sgst: '0.00', igst: '0.00' });
+    expect(r.itc.taxable).toBe('2000.00');
+    for (const k of ['zeroRated', 'nilExempt', 'nonGst', 'reverseCharge'] as const) expect(Number(r.outward[k]!.taxable)).toBe(0);
+    expect(Number(r.netPayableIndicative)).toBe(120 - 60);
+  });
+
+  it('blocked 17(5) / ineligible ITC excluded from eligible + net; supply categories and RCM split out', async () => {
+    const s = await setup();
+    await mkBill(s, { partyId: s.reg.id, taxable: 1000, cgst: 15, sgst: 15 }); // 3.1(a)
+    await mkBill(s, { partyId: s.regInter.id, interState: true, taxable: 2000, igst: 60, supplyCategory: 'ZERO_RATED' }); // 3.1(b)
+    await mkBill(s, { partyId: s.reg.id, taxable: 300, supplyCategory: 'NIL_EXEMPT' }); // 3.1(c)
+    await mkBill(s, { partyId: s.reg.id, taxable: 400, supplyCategory: 'NON_GST' }); // 3.1(e)
+    await mkBill(s, { partyId: s.reg.id, kind: 'PURCHASE', taxable: 1000, cgst: 15, sgst: 15, billNo: 'PUR/1' }); // eligible
+    await mkBill(s, { partyId: s.reg.id, kind: 'PURCHASE', taxable: 2000, cgst: 30, sgst: 30, billNo: 'PUR/2', itcEligibility: 'BLOCKED_17_5' });
+    await mkBill(s, { partyId: s.reg.id, kind: 'PURCHASE', taxable: 500, cgst: 7.5, sgst: 7.5, billNo: 'PUR/3', itcEligibility: 'INELIGIBLE' });
+    await mkBill(s, { partyId: s.unregIntra.id, kind: 'PURCHASE', taxable: 100, cgst: 1.5, sgst: 1.5, billNo: 'PUR/4', reverseCharge: true }); // RCM, unregistered supplier
+    const r = await svc.gstr3b(s.ctx, q);
+    expect(r.outward.taxable).toBe('1000.00');
+    expect([r.outward.zeroRated!.taxable, r.outward.zeroRated!.igst]).toEqual(['2000.00', '60.00']);
+    expect(r.outward.nilExempt!.taxable).toBe('300.00');
+    expect(r.outward.nonGst!.taxable).toBe('400.00');
+    expect([r.outward.reverseCharge!.taxable, r.outward.reverseCharge!.cgst]).toEqual(['100.00', '1.50']);
+    expect(r.itc.eligible).toEqual({ cgst: '16.50', sgst: '16.50', igst: '0.00' }); // PUR/1 + RCM PUR/4
+    expect([r.itc.cgst, r.itc.sgst]).toEqual(['16.50', '16.50']);
+    expect(r.itc.reversed).toEqual({ cgst: '30.00', sgst: '30.00', igst: '0.00' });
+    expect(r.itc.ineligible).toEqual({ cgst: '7.50', sgst: '7.50', igst: '0.00' });
+    expect(r.itc.taxable).toBe('3600.00');
+    // output 30 + 60 (all GST sells) + RCM 3 − eligible 33
+    expect(Number(r.netPayableIndicative)).toBe(60);
   });
 });
 
