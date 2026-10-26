@@ -23,6 +23,10 @@ export const updateBranchBody = branchBody.omit({ parentId: true }).partial().ex
 export const moveBranchBody = z.object({ newParentId: id });
 
 export const counterBody = z.object({ branchId: id, name: z.string().trim().min(1).max(60) });
+/** PATCH /admin/counters/:id: rename and/or (de)activate (counters are never hard-deleted). */
+export const updateCounterBody = z
+  .object({ name: counterBody.shape.name.optional(), isActive: z.boolean().optional() })
+  .refine((b) => b.name !== undefined || b.isActive !== undefined, { message: 'Nothing to update' });
 
 const permissionGrant = z.object({
   key: z.enum(PAGE_KEYS as [string, ...string[]]),

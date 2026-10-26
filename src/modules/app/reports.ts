@@ -454,7 +454,7 @@ export async function gstr3b(ctx: TenantContext, q: { from: Date; to: Date }): P
     from, to, gstin: shop.gstin,
     outward: { ...cols(pick(outRows, 'TAXABLE')), zeroRated: cols(pick(outRows, 'ZERO_RATED')), nilExempt: cols(pick(outRows, 'NIL_EXEMPT')), nonGst: cols(pick(outRows, 'NON_GST')), reverseCharge: cols(rcm) },
     nonGst: money(D(nonRow[0]!.s)),
-    itc: { ...tax(eligible), eligible: tax(eligible), reversed: tax(pick(itcRows, 'BLOCKED_17_5')), ineligible: tax(pick(itcRows, 'INELIGIBLE')), taxable: money(sumOf(itcRows, (c) => D(c.taxable))) },
+    itc: { ...tax(eligible), eligible: tax(eligible), reversed: tax(pick(itcRows, 'BLOCKED_17_5')), ineligible: tax(pick(itcRows, 'INELIGIBLE')), taxable: money(sumOf(itcRows, (c) => D(c.taxable))), eligibleTaxable: money(D(eligible.taxable)), reversedTaxable: money(D(pick(itcRows, 'BLOCKED_17_5').taxable)) },
     netPayableIndicative: money(net.isNegative() ? D(0) : net),
   };
 }

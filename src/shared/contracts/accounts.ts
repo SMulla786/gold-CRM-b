@@ -101,8 +101,8 @@ export interface LedgerRowDto {
   net: string | null;
   fine: string | null;
   amount: string | null;
-  /** stock item touched by this row (item name + tag), for the Item column */
-  item: { id: number; label: string } | null;
+  /** stock item touched by this row (item name + tag), for the Item column; TASK-98: + item group / name for the Type column */
+  item: { id: number; label: string; group?: string; name?: string } | null;
   narration: string | null;
   isReversal: boolean;
   /** true when a later row reverses this one — show struck-through */
@@ -173,6 +173,15 @@ export interface DayBookAllInOneRowDto {
   narration: string | null;
   /** per asset, main unit as in LedgerRowDto.balance; assets with no movement are "0" */
   assets: Record<(typeof LEDGER_ASSETS)[number], { in: string; out: string }>;
+  /** TASK-98: earliest createdAt (ISO) of the document's ledger rows — the row's time */
+  createdAt?: string;
+  /** TASK-98: MONEY in/out split by holder — cash = shop cash (no bank account), bank = any bank account */
+  money?: { cashIn: string; cashOut: string; bankIn: string; bankOut: string };
+  /** TASK-98: distinct metal forms (USUAL/BULLION/KACHA) and karat codes moved per metal; empty arrays when none */
+  metal?: Record<'GOLD' | 'SILVER', { forms: string[]; karats: string[] }>;
+  /** TASK-98: running balance AFTER this document (MONEY amount, GOLD/SILVER fine), chronological: opening before `from`
+   *  (Day-Book rule, same source filter) + every document up to this one. Rows are listed newest first. */
+  balance?: Record<'MONEY' | 'GOLD' | 'SILVER', string>;
 }
 
 /**

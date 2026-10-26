@@ -6,7 +6,7 @@ import { z } from 'zod';
 import { STOCK_CLASSES } from '../enums';
 import { id, pageQuery } from './common';
 import { CHARGE_UNITS } from './inventory';
-import { decimalInput, METALS } from './masters';
+import { decimalInput, METALS, PARTY_TYPES } from './masters';
 import type { PartyRefDto } from './masters';
 
 export const BILL_KINDS = ['SELL', 'PURCHASE'] as const;
@@ -50,6 +50,11 @@ export const billLineInput = z.object({
   other: decimalInput.default(0),
   discount: decimalInput.default(0),
   discountUnit: z.enum(DISCOUNT_UNITS).default('FIXED'),
+  /** PURCHASE "default sale value" (TASK-98): written onto the created stock item's rate / labour / labourUnit
+   *  instead of the purchase values. No effect on the bill line, purchaseCost, ledger or udhar. Ignored on SELL. */
+  saleRate: decimalInput.optional(),
+  saleLabour: decimalInput.optional(),
+  saleLabourUnit: z.enum(CHARGE_UNITS).optional(),
 });
 export type BillLineInput = z.infer<typeof billLineInput>;
 
@@ -141,6 +146,8 @@ export const billListQuery = pageQuery.extend({
   to: z.coerce.date().optional(),
   minTotal: decimalInput.optional(),
   maxTotal: decimalInput.optional(),
+  /** TASK-98: only bills whose party is of this type */
+  partyType: z.enum(PARTY_TYPES).optional(),
 });
 export const nextBillNoQuery = z.object({ kind: z.enum(BILL_KINDS), billType: z.enum(BILL_TYPES) });
 

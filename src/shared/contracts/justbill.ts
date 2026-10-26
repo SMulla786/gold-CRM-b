@@ -27,6 +27,16 @@ export const justBillLineInput = z.object({
 });
 export type JustBillLineInput = z.infer<typeof justBillLineInput>;
 
+/**
+ * TASK-98: Just Bill payments = billPaymentInput + UDHAR_ADVANCE (uses `amount` of the linked party's existing udhar credit,
+ * 409 OVER_BALANCE if more; no cash/bank movement). billPaymentInput itself stays unchanged (order advances use it).
+ */
+export const justBillPayInput = z.discriminatedUnion('mode', [
+  ...billPaymentInput.options,
+  z.object({ mode: z.literal('UDHAR_ADVANCE'), amount: decimalInput.positive(), remark: z.string().max(200).optional() }),
+]);
+export type JustBillPayInput = z.infer<typeof justBillPayInput>;
+
 export const justBillBody = z
   .object({
     /** link a party (balance goes to their udhar) or give a walk-in name */
@@ -38,8 +48,8 @@ export const justBillBody = z
     discount: decimalInput.default(0),
     discountUnit: z.enum(DISCOUNT_UNITS).default('FIXED'),
     gstPercent: z.coerce.number().min(0).max(28).default(0),
-    /** same modes as stock bills; METAL with metalForm KACHA = old gold/silver received */
-    payments: z.array(billPaymentInput).max(20).default([]),
+    /** CASH / ONLINE / METAL (KACHA = old gold/silver received) + UDHAR_ADVANCE (party's credit) */
+    payments: z.array(justBillPayInput).max(20).default([]),
     remark: z.string().trim().max(300).optional(),
   })
   .refine((b) => b.partyId != null || !!b.customerName, { message: 'Pick a party or enter the customer name', path: ['customerName'] });

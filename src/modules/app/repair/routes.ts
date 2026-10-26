@@ -6,6 +6,7 @@ import {
   id as idSchema,
   repairBody,
   repairStatusBody,
+  repairRejectBody,
   repairDeliverBody,
   repairListQuery,
   repairConsumableBody,
@@ -22,6 +23,7 @@ repairRouter.post('/repairs', requirePermission(REPAIR, 'edit'), async (req, res
 repairRouter.get('/repairs', requirePermission(REPAIR, 'view'), async (req, res) => res.json(await repair.listRepairs(req.ctx!, repairListQuery.parse(req.query))));
 repairRouter.get('/repairs/:id', requirePermission(REPAIR, 'view'), async (req, res) => res.json(await repair.getRepair(req.ctx!, idSchema.parse(req.params.id))));
 repairRouter.post('/repairs/:id/status', requirePermission(REPAIR, 'edit'), async (req, res) => res.json(await repair.updateRepairStatus(req.ctx!, idSchema.parse(req.params.id), repairStatusBody.parse(req.body))));
+repairRouter.post('/repairs/:id/reject', requirePermission(REPAIR, 'edit'), async (req, res) => res.json(await repair.rejectRepair(req.ctx!, idSchema.parse(req.params.id), repairRejectBody.parse(req.body))));
 repairRouter.post('/repairs/:id/deliver', requirePermission(REPAIR, 'edit'), async (req, res) => res.json(await repair.deliverRepair(req.ctx!, idSchema.parse(req.params.id), repairDeliverBody.parse(req.body))));
 
 // TASK-97 photo (JPEG/PNG/WebP, magic-byte checked, 2 MB) — multipart field "photo"

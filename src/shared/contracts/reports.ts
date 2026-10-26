@@ -196,6 +196,10 @@ export interface Gstr3bDto {
     ineligible?: { cgst: string; sgst: string; igst: string };
     /** taxable value of every counted purchase bill (all eligibility buckets) */
     taxable?: string;
+    /** taxable value of the ELIGIBLE bills only (4(C) basis) */
+    eligibleTaxable?: string;
+    /** taxable value of the blocked 17(5) bills (4(B)(1) basis); 4(A)(5) taxable = eligibleTaxable + reversedTaxable */
+    reversedTaxable?: string;
   };
   /** Σ output tax − Σ ITC, floored at 0 — the portal does the per-head set-off */
   netPayableIndicative: string;

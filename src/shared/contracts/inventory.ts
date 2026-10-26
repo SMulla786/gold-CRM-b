@@ -108,7 +108,12 @@ export const updateItemNameBody = itemNameBody.partial().extend({
   defLabour: z.coerce.number().min(0).nullable().optional(),
   defLabourUnit: z.enum(CHARGE_UNITS).nullable().optional(),
 });
-export const itemNameListQuery = pageQuery.extend({ stockClass: stockClass.optional(), groupId: id.optional() });
+export const itemNameListQuery = pageQuery.extend({
+  stockClass: stockClass.optional(),
+  groupId: id.optional(),
+  /** TASK-98: filter by the item group's jewellery type */
+  jewelleryTypeId: id.optional(),
+});
 export interface ItemNameDto {
   id: number;
   name: string;
@@ -337,7 +342,11 @@ export interface ShortageRowDto {
   maxWeight: string | null;
   minPcs: number | null;
   maxPcs: number | null;
-  /** SHORTAGE: below min; WARNING: within 20% above min; OK otherwise */
+  /**
+   * SHORTAGE: below min; WARNING: within 20% above min; OK otherwise.
+   * Weight (minWeight) and pcs (minPcs) are each checked when set and the worse result wins;
+   * pcs above maxPcs is also a WARNING (overstock). With pcs limits null only the weight rule applies.
+   */
   status: 'SHORTAGE' | 'WARNING' | 'OK';
 }
 
@@ -398,9 +407,10 @@ export type PrinterSettingsDto = z.output<typeof printerSettingsBody>;
 
 export const TAG_SHAPES = ['RECT', 'ROUNDED', 'BUTTERFLY'] as const;
 export const TAG_DIRECTIONS = ['HORIZONTAL', 'VERTICAL'] as const;
-export const TAG_ELEMENT_TYPES = ['text', 'field', 'barcode', 'image'] as const;
-/** Data a field/barcode element prints. image = the shop's invoice logo. */
-export const TAG_FIELDS = ['tagNo', 'huid', 'itemName', 'karat', 'gross', 'net', 'fine', 'rate', 'shopName'] as const;
+/** TASK-98: 'qr' = QR code of a field (same binding as barcode). */
+export const TAG_ELEMENT_TYPES = ['text', 'field', 'barcode', 'image', 'qr'] as const;
+/** Data a field/barcode/qr element prints. image = the shop's invoice logo. epcCode = RFID EPC (TASK-98). */
+export const TAG_FIELDS = ['tagNo', 'huid', 'itemName', 'karat', 'gross', 'net', 'fine', 'rate', 'shopName', 'epcCode'] as const;
 export type TagField = (typeof TAG_FIELDS)[number];
 export const tagElement = z.object({
   id: z.string().trim().min(1).max(40),
@@ -419,7 +429,7 @@ export const tagElement = z.object({
   opacity: z.coerce.number().min(0).max(1).optional(),
   /** type text */
   text: z.string().max(200).optional(),
-  /** type field / barcode */
+  /** type field / barcode / qr */
   field: z.enum(TAG_FIELDS).optional(),
 });
 export type TagElement = z.infer<typeof tagElement>;

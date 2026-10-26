@@ -30,12 +30,14 @@ async function nextNo(tx: Prisma.TransactionClient, businessId: number, branchId
 
 const FLOW = ['RECEIVED', 'IN_PROGRESS', 'IN_REVIEW', 'READY', 'DELIVERED'] as const;
 
-type RepairBody = { partyId: number; metal: 'GOLD' | 'SILVER' | 'OTHER'; category: string; description: string; pcs: number; gross: number; net?: number; karatCode?: string; hallmark?: string; expectedDate: Date; priority: 'NORMAL' | 'URGENT' | 'EXPRESS'; karigarId?: number; labourCharge: number; otherCharge: number; advanceCash: number; advanceOnline: number; advanceBankId?: number; purity?: number; subCategory?: string };
+type RepairBody = { partyId: number; metal: 'GOLD' | 'SILVER' | 'OTHER'; category: string; description: string; pcs: number; gross: number; net?: number; karatCode?: string; hallmark?: string; expectedDate: Date; priority: 'NORMAL' | 'URGENT' | 'EXPRESS'; karigarId?: number; labourCharge: number; otherCharge: number; advanceCash: number; advanceOnline: number; advanceBankId?: number; purity?: number; subCategory?: string; initialStatus?: 'RECEIVED' | 'IN_PROGRESS' };
 
 export async function createRepair(ctx: TenantContext, body: RepairBody): Promise<RepairTicketDto> {
   const branchId = activeBranch(ctx);
   const sdb = scopedDb(ctx);
   if (!(await sdb.party.findUnique({ where: { id: body.partyId } }))) throw new HttpError(404, 'NOT_FOUND', 'Party not found');
+  const initialStatus = body.initialStatus ?? 'RECEIVED';
+  if (initialStatus === 'IN_PROGRESS' && body.karigarId == null) throw new HttpError(400, 'VALIDATION', 'Assign a karigar to start work on intake');
   if (body.karigarId != null) {
     const k = await sdb.party.findUnique({ where: { id: body.karigarId } });
     if (!k) throw new HttpError(404, 'NOT_FOUND', 'Karigar not found');
@@ -50,7 +52,7 @@ export async function createRepair(ctx: TenantContext, body: RepairBody): Promis
     const t = await tx.repairTicket.create({ data: {
       businessId: ctx.businessId!, branchId, ticketNo, partyId: body.partyId, metal: body.metal, category: body.category, description: body.description,
       pcs: body.pcs, gross: body.gross, net: body.net ?? null, karatCode: body.karatCode ?? null, hallmark: body.hallmark ?? null,
-      expectedDate: ledger.businessDate(body.expectedDate), priority: body.priority, status: 'RECEIVED', karigarId: body.karigarId ?? null,
+      expectedDate: ledger.businessDate(body.expectedDate), priority: body.priority, status: initialStatus, karigarId: body.karigarId ?? null,
       labourCharge: body.labourCharge, otherCharge: body.otherCharge, advanceCash: body.advanceCash, advanceOnline: body.advanceOnline, advanceBankId: body.advanceBankId ?? null, createdById: ctx.userId,
       purity: body.purity ?? null, subCategory: body.subCategory || null,
     } });
@@ -93,6 +95,21 @@ export async function updateRepairStatus(ctx: TenantContext, id: number, body: {
   if (body.status === 'READY' && (body.finalWeight == null || !body.remarks)) throw new HttpError(400, 'VALIDATION', 'Final weight and remarks are required to mark READY');
   const c = await sdb.repairTicket.updateMany({ where: { id, status: t.status }, data: { status: body.status, ...(body.karigarId != null ? { karigarId: body.karigarId } : {}), ...(body.finalWeight != null ? { finalWeight: body.finalWeight } : {}), ...(body.remarks ? { remarks: body.remarks } : {}) } });
   if (c.count !== 1) throw new HttpError(409, 'CONFLICT', 'Ticket status just changed');
+  return getRepair(ctx, id);
+}
+
+/** QA "return to bench": IN_REVIEW → IN_PROGRESS only — the one backward move; the generic status route stays forward-only. */
+export async function rejectRepair(ctx: TenantContext, id: number, body: { remarks: string }): Promise<RepairTicketDto> {
+  const t = await scopedDb(ctx).repairTicket.findUnique({ where: { id } });
+  if (!t) throw new HttpError(404, 'NOT_FOUND', 'Repair ticket not found');
+  if (t.status !== 'IN_REVIEW') throw new HttpError(409, 'CONFLICT', `Only a ticket in QA review can be returned to the bench (this one is ${t.status})`);
+  const note = `QA returned: ${body.remarks}`;
+  await prisma.$transaction(async (tx) => {
+    // id was tenant-checked above; guard on IN_REVIEW so a concurrent move can't be overwritten
+    const c = await tx.repairTicket.updateMany({ where: { id, status: 'IN_REVIEW' }, data: { status: 'IN_PROGRESS', remarks: t.remarks ? `${t.remarks}; ${note}` : note } });
+    if (c.count !== 1) throw new HttpError(409, 'CONFLICT', 'Ticket status just changed');
+    await logActivity(tx, ctx, { module: 'REPAIR', action: 'EDITED', entity: 'RepairTicket', entityId: String(id), summary: `Repair ticket #${t.ticketNo} returned to bench: ${body.remarks}` });
+  });
   return getRepair(ctx, id);
 }
 

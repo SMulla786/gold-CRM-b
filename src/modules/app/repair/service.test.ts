@@ -3,6 +3,7 @@ import { db, truncateAll } from '../../../../test/helpers/db';
 import { createBusiness } from '../../../../test/helpers/factory';
 import * as repair from './service';
 import type { TenantContext } from '../../../middleware/context';
+import { repairBody, repairRejectBody } from '../../../shared';
 
 const ctxFor = (businessId: number, branchId: number): TenantContext => ({
   userId: 1, level: 'ADMIN', isOwner: true, businessId,
@@ -152,6 +153,64 @@ describe('repair', () => {
     const today = new Date(new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' }));
     expect((await repair.listRepairs(s.ctx, { ...page, from: today, to: today })).total).toBe(2);
     expect((await repair.listRepairs(s.ctx, { ...page, to: new Date(today.getTime() - 86_400_000) })).total).toBe(0);
+  });
+
+  it('initialStatus: default RECEIVED; IN_PROGRESS only with a karigar (else 400)', async () => {
+    const s = await setup();
+    const k = await db.party.create({ data: { businessId: s.business.id, type: 'KARIGAR', name: 'K1', mobile: '9333333331', countryCode: '+91' } });
+    type Body = Parameters<typeof repair.createRepair>[1];
+    const body = (over: Record<string, unknown>) => base({ partyId: s.customer.id, advanceCash: 0, ...over }) as unknown as Body;
+    expect((await repair.createRepair(s.ctx, body({}))).status).toBe('RECEIVED');
+    expect((await repair.createRepair(s.ctx, body({ initialStatus: 'RECEIVED' }))).status).toBe('RECEIVED');
+    await expect(repair.createRepair(s.ctx, body({ initialStatus: 'IN_PROGRESS' }))).rejects.toMatchObject({ status: 400 });
+    const started = await repair.createRepair(s.ctx, body({ initialStatus: 'IN_PROGRESS', karigarId: k.id }));
+    expect(started.status).toBe('IN_PROGRESS');
+    expect(started.karigar?.id).toBe(k.id);
+    // started tickets continue forward normally
+    expect((await repair.updateRepairStatus(s.ctx, started.id, { status: 'IN_REVIEW' })).status).toBe('IN_REVIEW');
+    // contract: zod rejects IN_PROGRESS without a karigar, defaults to RECEIVED
+    const raw = { partyId: s.customer.id, metal: 'GOLD', category: 'Ring', description: 'Resize', gross: 5, expectedDate: '2026-01-01' };
+    expect(repairBody.safeParse({ ...raw, initialStatus: 'IN_PROGRESS' }).success).toBe(false);
+    expect(repairBody.parse(raw).initialStatus).toBe('RECEIVED');
+  });
+
+  it('reject (return to bench): IN_REVIEW → IN_PROGRESS with remarks appended; 409 from any other status', async () => {
+    const s = await setup();
+    const t = await repair.createRepair(s.ctx, base({ partyId: s.customer.id, advanceCash: 0 }) as unknown as Parameters<typeof repair.createRepair>[1]);
+    await expect(repair.rejectRepair(s.ctx, t.id, { remarks: 'x' })).rejects.toMatchObject({ status: 409 }); // RECEIVED
+    await repair.updateRepairStatus(s.ctx, t.id, { status: 'IN_PROGRESS' });
+    await expect(repair.rejectRepair(s.ctx, t.id, { remarks: 'x' })).rejects.toMatchObject({ status: 409 }); // IN_PROGRESS
+    await repair.updateRepairStatus(s.ctx, t.id, { status: 'IN_REVIEW' });
+    const back = await repair.rejectRepair(s.ctx, t.id, { remarks: 'Solder joint weak' });
+    expect(back.status).toBe('IN_PROGRESS');
+    expect(back.remarks).toBe('QA returned: Solder joint weak');
+    expect(await db.activityLog.count({ where: { entity: 'RepairTicket', entityId: String(t.id), action: 'EDITED' } })).toBe(1);
+    // second round: remarks append, then the normal forward flow resumes
+    await repair.updateRepairStatus(s.ctx, t.id, { status: 'IN_REVIEW' });
+    expect((await repair.rejectRepair(s.ctx, t.id, { remarks: 'Polish' })).remarks).toBe('QA returned: Solder joint weak; QA returned: Polish');
+    await repair.updateRepairStatus(s.ctx, t.id, { status: 'IN_REVIEW' });
+    await repair.updateRepairStatus(s.ctx, t.id, { status: 'READY', finalWeight: 12, remarks: 'ok' });
+    await expect(repair.rejectRepair(s.ctx, t.id, { remarks: 'x' })).rejects.toMatchObject({ status: 409 }); // READY
+    // the generic status route still never moves backward
+    await expect(repair.updateRepairStatus(s.ctx, t.id, { status: 'IN_PROGRESS' })).rejects.toMatchObject({ status: 409 });
+    const c = await repair.createRepair(s.ctx, base({ partyId: s.customer.id, advanceCash: 0 }) as unknown as Parameters<typeof repair.createRepair>[1]);
+    await repair.updateRepairStatus(s.ctx, c.id, { status: 'CANCELLED' });
+    await expect(repair.rejectRepair(s.ctx, c.id, { remarks: 'x' })).rejects.toMatchObject({ status: 409 }); // CANCELLED
+    // cross-tenant → 404; contract requires a reason (max 300)
+    const other = await createBusiness({ name: 'B' });
+    await expect(repair.rejectRepair(ctxFor(other.business.id, other.root.id), t.id, { remarks: 'x' })).rejects.toMatchObject({ status: 404 });
+    expect(repairRejectBody.safeParse({ remarks: '  ' }).success).toBe(false);
+    expect(repairRejectBody.safeParse({ remarks: 'a'.repeat(301) }).success).toBe(false);
+  });
+
+  it('reject: concurrent double-submit → one wins, the other 409', async () => {
+    const s = await setup();
+    const t = await repair.createRepair(s.ctx, base({ partyId: s.customer.id, advanceCash: 0 }) as unknown as Parameters<typeof repair.createRepair>[1]);
+    await repair.updateRepairStatus(s.ctx, t.id, { status: 'IN_PROGRESS' });
+    await repair.updateRepairStatus(s.ctx, t.id, { status: 'IN_REVIEW' });
+    const results = await Promise.allSettled([repair.rejectRepair(s.ctx, t.id, { remarks: 'a' }), repair.rejectRepair(s.ctx, t.id, { remarks: 'b' })]);
+    expect(results.filter((r) => r.status === 'fulfilled')).toHaveLength(1);
+    expect(results.filter((r) => r.status === 'rejected' && (r.reason as { status?: number }).status === 409)).toHaveLength(1);
   });
 
   it('TASK-97: consumables CRUD + adjust (never below zero) + status', async () => {
