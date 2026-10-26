@@ -2,7 +2,7 @@ import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { db, truncateAll } from '../../../test/helpers/db';
 import { createBusiness } from '../../../test/helpers/factory';
 import type { TenantContext } from '../../middleware/context';
-import { createUdharTxn, deleteUdharTxn, listLedger, partyBalance } from './udhar';
+import { createUdharTxn, deleteUdharTxn, listEntries, listLedger, partyBalance, updateUdharTxn } from './udhar';
 
 const ctxFor = (businessId: number, branchIds: number[], activeBranchId: number): TenantContext => ({
   userId: 1,
@@ -115,6 +115,41 @@ describe('udhar txn posting', () => {
     expect(await partyBalance(ctx, p.id)).toEqual({ amount: '0.00', gold: '0.000', silver: '0.000' }); // fully reversed
     expect((await db.bill.findUniqueOrThrow({ where: { id: bill.id } })).paid.toString()).toBe('0');
     expect((await db.billPayment.findFirstOrThrow({ where: { billId: bill.id } })).isActive).toBe(false);
+  });
+
+  it('edit reverses the old postings, re-posts the new body (same txn no) and re-applies the bill settlement; delete after edit nets to zero', async () => {
+    const { business, root } = await createBusiness({ name: 'A' });
+    const ctx = ctxFor(business.id, [root.id], root.id);
+    const p = await makeParty(business.id);
+    const bill = await db.bill.create({
+      data: { businessId: business.id, branchId: root.id, kind: 'SELL', billType: 'GST', billNo: 'INV-3', seq: 3, partyId: p.id, billDate: new Date('2026-01-01'), sub: 10000, taxable: 10000, total: 10000, final: 10000 },
+    });
+    const zero = { cashOut: 0, onlineOut: 0, cashIn: 0, onlineIn: 0, goldOut: 0, goldIn: 0, silverOut: 0, silverIn: 0 };
+    const dto = await createUdharTxn(ctx, { partyId: p.id, ...zero, cashOut: 5000, cashIn: 3000, settleBillId: bill.id } as never);
+
+    const edited = await updateUdharTxn(ctx, dto.id, { partyId: p.id, ...zero, cashOut: 2000, cashIn: 1000, goldOut: 5, settleBillId: bill.id } as never);
+    expect(edited.txnNo).toBe(dto.txnNo);
+    expect(edited.final).toEqual({ amount: '1000.00', gold: '5.000', silver: '0.000' }); // only the new body counts
+    expect(edited.old).toEqual({ amount: '0.00', gold: '0.000', silver: '0.000' });
+    expect((await db.bill.findUniqueOrThrow({ where: { id: bill.id } })).paid.toString()).toBe('1000'); // old 3000 taken back, new 1000 applied
+    expect(await db.billPayment.count({ where: { billId: bill.id, isActive: true } })).toBe(1);
+    const money = (await ledgerRows(business.id, String(dto.id))).filter((r) => r.asset === 'MONEY');
+    const net = money.reduce((a, r) => a + (r.direction === 'IN' ? 1 : -1) * Number(r.amount), 0);
+    expect(net).toBe(-1000); // shop: 2000 out − 1000 in after reversals
+
+    await deleteUdharTxn(ctx, dto.id);
+    expect(await partyBalance(ctx, p.id)).toEqual({ amount: '0.00', gold: '0.000', silver: '0.000' });
+    expect((await db.bill.findUniqueOrThrow({ where: { id: bill.id } })).paid.toString()).toBe('0');
+    await expect(updateUdharTxn(ctx, dto.id, { partyId: p.id, ...zero, cashOut: 1 } as never)).rejects.toMatchObject({ status: 404 }); // deleted → not editable
+  });
+
+  it('udhar list: BHAV_CUT rows describe the conversion in narration', async () => {
+    const { business, root } = await createBusiness({ name: 'A' });
+    const ctx = ctxFor(business.id, [root.id], root.id);
+    const p = await makeParty(business.id);
+    await createUdharTxn(ctx, { partyId: p.id, cashOut: 0, onlineOut: 0, cashIn: 0, onlineIn: 0, goldOut: 0, goldIn: 0, silverOut: 0, silverIn: 0, bhav: { direction: 'MONEY_TO_METAL', metal: 'GOLD', amount: 70000, rate: 70000, unitGrams: 10 } } as never);
+    const list = await listEntries(ctx, { page: 1, pageSize: 20, partyId: p.id });
+    expect(list.items.find((r) => r.source === 'BHAV_CUT')!.narration).toBe('Bhav GOLD ₹70000.00 @ ₹70000.00/10 g = 10.000 g');
   });
 
   it('cross-tenant party is not found (404)', async () => {

@@ -153,6 +153,16 @@ export async function cancelDraft(ctx: TenantContext, id: number): Promise<Sales
   return (await buildDtos(ctx, [id]))[0]!;
 }
 
+/** Hard-delete a draft that never became a bill (any status but BILLED); items cascade. */
+export async function deleteDraft(ctx: TenantContext, id: number): Promise<void> {
+  const sdb = scopedDb(ctx);
+  const draft = await sdb.salesDraft.findUnique({ where: { id } });
+  if (!draft) throw new HttpError(404, 'NOT_FOUND', 'Draft not found');
+  if (draft.status === 'BILLED' || draft.billId != null) throw new HttpError(409, 'CONFLICT', 'A billed draft cannot be deleted');
+  await sdb.salesDraft.delete({ where: { id } });
+  await prisma.$transaction((tx) => logActivity(tx, ctx, { module: 'SALES_DRAFT', action: 'DELETED', entity: 'SALES_DRAFT', entityId: String(id), summary: `Draft #${draft.draftNo} deleted` }));
+}
+
 // ───────────── builder ─────────────
 
 async function buildDtos(ctx: TenantContext, ids: number[]): Promise<SalesDraftDto[]> {

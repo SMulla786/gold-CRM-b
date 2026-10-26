@@ -188,6 +188,7 @@ export async function gstRegister(ctx: TenantContext, q: { page: number; pageSiz
       sgst: money(D(b.sgst)),
       igst: money(D(b.igst)),
       total: money(D(b.final)),
+      gstPercent: D(b.gstPercent).toString(), // stored bill rate (one rate per bill), e.g. '3' — same source as GSTR-1
     };
   });
   return { items, total, page: q.page, pageSize: q.pageSize };
@@ -238,9 +239,11 @@ export async function gstSummary(ctx: TenantContext, q: { from?: Date; to?: Date
   const periodOf = (ym: string): string => {
     const [yy, mm] = ym.split('-').map(Number) as [number, number];
     if (q.groupBy === 'MONTH') return ym;
-    if (q.groupBy === 'QUARTER') return `${yy}-Q${Math.floor((mm - 1) / 3) + 1}`;
     const fy = mm >= 4 ? yy : yy - 1; // FY Apr–Mar
-    return `FY${fy}-${String((fy + 1) % 100).padStart(2, '0')}`;
+    const yy2 = (n: number) => String(n % 100).padStart(2, '0');
+    // FY quarter: Apr–Jun = Q1 … Jan–Mar = Q4, e.g. 'FY26-27 Q1' (sorts chronologically as a string)
+    if (q.groupBy === 'QUARTER') return `FY${yy2(fy)}-${yy2(fy + 1)} Q${Math.floor(((mm + 8) % 12) / 3) + 1}`;
+    return `FY${fy}-${yy2(fy + 1)}`;
   };
   const map = new Map<string, { salesTaxable: Prisma.Decimal; purchaseTaxable: Prisma.Decimal; outputGst: Prisma.Decimal; inputGst: Prisma.Decimal }>();
   for (const r of raw) {

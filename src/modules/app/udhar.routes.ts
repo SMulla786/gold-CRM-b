@@ -18,6 +18,8 @@ udharRouter.get('/udhar/parties/:partyId/balance', requireAnyPermission([LEDGER,
 udharRouter.get('/udhar/parties/:partyId/statement', requirePermission(LEDGER, 'view'), async (req, res) => res.json(await svc.statement(req.ctx!, idSchema.parse(req.params.partyId), statementQuery.parse(req.query))));
 
 udharRouter.get('/udhar/:id', requirePermission(LEDGER, 'view'), async (req, res) => res.json(await svc.getUdharTxn(req.ctx!, idSchema.parse(req.params.id))));
+// edit = reverse + re-post (same body as create), MPIN-gated like delete
+udharRouter.put('/udhar/:id', requirePermission(ENTRY, 'edit'), requireMpin, async (req, res) => res.json(await svc.updateUdharTxn(req.ctx!, idSchema.parse(req.params.id), udharBody.parse(req.body))));
 udharRouter.delete('/udhar/:id', requirePermission(ENTRY, 'delete'), requireMpin, async (req, res) => {
   await svc.deleteUdharTxn(req.ctx!, idSchema.parse(req.params.id));
   res.status(204).end();

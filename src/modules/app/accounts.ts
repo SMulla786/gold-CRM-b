@@ -175,8 +175,9 @@ async function autoEntries(ctx: TenantContext, sourceType: Exclude<IeSourceType,
 
 /** TASK-81: per-day Cash In/Out, Profit (money IN−OUT) and Gold/Silver net, across all sources or one sourceType. */
 export async function incomeExpenseDailySummary(ctx: TenantContext, query: { from?: Date; to?: Date; sourceType?: IeSourceType }): Promise<IncomeExpenseDailySummaryDto[]> {
-  const from = ledger.businessDate(query.from ?? new Date());
+  // no range given → last 30 days ending at `to` (one row per day), not just today
   const to = ledger.businessDate(query.to ?? new Date());
+  const from = ledger.businessDate(query.from ?? new Date(to.getTime() - 29 * 86_400_000));
   const sdb = scopedDb(ctx);
   const base: any = { branchId: { in: branchFilter(ctx) }, reversalOfId: null, txnDate: { gte: from, lte: to }, ...(query.sourceType ? { source: { in: IE_SOURCE_MAP[query.sourceType] } } : {}) };
   const [money, cash, metal] = await Promise.all([

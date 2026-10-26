@@ -43,26 +43,132 @@ async function userNames(ctx: TenantContext, ids: (number | null)[]): Promise<Ma
   return new Map(rows.map((r) => [r.id, r.name]));
 }
 
-// ───────────── Create ─────────────
+// ───────────── Create / edit ─────────────
 
-export async function createUdharTxn(ctx: TenantContext, body: UdharBody): Promise<UdharTxnDto> {
-  const branchId = ctx.activeBranchId ?? ctx.scopeBranchId;
-  if (branchId == null || !ctx.branchIds.includes(branchId)) throw new HttpError(404, 'NOT_FOUND', 'Branch not found');
-  const sdb = scopedDb(ctx);
-
+/** Party / bank / bill references must exist in the caller's scope (create + edit). */
+async function checkRefs(sdb: ReturnType<typeof scopedDb>, body: UdharBody) {
   const party = await sdb.party.findUnique({ where: { id: body.partyId }, select: PARTY_SELECT });
   if (!party) throw new HttpError(404, 'NOT_FOUND', 'Party not found');
   if (body.onlineOut > 0 && !(await sdb.bankAccount.findUnique({ where: { id: body.outBankId! } }))) throw new HttpError(404, 'NOT_FOUND', 'Bank account not found');
   if (body.onlineIn > 0 && !(await sdb.bankAccount.findUnique({ where: { id: body.inBankId! } }))) throw new HttpError(404, 'NOT_FOUND', 'Bank account not found');
-
-  const received = D(body.cashIn).plus(body.onlineIn);
   // existence + tenant scope checked here; the ACTIVE/party/balance checks + paid update run atomically inside the tx
   if (body.settleBillId != null && !(await sdb.bill.findUnique({ where: { id: body.settleBillId }, select: { id: true } }))) {
     throw new HttpError(404, 'NOT_FOUND', 'Bill not found');
   }
+  return party;
+}
+
+/** UdharTxn header columns taken from the body (create + edit). */
+const txnFields = (body: UdharBody, txnDate: Date, bhavWeight: string | null) => ({
+  partyId: body.partyId,
+  txnDate,
+  cashOut: body.cashOut,
+  onlineOut: body.onlineOut,
+  outBankId: body.onlineOut > 0 ? body.outBankId! : null,
+  cashIn: body.cashIn,
+  onlineIn: body.onlineIn,
+  inBankId: body.onlineIn > 0 ? body.inBankId! : null,
+  goldOut: body.goldOut,
+  goldIn: body.goldIn,
+  silverOut: body.silverOut,
+  silverIn: body.silverIn,
+  bhavDirection: body.bhav?.direction ?? null,
+  bhavMetal: body.bhav?.metal ?? null,
+  bhavAmount: body.bhav?.amount ?? null,
+  bhavRate: body.bhav?.rate ?? null,
+  bhavUnitGrams: body.bhav?.unitGrams ?? null,
+  bhavWeight: bhavWeight ?? null,
+  settleBillId: body.settleBillId ?? null,
+  remark: body.remark ?? null,
+});
+
+/** Steps 3-5 for one txn: shop-asset ledger rows, party-balance rows, bill settlement (create, and re-post on edit). */
+async function postTxn(tx: Prisma.TransactionClient, ctx: TenantContext, h: { id: number; branchId: number; txnDate: Date }, body: UdharBody, bhavWeight: string | null): Promise<void> {
+  const { branchId, txnDate } = h;
+  const lctx = lctxOf(ctx);
+  const sid = String(h.id);
+  const received = D(body.cashIn).plus(body.onlineIn);
+
+  // 3. Shop assets → LedgerEntry (source UDHAR). Bhav cut moves no shop asset.
+  const lrows: ledger.LedgerEntryInput[] = [];
+  const cash = (direction: 'IN' | 'OUT', amount: number, bankAccountId?: number) => {
+    if (amount > 0) lrows.push({ branchId, txnDate, asset: 'MONEY', direction, amount, bankAccountId, source: 'UDHAR', sourceId: sid, partyId: body.partyId, narration: body.remark ?? null });
+  };
+  const metal = (asset: 'GOLD' | 'SILVER', direction: 'IN' | 'OUT', w: number) => {
+    if (w > 0) lrows.push({ branchId, txnDate, asset, direction, metalForm: 'USUAL', gross: w, net: w, fine: w, source: 'UDHAR', sourceId: sid, partyId: body.partyId, narration: body.remark ?? null });
+  };
+  cash('OUT', body.cashOut);
+  cash('OUT', body.onlineOut, body.outBankId);
+  cash('IN', body.cashIn);
+  cash('IN', body.onlineIn, body.inBankId);
+  metal('GOLD', 'OUT', body.goldOut);
+  metal('GOLD', 'IN', body.goldIn);
+  metal('SILVER', 'OUT', body.silverOut);
+  metal('SILVER', 'IN', body.silverIn);
+  if (lrows.length) await ledger.post(tx, lctx, lrows);
+
+  // 4. Party balance → UdharEntry (source UDHAR). + = party owes shop.
+  const amount = D(body.cashOut).plus(body.onlineOut).minus(body.cashIn).minus(body.onlineIn);
+  const gold = D(body.goldOut).minus(body.goldIn);
+  const silver = D(body.silverOut).minus(body.silverIn);
+  if (!amount.isZero() || !gold.isZero() || !silver.isZero()) {
+    await udhar.post(tx, lctx, [{ branchId, partyId: body.partyId, txnDate, amount, gold, silver, source: 'UDHAR', sourceId: sid }]);
+  }
+  // Bhav cut row (source BHAV_CUT): moves value between money and metal on the party balance only.
+  if (body.bhav && bhavWeight) {
+    const w = D(bhavWeight);
+    const x = D(body.bhav.amount);
+    const s = body.bhav.direction === 'MONEY_TO_METAL' ? 1 : -1; // MONEY_TO_METAL: amount −X, metal +W
+    await udhar.post(tx, lctx, [
+      {
+        branchId,
+        partyId: body.partyId,
+        txnDate,
+        amount: x.times(-s),
+        gold: body.bhav.metal === 'GOLD' ? w.times(s) : 0,
+        silver: body.bhav.metal === 'SILVER' ? w.times(s) : 0,
+        source: 'BHAV_CUT',
+        sourceId: sid,
+      },
+    ]);
+  }
+
+  // 5. Settle a pending SELL bill: record the received money as BillPayment(s); step 3 already moved the cash,
+  // step 4 already reduced the party balance — so no extra ledger/udhar rows here.
+  if (body.settleBillId != null) {
+    const b = await tx.bill.findUnique({ where: { id: body.settleBillId } }); // re-read inside tx: concurrency-safe checks + atomic paid
+    if (!b) throw new HttpError(404, 'NOT_FOUND', 'Bill not found');
+    if (b.kind !== 'SELL' || b.partyId !== body.partyId || b.status !== 'ACTIVE') throw new HttpError(409, 'CONFLICT', 'Bill is not open for this party');
+    if (D(b.final).minus(b.paid).lte(0)) throw new HttpError(409, 'CONFLICT', 'Bill is already settled');
+    if (body.cashIn > 0) await tx.billPayment.create({ data: { billId: b.id, mode: 'CASH', amount: body.cashIn, txnDate, udharTxnId: h.id, createdById: ctx.userId } });
+    if (body.onlineIn > 0) await tx.billPayment.create({ data: { billId: b.id, mode: 'ONLINE', bankAccountId: body.inBankId!, amount: body.onlineIn, txnDate, udharTxnId: h.id, createdById: ctx.userId } });
+    await tx.bill.update({ where: { id: b.id }, data: { paid: { increment: received } } });
+  }
+}
+
+/** Undo postTxn: reverse ledger + party rows (dated today) and deactivate the settled bill payments (delete, and edit before re-post). */
+async function unpostTxn(tx: Prisma.TransactionClient, ctx: TenantContext, t: { id: number; settleBillId: number | null }): Promise<void> {
+  const lctx = lctxOf(ctx);
+  const sid = String(t.id);
+  await ledger.reverse(tx, lctx, { source: 'UDHAR', sourceId: sid });
+  await udhar.reverse(tx, lctx, { source: 'UDHAR', sourceId: sid });
+  await udhar.reverse(tx, lctx, { source: 'BHAV_CUT', sourceId: sid });
+  if (t.settleBillId != null) {
+    const pays = await tx.billPayment.findMany({ where: { billId: t.settleBillId, udharTxnId: t.id, isActive: true } });
+    if (pays.length) {
+      const back = pays.reduce((a, p) => a.plus(D(p.amount)), new Prisma.Decimal(0));
+      await tx.billPayment.updateMany({ where: { id: { in: pays.map((p) => p.id) } }, data: { isActive: false } });
+      await tx.bill.update({ where: { id: t.settleBillId }, data: { paid: { decrement: back } } });
+    }
+  }
+}
+
+export async function createUdharTxn(ctx: TenantContext, body: UdharBody): Promise<UdharTxnDto> {
+  const branchId = ctx.activeBranchId ?? ctx.scopeBranchId;
+  if (branchId == null || !ctx.branchIds.includes(branchId)) throw new HttpError(404, 'NOT_FOUND', 'Branch not found');
+  const party = await checkRefs(scopedDb(ctx), body);
 
   const txnDate = ledger.businessDate(body.txnDate ?? new Date());
-  const lctx = lctxOf(ctx);
   const bhavWeight = body.bhav ? moneyToMetal(body.bhav.amount, body.bhav.rate, body.bhav.unitGrams) : null;
 
   const header = await prisma.$transaction(async (tx) => {
@@ -74,97 +180,31 @@ export async function createUdharTxn(ctx: TenantContext, body: UdharBody): Promi
     });
     const txnNo = seq.next - 1;
 
-    const h = await tx.udharTxn.create({
-      data: {
-        businessId: ctx.businessId!,
-        branchId,
-        txnNo,
-        partyId: body.partyId,
-        txnDate,
-        cashOut: body.cashOut,
-        onlineOut: body.onlineOut,
-        outBankId: body.onlineOut > 0 ? body.outBankId! : null,
-        cashIn: body.cashIn,
-        onlineIn: body.onlineIn,
-        inBankId: body.onlineIn > 0 ? body.inBankId! : null,
-        goldOut: body.goldOut,
-        goldIn: body.goldIn,
-        silverOut: body.silverOut,
-        silverIn: body.silverIn,
-        bhavDirection: body.bhav?.direction ?? null,
-        bhavMetal: body.bhav?.metal ?? null,
-        bhavAmount: body.bhav?.amount ?? null,
-        bhavRate: body.bhav?.rate ?? null,
-        bhavUnitGrams: body.bhav?.unitGrams ?? null,
-        bhavWeight: bhavWeight ?? null,
-        settleBillId: body.settleBillId ?? null,
-        remark: body.remark ?? null,
-        createdById: ctx.userId,
-      },
-    });
-    const sid = String(h.id);
-
-    // 3. Shop assets → LedgerEntry (source UDHAR). Bhav cut moves no shop asset.
-    const lrows: ledger.LedgerEntryInput[] = [];
-    const cash = (direction: 'IN' | 'OUT', amount: number, bankAccountId?: number) => {
-      if (amount > 0) lrows.push({ branchId, txnDate, asset: 'MONEY', direction, amount, bankAccountId, source: 'UDHAR', sourceId: sid, partyId: body.partyId, narration: body.remark ?? null });
-    };
-    const metal = (asset: 'GOLD' | 'SILVER', direction: 'IN' | 'OUT', w: number) => {
-      if (w > 0) lrows.push({ branchId, txnDate, asset, direction, metalForm: 'USUAL', gross: w, net: w, fine: w, source: 'UDHAR', sourceId: sid, partyId: body.partyId, narration: body.remark ?? null });
-    };
-    cash('OUT', body.cashOut);
-    cash('OUT', body.onlineOut, body.outBankId);
-    cash('IN', body.cashIn);
-    cash('IN', body.onlineIn, body.inBankId);
-    metal('GOLD', 'OUT', body.goldOut);
-    metal('GOLD', 'IN', body.goldIn);
-    metal('SILVER', 'OUT', body.silverOut);
-    metal('SILVER', 'IN', body.silverIn);
-    if (lrows.length) await ledger.post(tx, lctx, lrows);
-
-    // 4. Party balance → UdharEntry (source UDHAR). + = party owes shop.
-    const amount = D(body.cashOut).plus(body.onlineOut).minus(body.cashIn).minus(body.onlineIn);
-    const gold = D(body.goldOut).minus(body.goldIn);
-    const silver = D(body.silverOut).minus(body.silverIn);
-    if (!amount.isZero() || !gold.isZero() || !silver.isZero()) {
-      await udhar.post(tx, lctx, [{ branchId, partyId: body.partyId, txnDate, amount, gold, silver, source: 'UDHAR', sourceId: sid }]);
-    }
-    // Bhav cut row (source BHAV_CUT): moves value between money and metal on the party balance only.
-    if (body.bhav && bhavWeight) {
-      const w = D(bhavWeight);
-      const x = D(body.bhav.amount);
-      const s = body.bhav.direction === 'MONEY_TO_METAL' ? 1 : -1; // MONEY_TO_METAL: amount −X, metal +W
-      await udhar.post(tx, lctx, [
-        {
-          branchId,
-          partyId: body.partyId,
-          txnDate,
-          amount: x.times(-s),
-          gold: body.bhav.metal === 'GOLD' ? w.times(s) : 0,
-          silver: body.bhav.metal === 'SILVER' ? w.times(s) : 0,
-          source: 'BHAV_CUT',
-          sourceId: sid,
-        },
-      ]);
-    }
-
-    // 5. Settle a pending SELL bill: record the received money as BillPayment(s); step 3 already moved the cash,
-    // step 4 already reduced the party balance — so no extra ledger/udhar rows here.
-    if (body.settleBillId != null) {
-      const b = await tx.bill.findUnique({ where: { id: body.settleBillId } }); // re-read inside tx: concurrency-safe checks + atomic paid
-      if (!b) throw new HttpError(404, 'NOT_FOUND', 'Bill not found');
-      if (b.kind !== 'SELL' || b.partyId !== body.partyId || b.status !== 'ACTIVE') throw new HttpError(409, 'CONFLICT', 'Bill is not open for this party');
-      if (D(b.final).minus(b.paid).lte(0)) throw new HttpError(409, 'CONFLICT', 'Bill is already settled');
-      if (body.cashIn > 0) await tx.billPayment.create({ data: { billId: b.id, mode: 'CASH', amount: body.cashIn, txnDate, udharTxnId: h.id, createdById: ctx.userId } });
-      if (body.onlineIn > 0) await tx.billPayment.create({ data: { billId: b.id, mode: 'ONLINE', bankAccountId: body.inBankId!, amount: body.onlineIn, txnDate, udharTxnId: h.id, createdById: ctx.userId } });
-      await tx.bill.update({ where: { id: b.id }, data: { paid: { increment: received } } });
-    }
-
-    await logActivity(tx, ctx, { module: 'UDHAR', action: 'CREATED', entity: 'UdharTxn', entityId: sid, summary: `Udhar #${txnNo}`, partyName: party.name });
+    const h = await tx.udharTxn.create({ data: { businessId: ctx.businessId!, branchId, txnNo, ...txnFields(body, txnDate, bhavWeight), createdById: ctx.userId } });
+    await postTxn(tx, ctx, h, body, bhavWeight);
+    await logActivity(tx, ctx, { module: 'UDHAR', action: 'CREATED', entity: 'UdharTxn', entityId: String(h.id), summary: `Udhar #${txnNo}`, partyName: party.name });
     return h;
   });
 
   return getUdharTxn(ctx, header.id);
+}
+
+/** Edit: reverse the old postings (like delete) and re-post the new body under the same txn no + branch. */
+export async function updateUdharTxn(ctx: TenantContext, id: number, body: UdharBody): Promise<UdharTxnDto> {
+  const sdb = scopedDb(ctx);
+  const t = await sdb.udharTxn.findUnique({ where: { id } });
+  if (!t || t.isDeleted) throw new HttpError(404, 'NOT_FOUND', 'Udhar transaction not found');
+  const party = await checkRefs(sdb, body);
+  const txnDate = ledger.businessDate(body.txnDate ?? t.txnDate);
+  const bhavWeight = body.bhav ? moneyToMetal(body.bhav.amount, body.bhav.rate, body.bhav.unitGrams) : null;
+
+  await prisma.$transaction(async (tx) => {
+    await unpostTxn(tx, ctx, t);
+    const h = await tx.udharTxn.update({ where: { id }, data: txnFields(body, txnDate, bhavWeight) });
+    await postTxn(tx, ctx, h, body, bhavWeight);
+    await logActivity(tx, ctx, { module: 'UDHAR', action: 'EDITED', entity: 'UdharTxn', entityId: String(id), summary: `Edited udhar #${t.txnNo}`, partyName: party.name });
+  });
+  return getUdharTxn(ctx, id);
 }
 
 // ───────────── Read one ─────────────
@@ -224,22 +264,10 @@ export async function deleteUdharTxn(ctx: TenantContext, id: number): Promise<vo
   const sdb = scopedDb(ctx);
   const t = await sdb.udharTxn.findUnique({ where: { id } });
   if (!t || t.isDeleted) throw new HttpError(404, 'NOT_FOUND', 'Udhar transaction not found');
-  const lctx = lctxOf(ctx);
-  const sid = String(id);
   await prisma.$transaction(async (tx) => {
     await tx.udharTxn.update({ where: { id }, data: { isDeleted: true } });
-    await ledger.reverse(tx, lctx, { source: 'UDHAR', sourceId: sid });
-    await udhar.reverse(tx, lctx, { source: 'UDHAR', sourceId: sid });
-    await udhar.reverse(tx, lctx, { source: 'BHAV_CUT', sourceId: sid });
-    if (t.settleBillId != null) {
-      const pays = await tx.billPayment.findMany({ where: { billId: t.settleBillId, udharTxnId: id, isActive: true } });
-      if (pays.length) {
-        const back = pays.reduce((a, p) => a.plus(D(p.amount)), new Prisma.Decimal(0));
-        await tx.billPayment.updateMany({ where: { id: { in: pays.map((p) => p.id) } }, data: { isActive: false } });
-        await tx.bill.update({ where: { id: t.settleBillId }, data: { paid: { decrement: back } } });
-      }
-    }
-    await logActivity(tx, ctx, { module: 'UDHAR', action: 'DELETED', entity: 'UdharTxn', entityId: sid, summary: `Deleted udhar #${t.txnNo}` });
+    await unpostTxn(tx, ctx, t);
+    await logActivity(tx, ctx, { module: 'UDHAR', action: 'DELETED', entity: 'UdharTxn', entityId: String(id), summary: `Deleted udhar #${t.txnNo}` });
   });
 }
 
@@ -264,6 +292,7 @@ export async function listEntries(ctx: TenantContext, q: { page: number; pageSiz
 
   const partyMap = await partyRefs(sdb, rows.map((r) => r.partyId));
   const reference = await referenceLabels(sdb, rows);
+  const bhav = await bhavNotes(sdb, rows);
   const items: UdharEntryRowDto[] = rows.map((r) => ({
     source: r.source,
     sourceId: r.sourceId,
@@ -273,7 +302,7 @@ export async function listEntries(ctx: TenantContext, q: { page: number; pageSiz
     amount: money(D(r.amount)),
     gold: wt(D(r.gold)),
     silver: wt(D(r.silver)),
-    narration: r.narration,
+    narration: r.narration ?? bhav.get(`${r.source}:${r.sourceId}`) ?? null,
     isReversal: r.reversalOfId != null,
     createdAt: r.createdAt.toISOString(),
   }));
@@ -369,6 +398,7 @@ export async function statement(ctx: TenantContext, partyId: number, q: { from?:
     orderBy: [{ txnDate: 'asc' }, { id: 'asc' }],
   });
   const reference = await referenceLabels(sdb, rows);
+  const bhav = await bhavNotes(sdb, rows);
   const statementRows = rows.map((r) => {
     runAmount = runAmount.plus(D(r.amount));
     runGold = runGold.plus(D(r.gold));
@@ -382,7 +412,7 @@ export async function statement(ctx: TenantContext, partyId: number, q: { from?:
       amount: money(D(r.amount)),
       gold: wt(D(r.gold)),
       silver: wt(D(r.silver)),
-      narration: r.narration,
+      narration: r.narration ?? bhav.get(`${r.source}:${r.sourceId}`) ?? null,
       isReversal: r.reversalOfId != null,
       createdAt: r.createdAt.toISOString(),
       balance: bal(runAmount, runGold, runSilver),
@@ -467,6 +497,19 @@ async function branchNames(sdb: any, ids: number[]): Promise<Map<number, string>
   if (!u.length) return new Map();
   const rows = await sdb.branch.findMany({ where: { id: { in: u } }, select: { id: true, name: true } });
   return new Map(rows.map((b: { id: number; name: string }) => [b.id, b.name]));
+}
+
+/** BHAV_CUT rows are posted without narration: describe the conversion from its udhar txn, keyed `BHAV_CUT:<id>`.
+ *  shortcut: reads the txn's current bhav, so a row reversed by an edit shows the edited cut; store narration at post time if that matters. */
+async function bhavNotes(sdb: any, rows: { source: string; sourceId: string }[]): Promise<Map<string, string>> {
+  const ids = [...new Set(rows.filter((r) => r.source === 'BHAV_CUT').map((r) => Number(r.sourceId)).filter(Number.isInteger))];
+  if (!ids.length) return new Map();
+  const txns: { id: number; bhavMetal: string | null; bhavAmount: unknown; bhavRate: unknown; bhavUnitGrams: number | null; bhavWeight: unknown }[] = await sdb.udharTxn.findMany({
+    where: { id: { in: ids } },
+    select: { id: true, bhavMetal: true, bhavAmount: true, bhavRate: true, bhavUnitGrams: true, bhavWeight: true },
+  });
+  const unit = (g: number | null) => (g === 1000 ? '1 kg' : `${g} g`);
+  return new Map(txns.filter((t) => t.bhavMetal).map((t) => [`BHAV_CUT:${t.id}`, `Bhav ${t.bhavMetal} ₹${money(D(t.bhavAmount))} @ ₹${money(D(t.bhavRate))}/${unit(t.bhavUnitGrams)} = ${wt(D(t.bhavWeight))} g`]));
 }
 
 /** Display reference per (source, sourceId): UdharTxn no for UDHAR/BHAV_CUT, bill no for bill sources. */
