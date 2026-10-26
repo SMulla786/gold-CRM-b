@@ -32,6 +32,14 @@ const branchNode = (b: any): BranchNodeDto => ({
   isActive: b.isActive,
   userCount: 0,
   children: [],
+  inchargeName: b.inchargeName,
+  countryCode: b.countryCode,
+  mobile: b.mobile,
+  gstin: b.gstin,
+  stateId: b.stateId,
+  districtId: b.districtId,
+  address: b.address,
+  disclaimer: b.disclaimer,
 });
 
 const userDto = (u: any): UserDto => ({
