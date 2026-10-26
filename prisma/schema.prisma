@@ -1518,23 +1518,80 @@ model GirviBatch {
 }
 
 model GirviItem {
-  id         Int             @id @default(autoincrement())
+  id         Int                 @id @default(autoincrement())
   batchId    Int
   category   String
   name       String
   photoUrl   String?
-  gross      Decimal         @db.Decimal(14, 3)
-  net        Decimal         @db.Decimal(14, 3)
-  purity     Decimal         @db.Decimal(6, 3)
-  fine       Decimal         @db.Decimal(14, 3)
+  gross      Decimal             @db.Decimal(14, 3)
+  net        Decimal             @db.Decimal(14, 3)
+  purity     Decimal             @db.Decimal(6, 3)
+  fine       Decimal             @db.Decimal(14, 3)
   /// valuation rate per gram of fine
-  rate       Decimal         @db.Decimal(14, 2)
-  valuation  Decimal         @db.Decimal(14, 2)
-  status     GirviItemStatus @default(PLEDGED)
+  rate       Decimal             @db.Decimal(14, 2)
+  valuation  Decimal             @db.Decimal(14, 2)
+  status     GirviItemStatus     @default(PLEDGED)
   releasedAt DateTime?
-  batch      GirviBatch      @relation(fields: [batchId], references: [id], onDelete: Cascade)
+  batch      GirviBatch          @relation(fields: [batchId], references: [id], onDelete: Cascade)
+  transfers  GirviTransferItem[]
 
   @@index([batchId])
+}
+
+/// Phase 9b — re-pledge: customers' pledged items handed to a lender against money received; returned when repaid.
+enum GirviTransferStatus {
+  ACTIVE
+  RETURNED
+}
+
+model GirviTransfer {
+  id                  Int                 @id @default(autoincrement())
+  businessId          Int
+  branchId            Int
+  transferNo          Int
+  /// the lender (a party, usually a supplier)
+  lenderPartyId       Int
+  transferDate        DateTime            @db.Date
+  tenureMonths        Int                 @default(12)
+  returnDate          DateTime            @db.Date
+  ratePercent         Decimal             @db.Decimal(6, 3)
+  ratePeriod          InterestPeriod      @default(MONTHLY)
+  interestType        InterestType        @default(SI)
+  ciPeriod            CiPeriod?
+  method              InterestMethod      @default(DAY_WISE)
+  /// money received from the lender
+  principal           Decimal             @db.Decimal(14, 2)
+  cash                Decimal             @default(0) @db.Decimal(14, 2)
+  online              Decimal             @default(0) @db.Decimal(14, 2)
+  bankAccountId       Int?
+  status              GirviTransferStatus @default(ACTIVE)
+  /// receive-back: date, interest paid to the lender, how it was paid
+  returnedOn          DateTime?           @db.Date
+  interestPaid        Decimal             @default(0) @db.Decimal(14, 2)
+  returnCash          Decimal             @default(0) @db.Decimal(14, 2)
+  returnOnline        Decimal             @default(0) @db.Decimal(14, 2)
+  returnBankAccountId Int?
+  remark              String?
+  createdById         Int?
+  createdAt           DateTime            @default(now())
+  updatedAt           DateTime            @updatedAt
+  items               GirviTransferItem[]
+
+  @@unique([businessId, branchId, transferNo])
+  @@index([businessId, branchId, status])
+  @@index([businessId, lenderPartyId])
+}
+
+/// Items in a transfer (kept after return as history). An item is "with the lender" while its transfer is ACTIVE.
+model GirviTransferItem {
+  id          Int           @id @default(autoincrement())
+  transferId  Int
+  girviItemId Int
+  transfer    GirviTransfer @relation(fields: [transferId], references: [id], onDelete: Cascade)
+  girviItem   GirviItem     @relation(fields: [girviItemId], references: [id])
+
+  @@unique([transferId, girviItemId])
+  @@index([girviItemId])
 }
 
 model GirviTxn {

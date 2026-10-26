@@ -56,6 +56,7 @@ const TENANT_MODELS: Record<string, Scope> = {
   SalesDraft: 'branch',
   // Phase 9 girvi (items/txns through the scoped batch):
   GirviBatch: 'branch',
+  GirviTransfer: 'branch',
   // Phase 10 trade (exchange/kacha, buy-sell, bhav booking; lines through the scoped parent):
   Exchange: 'branch',
   KachaProcess: 'branch',

@@ -60,6 +60,8 @@ export interface IncomeExpenseDto {
   remark: string | null;
   createdBy: string | null;
   createdAt: string;
+  /** TASK-97: DIRECT = manual row (editable); others are auto rows from that module (read-only) */
+  sourceType?: (typeof IE_SOURCE_TYPES)[number];
 }
 
 /** One asset ledger page (Money / Gold / Silver / Stone / Artificial / Franchise TXN). */
