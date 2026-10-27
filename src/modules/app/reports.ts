@@ -33,13 +33,14 @@ export async function dashboard(ctx: TenantContext): Promise<DashboardDto> {
   const scope = sqlScope(ctx, branches);
   const sell = { kind: 'SELL' as const, status: 'ACTIVE' as const, branchId: { in: branches } };
 
-  const [customers, suppliers, customersNewThisMonth, stockRows, todayAgg, monthAgg, yearAgg, purchaseMonth, cashInRows, cashBankRows, actRows] =
+  const [customers, suppliers, customersNewThisMonth, suppliersNewThisMonth, stockRows, todayAgg, monthAgg, yearAgg, purchaseMonth, cashInRows, cashBankRows, actRows] =
     await Promise.all([
       sdb.party.count({ where: { type: 'CUSTOMER', isActive: true } }),
       sdb.party.count({ where: { type: 'SUPPLIER', isActive: true } }),
       sdb.party.count({ where: { type: 'CUSTOMER', createdAt: { gte: monthStart } } }),
+      sdb.party.count({ where: { type: 'SUPPLIER', createdAt: { gte: monthStart } } }),
       sdb.stockItem.groupBy({ by: ['stockClass'], where: { status: 'AVAILABLE', branchId: { in: branches } }, _count: { _all: true }, _sum: { pcs: true, net: true, fine: true, purchaseCost: true } }),
-      sdb.bill.aggregate({ where: { ...sell, billDate: today }, _sum: { final: true, paid: true }, _count: { _all: true } }),
+      sdb.bill.aggregate({ where: { ...sell, billDate: today }, _sum: { final: true }, _count: { _all: true } }),
       sdb.bill.aggregate({ where: { ...sell, billDate: { gte: monthStart } }, _sum: { final: true } }),
       sdb.bill.aggregate({ where: { ...sell, billDate: { gte: yearStart } }, _sum: { final: true } }),
       sdb.bill.aggregate({ where: { kind: 'PURCHASE', status: 'ACTIVE', branchId: { in: branches }, billDate: { gte: monthStart } }, _sum: { final: true } }),
@@ -48,8 +49,16 @@ export async function dashboard(ctx: TenantContext): Promise<DashboardDto> {
       sdb.activityLog.groupBy({ by: ['action'], where: { branchId: { in: branches }, createdAt: { gte: istTodayStart } }, _count: { _all: true } }),
     ]);
 
+  // "Received today": every active payment row dated that day on an ACTIVE SELL bill. A bill's initial payments are BillPayment
+  // rows dated the bill date and later payments are rows dated their own day, so this covers both (read-only report figure).
+  // SCHEME / UDHAR_ADVANCE payments bring in no new money (it arrived earlier as scheme EMIs / udhar receipts), so they are not "received".
+  const receivedOn = (day: string) => prisma.$queryRaw<{ s: Prisma.Decimal | null }[]>(Prisma.sql`
+    SELECT COALESCE(SUM(bp.amount),0)::numeric AS s FROM "BillPayment" bp JOIN "Bill" b ON b.id = bp."billId"
+    WHERE b."businessId" = ${ctx.businessId!} AND b."branchId" IN (${Prisma.join(branches)}) AND b.kind::text='SELL' AND b.status::text='ACTIVE'
+      AND bp."isActive" AND bp."txnDate" = ${day}::date AND bp.mode::text NOT IN ('SCHEME', 'UDHAR_ADVANCE')`);
+
   // raw aggregates that need column arithmetic / positive-only filtering
-  const [pendRow, udhRow, collRow, monthlyRows] = await Promise.all([
+  const [pendRow, udhRow, collRow, monthlyRows, recvRow] = await Promise.all([
     prisma.$queryRaw<{ s: Prisma.Decimal | null }[]>(Prisma.sql`SELECT COALESCE(SUM(final - paid),0)::numeric AS s FROM "Bill" WHERE ${scope} AND kind::text='SELL' AND status::text='ACTIVE' AND final > paid`),
     prisma.$queryRaw<{ amount: Prisma.Decimal; gold: Prisma.Decimal; silver: Prisma.Decimal }[]>(Prisma.sql`
       SELECT
@@ -59,6 +68,7 @@ export async function dashboard(ctx: TenantContext): Promise<DashboardDto> {
     // shortcut: "collected this month" = money received into party accounts = −Σ negative UDHAR amount movements this month; refine if the dashboard needs online/cash split.
     prisma.$queryRaw<{ s: Prisma.Decimal | null }[]>(Prisma.sql`SELECT COALESCE(SUM(amount),0)::numeric AS s FROM "UdharEntry" WHERE ${scope} AND source='UDHAR' AND amount < 0 AND "txnDate" >= ${dateOnly(monthStart)}::date`),
     prisma.$queryRaw<{ ym: string; k: string; v: Prisma.Decimal }[]>(Prisma.sql`SELECT to_char("billDate",'YYYY-MM') AS ym, kind::text AS k, COALESCE(SUM(final),0)::numeric AS v FROM "Bill" WHERE ${scope} AND status::text='ACTIVE' AND kind::text IN ('SELL','PURCHASE') GROUP BY 1,2`),
+    receivedOn(todayStr),
   ]);
 
   // TASK-97 "% vs last month": same windows one calendar month back (day clamped to that month's length).
@@ -68,21 +78,24 @@ export async function dashboard(ctx: TenantContext): Promise<DashboardDto> {
   // shortcut: an udhar debit is due 30 days after its date (no due-days setting exists); make it a setting if owners ask.
   const UDHAR_DUE_DAYS = 30;
   const dueCutoff = dateOnly(new Date(today.getTime() - UDHAR_DUE_DAYS * 86_400_000));
-  const [prevTodayAgg, prevMonthAgg, prevPurchase, prevCustomers, prevCollRow, advRow, overdueRows] = await Promise.all([
-    sdb.bill.aggregate({ where: { ...sell, billDate: prevDay }, _sum: { final: true, paid: true }, _count: { _all: true } }),
-    sdb.bill.aggregate({ where: { ...sell, billDate: { gte: prevMonthStart, lte: prevDay } }, _sum: { final: true } }),
-    sdb.bill.aggregate({ where: { kind: 'PURCHASE', status: 'ACTIVE', branchId: { in: branches }, billDate: { gte: prevMonthStart, lte: prevDay } }, _sum: { final: true } }),
-    sdb.party.count({ where: { type: 'CUSTOMER', createdAt: { gte: prevMonthStart, lt: prevDayEnd } } }),
-    prisma.$queryRaw<{ s: Prisma.Decimal | null }[]>(Prisma.sql`SELECT COALESCE(SUM(amount),0)::numeric AS s FROM "UdharEntry" WHERE ${scope} AND source='UDHAR' AND amount < 0 AND "txnDate" >= ${dateOnly(prevMonthStart)}::date AND "txnDate" <= ${dateOnly(prevDay)}::date`),
-    // Bills Advance = money paid on sell bills beyond their final (overpay becomes the party's advance — api-phase4/5); mirror of pendingBalance.
-    prisma.$queryRaw<{ s: Prisma.Decimal | null }[]>(Prisma.sql`SELECT COALESCE(SUM(paid - final),0)::numeric AS s FROM "Bill" WHERE ${scope} AND kind::text='SELL' AND status::text='ACTIVE' AND paid > final`),
-    // Overdue: per asset with a positive balance, FIFO — walk debits newest-first; the one where the running sum reaches the balance is the oldest unpaid.
-    prisma.$queryRaw<{ id: number; name: string; mobile: string; since: Date; amount: Prisma.Decimal; gold: Prisma.Decimal; silver: Prisma.Decimal }[]>(Prisma.sql`
+  // Overdue: per asset with a positive balance, FIFO — walk debits newest-first; the one where the running sum reaches the balance is the oldest unpaid.
+  const overdueCte = Prisma.sql`
       WITH e AS (SELECT "partyId", "txnDate", id, x.dim, x.v FROM "UdharEntry" CROSS JOIN LATERAL (VALUES ('a', amount), ('g', gold), ('s', silver)) x(dim, v) WHERE ${scope}),
       bal AS (SELECT "partyId", dim, SUM(v) AS b FROM e GROUP BY 1, 2 HAVING SUM(v) > 0),
       deb AS (SELECT e."partyId", e.dim, e."txnDate", bal.b, SUM(e.v) OVER (PARTITION BY e."partyId", e.dim ORDER BY e."txnDate" DESC, e.id DESC) AS cum
               FROM e JOIN bal ON bal."partyId" = e."partyId" AND bal.dim = e.dim WHERE e.v > 0),
-      old AS (SELECT "partyId", MIN(d) AS since FROM (SELECT "partyId", dim, MAX("txnDate") AS d FROM deb WHERE cum >= b GROUP BY 1, 2) q GROUP BY 1)
+      old AS (SELECT "partyId", MIN(d) AS since FROM (SELECT "partyId", dim, MAX("txnDate") AS d FROM deb WHERE cum >= b GROUP BY 1, 2) q GROUP BY 1)`;
+  const [prevTodayAgg, prevMonthAgg, prevPurchase, prevCustomers, prevSuppliers, prevCollRow, advRow, overdueRows, overdueTotRow, prevRecvRow] = await Promise.all([
+    sdb.bill.aggregate({ where: { ...sell, billDate: prevDay }, _sum: { final: true }, _count: { _all: true } }),
+    sdb.bill.aggregate({ where: { ...sell, billDate: { gte: prevMonthStart, lte: prevDay } }, _sum: { final: true } }),
+    sdb.bill.aggregate({ where: { kind: 'PURCHASE', status: 'ACTIVE', branchId: { in: branches }, billDate: { gte: prevMonthStart, lte: prevDay } }, _sum: { final: true } }),
+    sdb.party.count({ where: { type: 'CUSTOMER', createdAt: { gte: prevMonthStart, lt: prevDayEnd } } }),
+    sdb.party.count({ where: { type: 'SUPPLIER', createdAt: { gte: prevMonthStart, lt: prevDayEnd } } }),
+    prisma.$queryRaw<{ s: Prisma.Decimal | null }[]>(Prisma.sql`SELECT COALESCE(SUM(amount),0)::numeric AS s FROM "UdharEntry" WHERE ${scope} AND source='UDHAR' AND amount < 0 AND "txnDate" >= ${dateOnly(prevMonthStart)}::date AND "txnDate" <= ${dateOnly(prevDay)}::date`),
+    // Bills Advance = money paid on sell bills beyond their final (overpay becomes the party's advance — api-phase4/5); mirror of pendingBalance.
+    prisma.$queryRaw<{ s: Prisma.Decimal | null }[]>(Prisma.sql`SELECT COALESCE(SUM(paid - final),0)::numeric AS s FROM "Bill" WHERE ${scope} AND kind::text='SELL' AND status::text='ACTIVE' AND paid > final`),
+    prisma.$queryRaw<{ id: number; name: string; mobile: string; since: Date; amount: Prisma.Decimal; gold: Prisma.Decimal; silver: Prisma.Decimal }[]>(Prisma.sql`
+      ${overdueCte}
       SELECT p.id, p.name, p.mobile, old.since,
         COALESCE((SELECT b FROM bal WHERE bal."partyId" = p.id AND dim = 'a'), 0)::numeric AS amount,
         COALESCE((SELECT b FROM bal WHERE bal."partyId" = p.id AND dim = 'g'), 0)::numeric AS gold,
@@ -90,6 +103,11 @@ export async function dashboard(ctx: TenantContext): Promise<DashboardDto> {
       FROM old JOIN "Party" p ON p.id = old."partyId"
       WHERE old.since < ${dueCutoff}::date
       ORDER BY old.since, p.id LIMIT 10`),
+    // same overdue party set, every party (not just the top 10): Σ money balance
+    prisma.$queryRaw<{ s: Prisma.Decimal | null }[]>(Prisma.sql`
+      ${overdueCte}
+      SELECT COALESCE(SUM(bal.b),0)::numeric AS s FROM old JOIN bal ON bal."partyId" = old."partyId" AND bal.dim = 'a' WHERE old.since < ${dueCutoff}::date`),
+    receivedOn(dateOnly(prevDay)),
   ]);
 
   const dirSum = (rows: { direction: 'IN' | 'OUT'; _sum: { amount: Prisma.Decimal | null } }[]) =>
@@ -127,12 +145,12 @@ export async function dashboard(ctx: TenantContext): Promise<DashboardDto> {
 
   return {
     date: todayStr,
-    parties: { customers, suppliers, customersNewThisMonth },
+    parties: { customers, suppliers, customersNewThisMonth, suppliersNewThisMonth },
     stock: stockRows.map((r) => ({ stockClass: r.stockClass, items: r._count._all, pcs: Number(r._sum.pcs ?? 0), net: wt(D(r._sum.net)), fine: wt(D(r._sum.fine)), value: money(D(r._sum.purchaseCost)) })),
     sales: {
       todayTotal: money(D(todayAgg._sum.final)),
       todayCount: todayAgg._count._all,
-      todayReceived: money(D(todayAgg._sum.paid)), // shortcut: Σ paid of bills dated today (not a separate payments-today ledger scan)
+      todayReceived: money(D(recvRow[0]?.s)),
       monthTotal: money(D(monthAgg._sum.final)),
       yearTotal: money(D(yearAgg._sum.final)),
       pendingBalance: money(D(pendRow[0]?.s)),
@@ -147,11 +165,12 @@ export async function dashboard(ctx: TenantContext): Promise<DashboardDto> {
     lastMonth: {
       todayTotal: money(D(prevTodayAgg._sum.final)),
       todayCount: prevTodayAgg._count._all,
-      todayReceived: money(D(prevTodayAgg._sum.paid)),
+      todayReceived: money(D(prevRecvRow[0]?.s)),
       monthTotal: money(D(prevMonthAgg._sum.final)),
       purchasesMonthTotal: money(D(prevPurchase._sum.final)),
       collectedThisMonth: money(D(prevCollRow[0]?.s).negated()),
       customersNewThisMonth: prevCustomers,
+      suppliersNewThisMonth: prevSuppliers,
     },
     udharOverdue: overdueRows.map((r) => ({
       party: { id: r.id, name: r.name, mobile: r.mobile },
@@ -159,6 +178,7 @@ export async function dashboard(ctx: TenantContext): Promise<DashboardDto> {
       since: dateOnly(r.since),
       daysOverdue: Math.round((today.getTime() - r.since.getTime()) / 86_400_000) - UDHAR_DUE_DAYS,
     })),
+    udharOverdueTotal: money(D(overdueTotRow[0]?.s)),
   };
 }
 

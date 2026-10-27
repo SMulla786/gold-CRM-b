@@ -4,6 +4,7 @@ import { createBranch, createBusiness, createUser } from '../../../test/helpers/
 import * as svc from './service';
 import * as platform from '../platform/service';
 import { updateBusinessBody } from '../../shared/contracts/platform';
+import { updateCounterBody } from '../../shared/contracts/admin';
 import type { TenantContext } from '../../middleware/context';
 
 // Covers TASK-5b security fixes 1–4 at the service layer.
@@ -121,5 +122,20 @@ describe('Business alternateMobile (Shop Settings "Alternate No")', () => {
     const cleared = await platform.updateBusiness(s.business.id, updateBusinessBody.parse({ alternateMobile: null }));
     expect(cleared.alternateMobile).toBeNull();
     expect(() => updateBusinessBody.parse({ alternateMobile: '123' })).toThrow();
+  });
+});
+
+describe('Counters: deactivate / reactivate (PATCH isActive)', () => {
+  it('toggles isActive without touching the name; rename alone keeps it active', async () => {
+    const s = await setup();
+    const c = await svc.createCounter(s.ownerCtx, { branchId: s.pune.id, name: 'Front desk' });
+    expect(c.isActive).toBe(true);
+    const off = await svc.updateCounter(s.ownerCtx, c.id, updateCounterBody.parse({ isActive: false }));
+    expect(off).toMatchObject({ name: 'Front desk', isActive: false });
+    const renamed = await svc.updateCounter(s.ownerCtx, c.id, updateCounterBody.parse({ name: 'Desk 1' }));
+    expect(renamed).toMatchObject({ name: 'Desk 1', isActive: false });
+    const on = await svc.updateCounter(s.ownerCtx, c.id, updateCounterBody.parse({ isActive: true }));
+    expect(on.isActive).toBe(true);
+    expect(() => updateCounterBody.parse({})).toThrow();
   });
 });

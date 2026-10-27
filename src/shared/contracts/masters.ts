@@ -189,18 +189,31 @@ export const setRatesBody = z.object({
   /** bypass RateLimit check (requires X-MPIN) */
   overrideLimits: z.boolean().default(false),
 });
+/** POST /app/rates/batch — several metals' rates saved in ONE transaction (all or nothing). Each entry = a POST /app/rates body
+ *  (same rate-limit check; any entry with overrideLimits needs X-MPIN). One entry per metal + branch. */
+export const setRatesBatchBody = z.object({
+  metals: z
+    .array(setRatesBody)
+    .min(1)
+    .max(8)
+    .refine((ms) => new Set(ms.map((m) => `${m.metal}:${m.branchId ?? 0}`)).size === ms.length, 'Each metal may appear only once per branch'),
+});
 export interface RateRowDto {
   karatCode: string;
   title: string;
   touch: string;
   sellRate: string;
   buyRate: string;
+  /** additive: this karat's sell rate in the save before the current one (same branch), re-expressed in the current rateUnit; null = no earlier rate. Trend arrow only. */
+  prevSellRate?: string | null;
 }
 export interface CurrentRatesDto {
   /** effective scope of the returned rates */
   branchId: number | null;
   gold: { rateUnit: RateUnitKey; updatedAt: string | null; rows: RateRowDto[] };
   silver: { rateUnit: RateUnitKey; updatedAt: string | null; rows: RateRowDto[] };
+  /** additive: the 'rates.display' setting, so the rate card can read it without settings.misc view */
+  display?: { showBuy: boolean };
 }
 export const rateHistoryQuery = pageQuery.extend({ metal: z.enum(METALS).optional() });
 export interface RateHistoryDto {
@@ -260,6 +273,8 @@ export type InvoiceFormat = (typeof INVOICE_FORMATS)[number];
 export const SETTING_SCHEMAS = {
   'calc.basis': z.object({ sale: calcBasis.default('NET'), purchase: calcBasis.default('NET') }),
   'calc.amountBasedRate': z.object({ enabled: z.boolean().default(false) }),
+  /** Dashboard rate card display (presentation only): show the Buy column */
+  'rates.display': z.object({ showBuy: z.boolean().default(true) }),
   'rates.units': z.object({
     gold: z.enum(['GRAM_1', 'GRAM_10', 'TOLA']).default('GRAM_10'),
     silver: z.enum(['GRAM_1', 'KG_1']).default('KG_1'),

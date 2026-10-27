@@ -69,7 +69,9 @@ export async function createGirvi(ctx: TenantContext, body: GirviBody): Promise<
   if (D(body.principal).gt(valuation)) throw new HttpError(400, 'VALIDATION', 'Loan cannot exceed the item valuation');
 
   const issueDate = ledger.businessDate(body.issueDate ?? new Date());
-  const returnDate = addMonths(issueDate, body.tenureMonths);
+  // tenure in days (optional): exact return date; tenureMonths stays an int = ceil(days / 30)
+  const tenureMonths = body.tenureDays ? Math.ceil(body.tenureDays / 30) : body.tenureMonths;
+  const returnDate = body.tenureDays ? new Date(issueDate.getTime() + body.tenureDays * 864e5) : addMonths(issueDate, body.tenureMonths);
   const lctx = lctxOf(ctx);
 
   const id = await prisma.$transaction(async (tx) => {
@@ -79,7 +81,7 @@ export async function createGirvi(ctx: TenantContext, body: GirviBody): Promise<
     const girviNo = Number(seqRow[0]!.next) - 1;
     const batch = await tx.girviBatch.create({
       data: {
-        businessId: ctx.businessId!, branchId, girviNo, partyId: body.partyId, issueDate, tenureMonths: body.tenureMonths, returnDate,
+        businessId: ctx.businessId!, branchId, girviNo, partyId: body.partyId, issueDate, tenureMonths, returnDate,
         ratePercent: body.ratePercent, ratePeriod: body.ratePeriod, interestType: body.interestType, ciPeriod: body.ciPeriod ?? null, method: body.method,
         valuation, principal: body.principal, interestFrom: issueDate, status: 'ACTIVE', remark: body.remark ?? null, createdById: ctx.userId,
         firstMonthInterest: body.firstMonthInterest, penaltyRatePercent: body.penaltyRatePercent,
@@ -250,7 +252,7 @@ export async function getGirvi(ctx: TenantContext, id: number, asOf: Date): Prom
     interestDue, payable: D(b.principal).plus(interestDue).toFixed(2), overdue: b.status === 'ACTIVE' && onDate.getTime() > b.returnDate.getTime(),
     interestBreakdown: { regular: parts.regular, firstMonth: parts.firstMonth, penalty: parts.penalty, effectiveRate: parts.effectiveRate },
     firstMonthInterest: money(b.firstMonthInterest), penaltyRatePercent: String(b.penaltyRatePercent),
-    status: b.status, remark: b.remark, items: b.items.map(itemDto), txns: b.txns.map((t) => txnDto(t, baMap, uMap)), createdAt: b.createdAt.toISOString(),
+    status: b.status, remark: b.remark, docUrl: b.docUrl ?? null, items: b.items.map(itemDto), txns: b.txns.map((t) => txnDto(t, baMap, uMap)), createdAt: b.createdAt.toISOString(),
   };
 }
 
@@ -275,7 +277,7 @@ export async function listGirvi(ctx: TenantContext, query: any): Promise<Paged<G
     where.AND = [query.q && Number.isInteger(asNo) && !query.partyType ? { OR: [{ girviNo: asNo }, ids] } : ids];
   }
   const [rows, total] = await Promise.all([
-    sdb.girviBatch.findMany({ where, include: { items: { select: { name: true, status: true, valuation: true, ratePercent: true } } }, orderBy: { id: 'desc' }, skip: (query.page - 1) * query.pageSize, take: query.pageSize }),
+    sdb.girviBatch.findMany({ where, include: { items: { select: { name: true, status: true, valuation: true, ratePercent: true } }, _count: { select: { txns: true } } }, orderBy: { id: 'desc' }, skip: (query.page - 1) * query.pageSize, take: query.pageSize }),
     sdb.girviBatch.count({ where }),
   ]);
   const parties = new Map((await sdb.party.findMany({ where: { id: { in: [...new Set(rows.map((b) => b.partyId))] } } })).map((p) => [p.id, p]));
@@ -300,6 +302,7 @@ export async function listGirvi(ctx: TenantContext, query: any): Promise<Paged<G
     interestPaid: money(sum(b.id, ['INTEREST', 'RELEASE'], 'interest')),
     payoutCash: money(sum(b.id, ['GRANT'], 'cash')),
     payoutOnline: money(sum(b.id, ['GRANT'], 'online')),
+    deletable: b._count.txns === 1, // same rule as deleteGirvi (the first txn is always the GRANT)
   }));
   return { items, total, page: query.page, pageSize: query.pageSize };
 }

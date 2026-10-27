@@ -295,11 +295,12 @@ async function writeBillContents(tx: Prisma.TransactionClient, ctx: TenantContex
     } else if (r.action === 'PURCHASE') {
       const method = r.input.tagNo || r.itemName.method === 'TAG' ? 'TAG' : 'LOOSE';
       const tagNo = method === 'TAG' ? (r.input.tagNo ?? (r.itemName.tagPrefix && r.itemName.tagDigits ? await nextTagNo(tx, ctx.businessId!, r.itemName.tagPrefix, r.itemName.tagDigits) : null)) : null;
+      // TASK-98 "default sale value": optional sale rate/labour go onto the stock item only; purchaseCost stays the bill line total.
       const created = await tx.stockItem.create({
         data: {
           businessId: ctx.businessId!, branchId, stockClass: r.stockClass, groupId: r.itemName.groupId, itemNameId: r.itemName.id, method, tagNo, huid: null, karatCode: r.karatCode,
-          pcs: r.pcs, gross: r.gross, less: r.less, net: r.calc.net, tunch: r.tunch, wastage: r.wastage, fine: r.calc.fine, stoneCharge: r.input.stoneCharge, labour: r.input.labour,
-          labourUnit: r.input.labourUnit, other: r.input.other, rate: r.input.rate || null, purchaseCost: r.calc.total, status: 'AVAILABLE', source: 'PURCHASE_BILL', sourceId: String(billId), createdById: ctx.userId,
+          pcs: r.pcs, gross: r.gross, less: r.less, net: r.calc.net, tunch: r.tunch, wastage: r.wastage, fine: r.calc.fine, stoneCharge: r.input.stoneCharge, labour: r.input.saleLabour ?? r.input.labour,
+          labourUnit: r.input.saleLabourUnit ?? r.input.labourUnit, other: r.input.other, rate: r.input.saleRate ?? (r.input.rate || null), purchaseCost: r.calc.total, status: 'AVAILABLE', source: 'PURCHASE_BILL', sourceId: String(billId), createdById: ctx.userId,
         },
       });
       stockItemId = created.id;
@@ -619,6 +620,11 @@ export async function listBills(ctx: TenantContext, query: any): Promise<Paged<B
   if (query.q) {
     const parties = await sdb.party.findMany({ where: { OR: [{ name: { contains: query.q, mode: 'insensitive' } }, { mobile: { contains: query.q } }] }, select: { id: true } });
     where.OR = [{ billNo: { contains: query.q, mode: 'insensitive' } }, { partyId: { in: parties.map((p) => p.id) } }];
+  }
+  if (query.partyType) {
+    // Bill has no party relation: resolve this type's party ids first (AND-ed with partyId / q above).
+    const typed = await sdb.party.findMany({ where: { type: query.partyType }, select: { id: true } });
+    where.AND = [...(where.AND ?? []), { partyId: { in: typed.map((p) => p.id) } }];
   }
   const [rows, total] = await Promise.all([
     sdb.bill.findMany({ where, include: { _count: { select: { items: true } } }, orderBy: { id: 'desc' }, skip: (query.page - 1) * query.pageSize, take: query.pageSize }),

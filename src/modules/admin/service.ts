@@ -194,8 +194,8 @@ export async function createCounter(ctx: TenantContext, body: { branchId: number
   return { id: c.id, branchId: c.branchId, branchName: branch.name, name: c.name, isActive: c.isActive };
 }
 
-export async function updateCounter(ctx: TenantContext, counterId: number, body: { name: string }): Promise<CounterDto> {
-  const c = await scopedDb(ctx).counter.update({ where: { id: counterId }, data: { name: body.name }, include: { branch: true } });
+export async function updateCounter(ctx: TenantContext, counterId: number, body: { name?: string; isActive?: boolean }): Promise<CounterDto> {
+  const c = await scopedDb(ctx).counter.update({ where: { id: counterId }, data: { name: body.name, isActive: body.isActive }, include: { branch: true } });
   return { id: c.id, branchId: c.branchId, branchName: c.branch.name, name: c.name, isActive: c.isActive };
 }
 

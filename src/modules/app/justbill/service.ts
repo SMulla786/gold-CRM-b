@@ -36,6 +36,25 @@ function justPaymentLedgerRow(pc: PayCalc, paymentId: number, justBillId: number
   return { ...base, asset: 'MONEY', bankAccountId: pc.bankAccountId ?? null, amount: pc.amount, narration: 'Just bill payment' };
 }
 
+/**
+ * TASK-98 Udhar advance on a Just Bill — mirrors billing/service postNoCashPays (UDHAR_ADVANCE half). No ledger row (nothing enters the shop);
+ * the bill takes `amount` of the party's udhar credit as a +amount udhar row under sourceId `<justBillId>-A` (reversed by deleteJustBill).
+ * Credit = −Σ party udhar amount excluding this just bill's own balance row (source JUST_BILL, sourceId `<id>`); over-balance → 409 OVER_BALANCE.
+ */
+async function postAdvancePays(tx: Prisma.TransactionClient, ctx: TenantContext, jb: { id: number; billNo: string; branchId: number; partyId: number }, payCalcs: PayCalc[], txnDate: Date, lctx: ledger.LedgerContext): Promise<void> {
+  const adv = payCalcs.filter((pc) => pc.input.mode === 'UDHAR_ADVANCE');
+  if (!adv.length) return;
+  await ledger.assertDaysOpen(tx, lctx, [{ branchId: jb.branchId, txnDate }]);
+  const advance = adv.reduce((a, pc) => a.plus(D(pc.amount)), new Prisma.Decimal(0));
+  await tx.$queryRaw`SELECT id FROM "Party" WHERE id = ${jb.partyId} FOR UPDATE`; // serialize concurrent uses of the same credit
+  const sum = await tx.udharEntry.aggregate({ where: { businessId: ctx.businessId!, partyId: jb.partyId, NOT: { source: 'JUST_BILL', sourceId: String(jb.id) } }, _sum: { amount: true } });
+  const credit = Prisma.Decimal.max(D(sum._sum.amount).negated(), 0);
+  if (advance.gt(credit)) throw new HttpError(409, 'CONFLICT', `Udhar advance available is ₹${credit.toFixed(2)}`, { code: 'OVER_BALANCE' });
+  for (const pc of adv) {
+    await udhar.post(tx, lctx, [{ branchId: jb.branchId, partyId: jb.partyId, txnDate, amount: D(pc.amount), source: 'JUST_BILL', sourceId: `${jb.id}-A`, narration: `${jb.billNo} udhar advance` }]);
+  }
+}
+
 export async function nextJustBillNo(ctx: TenantContext): Promise<{ billNo: string }> {
   const branchId = activeBranch(ctx);
   const s = await getSettings(ctx);
@@ -67,6 +86,7 @@ export async function createJustBill(ctx: TenantContext, body: JustBillBody): Pr
       throw new HttpError(400, 'VALIDATION', `Making per gram needs a GRAM line (item "${it.name}")`);
     }
   });
+  if (body.partyId == null && body.payments.some((p) => p.mode === 'UDHAR_ADVANCE')) throw new HttpError(400, 'VALIDATION', 'Link a party to use udhar advance');
   const payCalcs = await computePayments(ctx, body.payments, s);
   const paid = sumAmounts(payCalcs);
   const billCalc = computeBill({ lineTotals: lineCalcs.map((l) => l.total), discount: body.discount, discountUnit: body.discountUnit, gstPercent: body.gstPercent, interState, roundTo: 1 });
@@ -97,9 +117,10 @@ export async function createJustBill(ctx: TenantContext, body: JustBillBody): Pr
       const it = body.items[i]!;
       await tx.justBillItem.create({ data: { justBillId: jb.id, name: it.name, karat: it.karat ?? null, purity: it.purity ?? null, quantity: it.quantity, unit: it.unit, rate: it.rate, making: it.making, makingUnit: it.makingUnit, other: it.other, total: lineCalcs[i]!.total } });
     }
+    if (body.partyId != null) await postAdvancePays(tx, ctx, { id: jb.id, billNo, branchId, partyId: body.partyId }, payCalcs, billDate, lctx);
     for (const pc of payCalcs) {
       const pay = await tx.justBillPayment.create({ data: { justBillId: jb.id, mode: pc.input.mode, bankAccountId: pc.bankAccountId ?? null, metal: pc.metal ?? null, metalForm: pc.metalForm ?? null, gross: pc.gross ?? null, net: pc.net ?? null, tunch: pc.tunch ?? null, fine: pc.fine ?? null, rate: pc.rate ?? null, amount: pc.amount, remark: pc.input.remark ?? null, txnDate: billDate, isActive: true, createdById: ctx.userId } });
-      await ledger.post(tx, lctx, [justPaymentLedgerRow(pc, pay.id, jb.id, branchId, billDate)]);
+      if (pc.input.mode !== 'UDHAR_ADVANCE') await ledger.post(tx, lctx, [justPaymentLedgerRow(pc, pay.id, jb.id, branchId, billDate)]);
     }
     if (body.partyId != null && !bal.isZero()) {
       await udhar.post(tx, lctx, [{ branchId, partyId: body.partyId, txnDate: billDate, source: 'JUST_BILL', sourceId: String(jb.id), amount: bal, narration: billNo }]); // + = party owes (same sign as SELL)
@@ -122,6 +143,7 @@ export async function deleteJustBill(ctx: TenantContext, id: number): Promise<vo
     await tx.justBillPayment.updateMany({ where: { justBillId: id }, data: { isActive: false } });
     for (const p of jb.payments) await ledger.reverse(tx, lctx, { source: 'JUST_BILL', sourceId: `${id}-P${p.id}` });
     await udhar.reverse(tx, lctx, { source: 'JUST_BILL', sourceId: String(id) });
+    await udhar.reverse(tx, lctx, { source: 'JUST_BILL', sourceId: `${id}-A` }); // TASK-98 udhar advance uses
     await logActivity(tx, ctx, { module: 'JUST_BILL', action: 'DELETED', entity: 'JUST_BILL', entityId: String(id), summary: `Deleted just bill ${jb.billNo}` });
   });
 }

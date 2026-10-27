@@ -186,4 +186,37 @@ describe('TASK-90 day-book all-in-one', () => {
     expect(Number(pur.assets.MONEY.out)).toBe(300);
     expect(pur.party).toBeNull();
   });
+
+  it('TASK-98: time, cash/bank split, metal forms/karats and a chronological running balance', async () => {
+    const s = await setup();
+    const today = ledger.businessDate();
+    const row = (over: Record<string, unknown>) => db.ledgerEntry.create({ data: { businessId: s.business.id, branchId: s.root.id, txnDate: today, asset: 'MONEY', direction: 'IN', amount: 0, source: 'SELL_BILL', sourceId: '1', createdById: 1, ...over } });
+    await acc.createIncomeExpense(s.ctx, ie({ cash: 100, gold: 1, txnDate: new Date('2020-01-01') })); // opening: 100 money, 1 g gold
+    const t1 = new Date(Date.now() - 60_000);
+    await row({ amount: 1000, createdAt: t1 }); // doc 1 (older): cash 1000 + bank 500 in, gold 22K usual + 18K kacha out
+    await row({ amount: 500, bankAccountId: s.bank.id, createdAt: new Date(t1.getTime() + 5_000) });
+    await row({ asset: 'GOLD', direction: 'OUT', net: 2, fine: 2, metalForm: 'USUAL', karatCode: '22K', createdAt: t1 });
+    await row({ asset: 'GOLD', direction: 'OUT', net: 1, fine: 0.5, metalForm: 'KACHA', karatCode: '18K', createdAt: t1 });
+    await row({ source: 'PURCHASE_BILL', sourceId: '2', direction: 'OUT', amount: 300, bankAccountId: s.bank.id }); // doc 2 (newer)
+
+    const res = await acc.getDayBookAllInOne(s.ctx, { page: 1, pageSize: 20 });
+    expect(res.items.map((r) => r.sourceId)).toEqual(['2', '1']); // newest first by time
+    const [pur, sell] = res.items as [typeof res.items[0], typeof res.items[0]];
+    expect(sell.createdAt).toBe(t1.toISOString()); // earliest row time
+    expect(sell.money).toEqual({ cashIn: '1000', cashOut: '0', bankIn: '500', bankOut: '0' });
+    expect(pur.money).toMatchObject({ bankOut: '300', cashOut: '0' });
+    expect(sell.metal?.GOLD).toEqual({ forms: ['KACHA', 'USUAL'], karats: ['18K', '22K'] });
+    expect(sell.metal?.SILVER).toEqual({ forms: [], karats: [] });
+    // balance after each document: opening 100 + 1500 = 1600, then − 300 = 1300; gold 1 − 2.5 = −1.5
+    expect(Number(sell.balance?.MONEY)).toBe(1600);
+    expect(Number(sell.balance?.GOLD)).toBe(-1.5);
+    expect(Number(pur.balance?.MONEY)).toBe(1300);
+
+    // page 2 of size 1 still carries the documents above it into its balance
+    const p2 = await acc.getDayBookAllInOne(s.ctx, { page: 2, pageSize: 1 });
+    expect(p2.items[0]!.sourceId).toBe('1');
+    expect(Number(p2.items[0]!.balance?.MONEY)).toBe(1600);
+    const p1 = await acc.getDayBookAllInOne(s.ctx, { page: 1, pageSize: 1 });
+    expect(Number(p1.items[0]!.balance?.MONEY)).toBe(1300);
+  });
 });

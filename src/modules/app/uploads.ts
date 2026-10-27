@@ -107,3 +107,20 @@ async function scopedGirviItem(ctx: TenantContext, itemId: number) {
 export const saveGirviItemPhoto = (ctx: TenantContext, itemId: number, buffer: Buffer): Promise<string> =>
   saveImage(ctx, () => scopedGirviItem(ctx, itemId), (rel) => prisma.girviItem.update({ where: { id: itemId }, data: { photoUrl: rel } }), 'girvi', 'photoUrl', buffer, 'Girvi item not found');
 export const girviItemPhotoPath = (ctx: TenantContext, itemId: number): Promise<string> => imagePath(() => scopedGirviItem(ctx, itemId), 'photoUrl');
+
+// Girvi customer document (GirviBatch.docUrl) — a JPEG/PNG/WebP image or a PDF (magic-byte checked); replaces the previous file.
+const scopedGirviBatch = (ctx: TenantContext, batchId: number) => scopedDb(ctx).girviBatch.findFirst({ where: { id: batchId } });
+export async function saveGirviDoc(ctx: TenantContext, batchId: number, buffer: Buffer): Promise<string> {
+  const row = await scopedGirviBatch(ctx, batchId);
+  if (!row) throw new HttpError(404, 'NOT_FOUND', 'Girvi not found');
+  const ext = detectImage(buffer) ?? (buffer.length >= 5 && buffer.toString('ascii', 0, 5) === '%PDF-' ? 'pdf' : null);
+  if (!ext) throw new HttpError(400, 'VALIDATION', 'Only JPEG, PNG, WebP or PDF files are allowed');
+  const rel = `${ctx.businessId}/girvi-docs/${randomUUID()}.${ext}`;
+  const abs = path.join(UPLOAD_ROOT, rel);
+  await mkdir(path.dirname(abs), { recursive: true });
+  await writeFile(abs, buffer);
+  await prisma.girviBatch.update({ where: { id: batchId }, data: { docUrl: rel } });
+  if (row.docUrl) await rm(path.join(UPLOAD_ROOT, row.docUrl), { force: true }).catch(() => {});
+  return rel;
+}
+export const girviDocPath = (ctx: TenantContext, batchId: number): Promise<string> => imagePath(() => scopedGirviBatch(ctx, batchId), 'docUrl');

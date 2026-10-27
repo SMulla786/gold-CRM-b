@@ -217,6 +217,21 @@ describe('schemes', () => {
     expect((await list({ from: '2026-03-01', to: '2026-03-31' })).items.map((e) => e.assignId)).toEqual(['S2']);
   });
 
+  it('transactions medium filter: single value or comma list (CASH,TOKEN)', async () => {
+    const s = await setup();
+    const scheme = await cashScheme(s.ctx);
+    const e = await schemes.enroll(s.ctx, { schemeId: scheme.id, partyId: s.party.id, assignId: 'M1', displayName: 'C', tokenAmount: 500 } as any);
+    await schemes.addPayment(s.ctx, { enrollmentId: e.id, emiNo: 1, amount: 2000, medium: 'CASH' } as any);
+    await schemes.addPayment(s.ctx, { enrollmentId: e.id, emiNo: 2, amount: 2000, medium: 'DRAW' } as any);
+    const { schemeTxnListQuery } = await import('../../../shared');
+    const media = async (raw: Record<string, string>) => (await schemes.transactions(s.ctx, schemeTxnListQuery.parse(raw))).items.map((t) => t.medium).sort();
+    expect(await media({ medium: 'CASH' })).toEqual(['CASH']);
+    expect(await media({ medium: 'CASH,TOKEN' })).toEqual(['CASH', 'TOKEN']);
+    expect(await media({ medium: 'DRAW, VENDOR' })).toEqual(['DRAW']);
+    expect(await media({})).toHaveLength(3);
+    expect(() => schemeTxnListQuery.parse({ medium: 'CASH,BOGUS' })).toThrow();
+  });
+
   it('dues: q filters server-side; perMonth gives one row per due EMI (count = emisDue)', async () => {
     const s = await setup();
     const scheme = await cashScheme(s.ctx);

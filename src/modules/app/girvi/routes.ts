@@ -20,9 +20,10 @@ import {
 import * as girvi from './service';
 import * as transfer from './transfer';
 import { girviImportSampleCsv, importGirvi } from './import';
-import { girviItemPhotoPath, saveGirviItemPhoto } from '../uploads';
+import { girviDocPath, girviItemPhotoPath, saveGirviDoc, saveGirviItemPhoto } from '../uploads';
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 2 * 1024 * 1024 } });
+const docUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } }); // scanned PDFs run larger than photos
 
 export const girviRouter = Router();
 const ENTRY = 'girvi.entry';
@@ -46,6 +47,17 @@ girviRouter.post('/girvi/items/:itemId/photo', requirePermission(ENTRY, 'edit'),
 girviRouter.get('/girvi/items/:itemId/photo', requirePermission(LEDGER, 'view'), async (req, res) => {
   const abs = await girviItemPhotoPath(req.ctx!, idSchema.parse(req.params.itemId));
   res.type({ '.jpg': 'image/jpeg', '.png': 'image/png', '.webp': 'image/webp' }[path.extname(abs)] ?? 'application/octet-stream').sendFile(abs);
+});
+// Customer document on the loan (JPEG/PNG/WebP or PDF, magic-byte checked)
+girviRouter.post('/girvi/:id/doc', requirePermission(ENTRY, 'edit'), docUpload.single('file'), async (req, res) => {
+  if (!req.file) throw new HttpError(400, 'VALIDATION', 'No file uploaded (field "file")');
+  const id = idSchema.parse(req.params.id);
+  await saveGirviDoc(req.ctx!, id, req.file.buffer);
+  res.status(201).json({ url: `/api/app/girvi/${id}/doc` });
+});
+girviRouter.get('/girvi/:id/doc', requirePermission(LEDGER, 'view'), async (req, res) => {
+  const abs = await girviDocPath(req.ctx!, idSchema.parse(req.params.id));
+  res.type({ '.jpg': 'image/jpeg', '.png': 'image/png', '.webp': 'image/webp', '.pdf': 'application/pdf' }[path.extname(abs)] ?? 'application/octet-stream').sendFile(abs);
 });
 girviRouter.patch('/girvi/:id/items/:itemId', requirePermission(ENTRY, 'edit'), requireMpin, async (req, res) =>
   res.json(await girvi.replaceGirviItem(req.ctx!, idSchema.parse(req.params.id), idSchema.parse(req.params.itemId), girviItemReplaceBody.parse(req.body))),

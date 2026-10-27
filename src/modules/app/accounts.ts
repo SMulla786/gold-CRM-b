@@ -336,8 +336,8 @@ async function decorateLedger(ctx: TenantContext, rows: RawRow[], opening: Prism
   const banks = baIds.length ? await sdb.bankAccount.findMany({ where: { id: { in: baIds } }, select: { id: true, bankName: true } }) : [];
   const baMap = new Map(banks.map((b) => [b.id, b.bankName]));
   const stockIds = uniqIds(rows, 'stockItemId');
-  const stock = stockIds.length ? await sdb.stockItem.findMany({ where: { id: { in: stockIds } }, include: { itemName: true } }) : [];
-  const stockMap = new Map(stock.map((s) => [s.id, { id: s.id, label: `${s.itemName.name}${s.tagNo ? ` ${s.tagNo}` : ''}` }]));
+  const stock = stockIds.length ? await sdb.stockItem.findMany({ where: { id: { in: stockIds } }, include: { itemName: true, group: { select: { name: true } } } }) : [];
+  const stockMap = new Map(stock.map((s) => [s.id, { id: s.id, label: `${s.itemName.name}${s.tagNo ? ` ${s.tagNo}` : ''}`, group: s.group.name, name: s.itemName.name }]));
   const uMap = await userNames(ctx, uniqIds(rows, 'createdById'));
   const pageIds = rows.map((r) => r.id);
   const reversed = new Set(
@@ -420,6 +420,11 @@ export async function getDayBook(ctx: TenantContext, query: { from?: Date; to?: 
   return { from: dateOnly(from), to: dateOnly(to), totals, bySource, status, ...(days ? { days } : {}) };
 }
 
+/** A groupBy row's value in the asset's main unit, and sum IN - OUT of such rows for one asset (the Day-Book opening rule). */
+const unitVal = (g: any, asset: LedgerAsset) => new Prisma.Decimal(g._sum[UNIT[asset]] ?? 0);
+const signedSum = (groups: any[], asset: LedgerAsset) =>
+  groups.filter((g) => g.asset === asset).reduce((a, g) => (g.direction === 'IN' ? a.plus(unitVal(g, asset)) : a.minus(unitVal(g, asset))), new Prisma.Decimal(0));
+
 const DAY_MS = 86_400_000;
 const MAX_DAYS = 62;
 
@@ -440,9 +445,8 @@ async function dayBookDays(ctx: TenantContext, scope: any, from: Date, to: Date,
       : Promise.resolve([] as { date: Date; status: 'OPEN' | 'CLOSED' }[]),
   ]);
   const statusOf = new Map(closed.map((d) => [dateOnly(d.date), d.status]));
-  const val = (g: any, asset: LedgerAsset) => new Prisma.Decimal(g._sum[UNIT[asset]] ?? 0);
-  const signed = (groups: any[], asset: LedgerAsset) =>
-    groups.filter((g) => g.asset === asset).reduce((a, g) => (g.direction === 'IN' ? a.plus(val(g, asset)) : a.minus(val(g, asset))), new Prisma.Decimal(0));
+  const val = unitVal;
+  const signed = signedSum;
 
   const running = new Map(LEDGER_ASSETS.map((a) => [a, signed(openBeforeFrom, a).plus(signed(gap, a))]));
   const out: DayBookDayDto[] = [];
@@ -466,44 +470,101 @@ async function dayBookDays(ctx: TenantContext, scope: any, from: Date, to: Date,
 }
 
 /** TASK-90: Day-Book "All-in-One" — one row per (source, sourceId, txnDate) document with every asset's IN/OUT side by side.
- *  Grouped SQL (3 queries, no per-document round-trips), scoped by businessId + the active branch(es). */
+ *  Grouped SQL (no per-document round-trips), scoped by businessId + the active branch(es). Newest first (date, then time).
+ *  TASK-98: + time (earliest createdAt), money cash/bank split, metal forms/karats, running MONEY/GOLD/SILVER balance. */
 export async function getDayBookAllInOne(ctx: TenantContext, q: { page: number; pageSize: number; from?: Date; to?: Date; source?: LedgerSource }): Promise<Paged<DayBookAllInOneRowDto>> {
   const from = ledger.businessDate(q.from ?? new Date());
   const to = ledger.businessDate(q.to ?? new Date());
   const sdb = scopedDb(ctx);
-  const where: any = { branchId: { in: branchFilter(ctx) }, txnDate: { gte: from, lte: to }, ...(q.source ? { source: q.source } : {}) };
-  const docs = await sdb.ledgerEntry.groupBy({ by: ['source', 'sourceId', 'txnDate'], where, orderBy: [{ txnDate: 'desc' }, { sourceId: 'desc' }] });
+  const scope: any = { branchId: { in: branchFilter(ctx) }, ...(q.source ? { source: q.source } : {}) };
+  const where: any = { ...scope, txnDate: { gte: from, lte: to } };
+  const docs = await sdb.ledgerEntry.groupBy({
+    by: ['source', 'sourceId', 'txnDate'],
+    where,
+    _min: { createdAt: true },
+    orderBy: [{ txnDate: 'desc' }, { _min: { createdAt: 'desc' } }, { sourceId: 'desc' }],
+  });
   const total = docs.length;
-  const page = docs.slice((q.page - 1) * q.pageSize, (q.page - 1) * q.pageSize + q.pageSize);
+  const start = (q.page - 1) * q.pageSize;
+  const page = docs.slice(start, start + q.pageSize);
   if (page.length === 0) return { items: [], total, page: q.page, pageSize: q.pageSize };
 
-  const scoped = { ...where, sourceId: { in: [...new Set(page.map((d) => d.sourceId))] } };
-  const [agg, reps] = await Promise.all([
-    sdb.ledgerEntry.groupBy({ by: ['source', 'sourceId', 'txnDate', 'asset', 'direction'], where: scoped, _sum: { amount: true, fine: true, pcs: true } }),
-    sdb.ledgerEntry.findMany({ where: scoped, select: { source: true, sourceId: true, txnDate: true, partyId: true, narration: true }, distinct: ['source', 'sourceId', 'txnDate'] }),
-  ]);
   const key = (s: string, id: string, d: Date) => `${s}|${id}|${d.toISOString()}`;
-  const assetMap = new Map<string, Record<string, { in: Prisma.Decimal; out: Prisma.Decimal }>>();
+  const RUN = ['MONEY', 'GOLD', 'SILVER'] as const;
+  type RunAsset = (typeof RUN)[number];
+  const sum = { _sum: { amount: true, fine: true, pcs: true } } as const;
+  const scoped = { ...where, sourceId: { in: [...new Set(page.map((d) => d.sourceId))] } };
+  const [agg, reps, open, runAgg] = await Promise.all([
+    // page documents per asset/direction, split by bank account (money) and metal form / karat (gold, silver)
+    sdb.ledgerEntry.groupBy({ by: ['source', 'sourceId', 'txnDate', 'asset', 'direction', 'bankAccountId', 'metalForm', 'karatCode'], where: scoped, ...sum }),
+    sdb.ledgerEntry.findMany({ where: scoped, select: { source: true, sourceId: true, txnDate: true, partyId: true, narration: true }, distinct: ['source', 'sourceId', 'txnDate'] }),
+    // opening before `from` — same rule (scope + source filter) as getDayBook
+    sdb.ledgerEntry.groupBy({ by: ['asset', 'direction'], where: { ...scope, asset: { in: [...RUN] }, txnDate: { lt: from } }, ...sum }),
+    // per-document sums from `from` up to the page's oldest date (covers every document at or below the page)
+    sdb.ledgerEntry.groupBy({ by: ['source', 'sourceId', 'txnDate', 'asset', 'direction'], where: { ...where, asset: { in: [...RUN] }, txnDate: { gte: from, lte: page.at(-1)!.txnDate } }, ...sum }),
+  ]);
+
+  // running balance: rows are newest first, so walk from the oldest document up to the page's first row
+  const perDoc = new Map<string, any[]>();
+  for (const g of runAgg) {
+    const k = key(g.source, g.sourceId, g.txnDate);
+    const list = perDoc.get(k);
+    if (list) list.push(g);
+    else perDoc.set(k, [g]);
+  }
+  const bal = new Map(RUN.map((a) => [a, signedSum(open, a)]));
+  const balanceAt = new Map<string, Record<RunAsset, string>>();
+  for (let i = docs.length - 1; i >= start; i--) {
+    const d = docs[i]!;
+    const k = key(d.source, d.sourceId, d.txnDate);
+    const groups = perDoc.get(k) ?? [];
+    for (const a of RUN) bal.set(a, bal.get(a)!.plus(signedSum(groups, a)));
+    if (i < start + page.length) balanceAt.set(k, Object.fromEntries(RUN.map((a) => [a, bal.get(a)!.toString()])) as Record<RunAsset, string>);
+  }
+
+  type Rec = {
+    assets: Record<string, { in: Prisma.Decimal; out: Prisma.Decimal }>;
+    money: { cashIn: Prisma.Decimal; cashOut: Prisma.Decimal; bankIn: Prisma.Decimal; bankOut: Prisma.Decimal };
+    metal: Record<'GOLD' | 'SILVER', { forms: Set<string>; karats: Set<string> }>;
+  };
+  const zero = () => new Prisma.Decimal(0);
+  const recs = new Map<string, Rec>();
   for (const g of agg) {
     const k = key(g.source, g.sourceId, g.txnDate);
-    let rec = assetMap.get(k);
+    let rec = recs.get(k);
     if (!rec) {
-      rec = Object.fromEntries(LEDGER_ASSETS.map((a) => [a, { in: new Prisma.Decimal(0), out: new Prisma.Decimal(0) }]));
-      assetMap.set(k, rec);
+      rec = {
+        assets: Object.fromEntries(LEDGER_ASSETS.map((a) => [a, { in: zero(), out: zero() }])),
+        money: { cashIn: zero(), cashOut: zero(), bankIn: zero(), bankOut: zero() },
+        metal: { GOLD: { forms: new Set(), karats: new Set() }, SILVER: { forms: new Set(), karats: new Set() } },
+      };
+      recs.set(k, rec);
     }
-    const v = new Prisma.Decimal((g._sum as any)[UNIT[g.asset]] ?? 0);
-    if (g.direction === 'IN') rec[g.asset]!.in = rec[g.asset]!.in.plus(v);
-    else rec[g.asset]!.out = rec[g.asset]!.out.plus(v);
+    const v = unitVal(g, g.asset);
+    const isIn = g.direction === 'IN';
+    if (isIn) rec.assets[g.asset]!.in = rec.assets[g.asset]!.in.plus(v);
+    else rec.assets[g.asset]!.out = rec.assets[g.asset]!.out.plus(v);
+    if (g.asset === 'MONEY') {
+      const slot = `${g.bankAccountId == null ? 'cash' : 'bank'}${isIn ? 'In' : 'Out'}` as keyof Rec['money'];
+      rec.money[slot] = rec.money[slot].plus(v);
+    } else if (g.asset === 'GOLD' || g.asset === 'SILVER') {
+      if (g.metalForm) rec.metal[g.asset].forms.add(g.metalForm);
+      if (g.karatCode) rec.metal[g.asset].karats.add(g.karatCode);
+    }
   }
   const repMap = new Map(reps.map((r) => [key(r.source, r.sourceId, r.txnDate), r]));
   const partyNames = await scopedNames(sdb.party, reps.map((r) => r.partyId).filter((x): x is number => x != null));
 
   const items: DayBookAllInOneRowDto[] = page.map((d) => {
-    const rec = assetMap.get(key(d.source, d.sourceId, d.txnDate));
-    const rep = repMap.get(key(d.source, d.sourceId, d.txnDate));
+    const k = key(d.source, d.sourceId, d.txnDate);
+    const rec = recs.get(k);
+    const rep = repMap.get(k);
     const assets = Object.fromEntries(
-      LEDGER_ASSETS.map((a) => [a, { in: (rec?.[a]?.in ?? new Prisma.Decimal(0)).toString(), out: (rec?.[a]?.out ?? new Prisma.Decimal(0)).toString() }]),
+      LEDGER_ASSETS.map((a) => [a, { in: (rec?.assets[a]?.in ?? zero()).toString(), out: (rec?.assets[a]?.out ?? zero()).toString() }]),
     ) as Record<(typeof LEDGER_ASSETS)[number], { in: string; out: string }>;
+    const m = rec?.money;
+    const metalOf = (a: 'GOLD' | 'SILVER') => ({ forms: [...(rec?.metal[a].forms ?? [])].sort(), karats: [...(rec?.metal[a].karats ?? [])].sort() });
+    const balance = balanceAt.get(k);
     return {
       txnDate: dateOnly(d.txnDate),
       source: d.source as LedgerSource,
@@ -511,6 +572,10 @@ export async function getDayBookAllInOne(ctx: TenantContext, q: { page: number; 
       party: rep?.partyId != null ? { id: rep.partyId, name: partyNames.get(rep.partyId) ?? '' } : null,
       narration: rep?.narration ?? null,
       assets,
+      ...(d._min?.createdAt ? { createdAt: d._min.createdAt.toISOString() } : {}),
+      money: { cashIn: (m?.cashIn ?? zero()).toString(), cashOut: (m?.cashOut ?? zero()).toString(), bankIn: (m?.bankIn ?? zero()).toString(), bankOut: (m?.bankOut ?? zero()).toString() },
+      metal: { GOLD: metalOf('GOLD'), SILVER: metalOf('SILVER') },
+      ...(balance ? { balance } : {}),
     };
   });
   return { items, total, page: q.page, pageSize: q.pageSize };

@@ -5,6 +5,7 @@ import { HttpError } from '../../middleware/error';
 import {
   branchBody,
   counterBody,
+  updateCounterBody,
   createUserBody,
   enquiryListQuery,
   enquiryRejectBody,
@@ -60,7 +61,7 @@ adminRouter.get('/counters', async (req, res) => {
   res.json(await svc.listCounters(req.ctx!, branchId));
 });
 adminRouter.post('/counters', async (req, res) => res.status(201).json(await svc.createCounter(req.ctx!, counterBody.parse(req.body))));
-adminRouter.patch('/counters/:id', async (req, res) => res.json(await svc.updateCounter(req.ctx!, idSchema.parse(req.params.id), counterBody.pick({ name: true }).parse(req.body))));
+adminRouter.patch('/counters/:id', async (req, res) => res.json(await svc.updateCounter(req.ctx!, idSchema.parse(req.params.id), updateCounterBody.parse(req.body))));
 
 // Users
 adminRouter.get('/users', async (req, res) => res.json(await svc.listUsers(req.ctx!, userListQuery.parse(req.query))));

@@ -503,7 +503,7 @@ function paymentDto(p: any, bankMap: Map<number, string>, userMap: Map<number, s
 const txnInclude = { enrollment: { include: { scheme: true, group: true } } } as const;
 const txnWhere = (ctx: TenantContext, q: any, keyword?: Prisma.SchemeEnrollmentWhereInput) => ({
   enrollment: { businessId: ctx.businessId!, branchId: { in: branchScope(ctx) }, ...(q?.schemeId ? { schemeId: q.schemeId } : {}), ...(q?.groupId ? { groupId: q.groupId } : {}), ...(q?.kind ? { scheme: { kind: q.kind } } : {}), ...(keyword ?? {}) },
-  ...(q?.medium ? { medium: q.medium } : {}),
+  ...(q?.medium ? { medium: Array.isArray(q.medium) ? { in: q.medium } : q.medium } : {}),
   ...(q?.from || q?.to ? { txnDate: { ...(q.from ? { gte: dateOnly(q.from) } : {}), ...(q.to ? { lte: dateOnly(q.to) } : {}) } } : {}),
 });
 

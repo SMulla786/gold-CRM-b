@@ -4,6 +4,8 @@ import { createBusiness } from '../../../../test/helpers/factory';
 import { girviBody, girviInterest } from '../../../shared';
 import { businessDate } from '../../../lib/ledger';
 import * as girvi from './service';
+import { girviDocPath, saveGirviDoc } from '../uploads';
+import { readFile, rm } from 'node:fs/promises';
 import type { TenantContext } from '../../../middleware/context';
 
 const ctxFor = (businessId: number, branchId: number): TenantContext => ({
@@ -94,5 +96,47 @@ describe('girvi (TASK-61)', () => {
     await expect(girvi.createGirvi(s.ctx, loan({ partyId: oParty.id }))).rejects.toMatchObject({ status: 404 });
     const oBank = await db.bankAccount.create({ data: { businessId: other.business.id, branchId: 0, bankName: 'Y', accountNo: '9', ifsc: 'HDFC0009999', applyTo: 'ALL' } });
     await expect(girvi.createGirvi(s.ctx, loan({ partyId: s.party.id, cash: 0, online: 50000, bankAccountId: oBank.id }))).rejects.toMatchObject({ status: 404 });
+  });
+  it('tenureDays → returnDate = issueDate + days, tenureMonths = ceil(days / 30); without it, months as before', async () => {
+    const s = await setup();
+    const issue = new Date('2026-01-10T00:00:00Z');
+    const d = await girvi.createGirvi(s.ctx, loan({ partyId: s.party.id, issueDate: issue, tenureMonths: 1, tenureDays: 45 }));
+    expect(d.issueDate).toBe('2026-01-10');
+    expect(d.returnDate).toBe('2026-02-24');
+    expect(d.tenureMonths).toBe(2);
+    const m = await girvi.createGirvi(s.ctx, loan({ partyId: s.party.id, issueDate: issue, tenureMonths: 3 }));
+    expect(m.returnDate).toBe('2026-04-10');
+    expect(m.tenureMonths).toBe(3);
+  });
+
+  it('list marks only a GRANT-only loan deletable', async () => {
+    const s = await setup();
+    const a = await girvi.createGirvi(s.ctx, loan({ partyId: s.party.id }));
+    const b = await girvi.createGirvi(s.ctx, loan({ partyId: s.party.id }));
+    await girvi.topupGirvi(s.ctx, b.id, { principal: 1000, cash: 1000, online: 0 }); // issued today → no interest due yet
+    const list = await girvi.listGirvi(s.ctx, { page: 1, pageSize: 20 });
+    expect(list.items.find((r) => r.id === a.id)!.deletable).toBe(true);
+    expect(list.items.find((r) => r.id === b.id)!.deletable).toBe(false);
+  });
+
+  it('customer document: PDF/image saved on the batch (docUrl), replaced on re-upload, other types → 400, other tenant → 404', async () => {
+    const s = await setup();
+    const g = await girvi.createGirvi(s.ctx, loan({ partyId: s.party.id }));
+    expect(g.docUrl).toBeNull();
+    const pdf = Buffer.from('%PDF-1.4 test');
+    const rel = await saveGirviDoc(s.ctx, g.id, pdf);
+    expect(rel).toMatch(/\.pdf$/);
+    expect((await girvi.getGirvi(s.ctx, g.id, new Date())).docUrl).toBe(rel);
+    expect((await readFile(await girviDocPath(s.ctx, g.id))).toString('ascii', 0, 5)).toBe('%PDF-');
+    const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0]);
+    const rel2 = await saveGirviDoc(s.ctx, g.id, png);
+    expect(rel2).toMatch(/\.png$/);
+    expect((await girvi.getGirvi(s.ctx, g.id, new Date())).docUrl).toBe(rel2);
+    await expect(saveGirviDoc(s.ctx, g.id, Buffer.from('hello world'))).rejects.toMatchObject({ status: 400 });
+    const other = await createBusiness({ name: 'B' });
+    const oCtx = ctxFor(other.business.id, other.root.id);
+    await expect(saveGirviDoc(oCtx, g.id, pdf)).rejects.toMatchObject({ status: 404 });
+    await expect(girviDocPath(oCtx, g.id)).rejects.toMatchObject({ status: 404 });
+    await rm(await girviDocPath(s.ctx, g.id), { force: true });
   });
 });

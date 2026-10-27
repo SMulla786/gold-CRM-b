@@ -234,6 +234,25 @@ describe('udhar txn posting', () => {
     expect(list.items.find((r) => r.source === 'BHAV_CUT')!.narration).toBe('Bhav GOLD ₹70000.00 @ ₹70000.00/10 g = 10.000 g');
   });
 
+  it('udhar list: per-row Old/Final = party running balance in txnDate,id order', async () => {
+    const { business, root } = await createBusiness({ name: 'A' });
+    const ctx = ctxFor(business.id, [root.id], root.id);
+    const p = await makeParty(business.id);
+    const other = await makeParty(business.id, 'Other');
+    const num = { onlineOut: 0, cashIn: 0, onlineIn: 0, goldOut: 0, goldIn: 0, silverOut: 0, silverIn: 0 };
+    const a = await createUdharTxn(ctx, { partyId: p.id, cashOut: 1000, ...num, goldOut: 2, txnDate: new Date('2026-05-01') } as never);
+    await createUdharTxn(ctx, { partyId: other.id, cashOut: 9000, ...num, txnDate: new Date('2026-05-01') } as never); // other party: not counted
+    const b = await createUdharTxn(ctx, { partyId: p.id, cashOut: 0, ...num, cashIn: 300, silverOut: 5, txnDate: new Date('2026-05-02') } as never);
+
+    const list = await listEntries(ctx, { page: 1, pageSize: 20, partyId: p.id });
+    const rowA = list.items.find((r) => r.source === 'UDHAR' && r.sourceId === String(a.id))!;
+    const rowB = list.items.find((r) => r.source === 'UDHAR' && r.sourceId === String(b.id))!;
+    expect(rowA.old).toEqual({ amount: '0.00', gold: '0.000', silver: '0.000' });
+    expect(rowA.final).toEqual({ amount: '1000.00', gold: '2.000', silver: '0.000' });
+    expect(rowB.old).toEqual(rowA.final);
+    expect(rowB.final).toEqual({ amount: '700.00', gold: '2.000', silver: '5.000' });
+  });
+
   it('cross-tenant party is not found (404)', async () => {
     const a = await createBusiness({ name: 'A' });
     const b = await createBusiness({ name: 'B' });

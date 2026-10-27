@@ -10,6 +10,7 @@ const ctxFor = (businessId: number, branchIds: number[], activeBranchId: number 
   readOnly: false, modules: [], limits: null, permissions: {}, impersonatorId: null,
 });
 const dateOnlyStr = (d: Date) => d.toISOString().slice(0, 10);
+const pay = (billId: number, amount: number, txnDate: Date = businessDate(), isActive = true) => db.billPayment.create({ data: { billId, mode: 'CASH', amount, txnDate, isActive } });
 const party = (businessId: number, name = 'Cust', type: 'CUSTOMER' | 'SUPPLIER' = 'CUSTOMER') => db.party.create({ data: { businessId, type, name, mobile: '9000000000' } });
 
 async function sellBill(businessId: number, branchId: number, partyId: number, over: Partial<{ final: number; paid: number; billType: 'GST' | 'ROUGH'; cgst: number; sgst: number; billNo: string; seq: number }> = {}) {
@@ -29,7 +30,8 @@ describe('reports dashboard', () => {
     const { business, root } = await createBusiness({ name: 'A' });
     const d = await dashboard(ctxFor(business.id, [root.id], root.id));
     expect(d.date).toBe(businessDate().toISOString().slice(0, 10));
-    expect(d.parties).toEqual({ customers: 0, suppliers: 0, customersNewThisMonth: 0 });
+    expect(d.parties).toEqual({ customers: 0, suppliers: 0, customersNewThisMonth: 0, suppliersNewThisMonth: 0 });
+    expect(d.udharOverdueTotal).toBe('0.00');
     expect(d.stock).toEqual([]);
     expect(d.sales).toMatchObject({ todayTotal: '0.00', todayCount: 0, pendingBalance: '0.00' });
     expect(d.monthly).toHaveLength(12);
@@ -40,7 +42,8 @@ describe('reports dashboard', () => {
   it('today SELL bill → sales totals, count and pending balance', async () => {
     const { business, root } = await createBusiness({ name: 'A' });
     const p = await party(business.id);
-    await sellBill(business.id, root.id, p.id, { final: 10300, paid: 4000 });
+    const b = await sellBill(business.id, root.id, p.id, { final: 10300, paid: 4000 });
+    await pay(b.id, 4000);
     const d = await dashboard(ctxFor(business.id, [root.id], root.id));
     expect(d.sales.todayTotal).toBe('10300.00');
     expect(d.sales.todayCount).toBe(1);
@@ -77,7 +80,9 @@ describe('reports dashboard', () => {
     const [y, m, d] = [today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate()];
     const prevDay = new Date(Date.UTC(y, m - 1, Math.min(d, new Date(Date.UTC(y, m, 0)).getUTCDate())));
     await sellBill(business.id, root.id, p.id, { final: 10300, paid: 12000, seq: 1, billNo: 'INV-1' }); // overpaid 1700 = advance
-    await db.bill.update({ where: { id: (await sellBill(business.id, root.id, p.id, { final: 5000, paid: 1000, seq: 2, billNo: 'INV-2' })).id }, data: { billDate: prevDay } });
+    const prevBill = await sellBill(business.id, root.id, p.id, { final: 5000, paid: 1000, seq: 2, billNo: 'INV-2' });
+    await db.bill.update({ where: { id: prevBill.id }, data: { billDate: prevDay } });
+    await pay(prevBill.id, 1000, prevDay);
 
     const ago = (n: number) => new Date(today.getTime() - n * 86_400_000);
     const late = await party(business.id, 'Late');
@@ -99,6 +104,55 @@ describe('reports dashboard', () => {
       ['Late', '6000.00', '0.000', dateOnlyStr(ago(60)), 30],
       ['Metal', '0.00', '2.000', dateOnlyStr(ago(40)), 10],
     ]);
+    expect(r.udharOverdueTotal).toBe('6000.00'); // Late 6000 + Metal 0 money; Fresh not yet due
+  });
+
+  it('udharOverdueTotal sums every overdue party, not just the top 10', async () => {
+    const { business, root } = await createBusiness({ name: 'A' });
+    const ago = businessDate(new Date(Date.now() - 45 * 86_400_000));
+    for (let i = 0; i < 12; i++) {
+      const p = await party(business.id, `P${i}`);
+      await db.udharEntry.create({ data: { businessId: business.id, branchId: root.id, partyId: p.id, txnDate: ago, amount: 100, source: 'UDHAR', sourceId: String(i) } });
+    }
+    const r = await dashboard(ctxFor(business.id, [root.id], root.id));
+    expect(r.udharOverdue).toHaveLength(10);
+    expect(r.udharOverdueTotal).toBe('1200.00');
+  });
+
+  it('received today = active payments dated today on ACTIVE SELL bills (incl. later payments on older bills)', async () => {
+    const { business, root } = await createBusiness({ name: 'A' });
+    const p = await party(business.id);
+    const yesterday = new Date(businessDate().getTime() - 86_400_000);
+    const todayBill = await sellBill(business.id, root.id, p.id, { final: 10000, paid: 3000, seq: 1, billNo: 'INV-1' });
+    await pay(todayBill.id, 3000); // initial payment on today's bill
+    const old = await sellBill(business.id, root.id, p.id, { final: 8000, paid: 7000, seq: 2, billNo: 'INV-2' });
+    await db.bill.update({ where: { id: old.id }, data: { billDate: yesterday } });
+    await pay(old.id, 5000, yesterday); // yesterday: not today
+    await pay(old.id, 2000); // later payment today on yesterday's bill: counts
+    await pay(old.id, 999, businessDate(), false); // reversed (inactive): excluded
+    const dead = await sellBill(business.id, root.id, p.id, { final: 500, paid: 500, seq: 3, billNo: 'INV-3' });
+    await db.bill.update({ where: { id: dead.id }, data: { status: 'DELETED' } });
+    await pay(dead.id, 500); // deleted bill: excluded
+    // no-new-money modes: excluded (the money came in earlier as scheme EMIs / udhar receipts)
+    await db.billPayment.create({ data: { billId: todayBill.id, mode: 'SCHEME', amount: 400, txnDate: businessDate() } });
+    await db.billPayment.create({ data: { billId: todayBill.id, mode: 'UDHAR_ADVANCE', amount: 300, txnDate: businessDate() } });
+    const d = await dashboard(ctxFor(business.id, [root.id], root.id));
+    expect(d.sales.todayReceived).toBe('5000.00'); // 3000 + 2000
+  });
+
+  it('suppliersNewThisMonth counts suppliers created this month (and last month comparable)', async () => {
+    const { business, root } = await createBusiness({ name: 'A' });
+    await party(business.id, 'S1', 'SUPPLIER');
+    await party(business.id, 'S2', 'SUPPLIER');
+    await party(business.id, 'C1');
+    const today = businessDate();
+    const lastMonth = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth() - 1, 1, 6));
+    const s3 = await party(business.id, 'S3', 'SUPPLIER');
+    await db.party.update({ where: { id: s3.id }, data: { createdAt: lastMonth } });
+    const d = await dashboard(ctxFor(business.id, [root.id], root.id));
+    expect(d.parties.suppliers).toBe(3);
+    expect(d.parties.suppliersNewThisMonth).toBe(2);
+    expect(d.lastMonth!.suppliersNewThisMonth).toBe(1);
   });
 
   it('byBranch present only with X-Branch-Id: all', async () => {

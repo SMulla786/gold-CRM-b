@@ -304,6 +304,7 @@ export async function listEntries(ctx: TenantContext, q: { page: number; pageSiz
   const partyMap = await partyRefs(sdb, rows.map((r) => r.partyId));
   const reference = await referenceLabels(sdb, rows);
   const bhav = await bhavNotes(sdb, rows);
+  const running = await runningBalances(ctx, rows);
   const items: UdharEntryRowDto[] = rows.map((r) => ({
     source: r.source,
     sourceId: r.sourceId,
@@ -316,8 +317,31 @@ export async function listEntries(ctx: TenantContext, q: { page: number; pageSiz
     narration: r.narration ?? bhav.get(`${r.source}:${r.sourceId}`) ?? null,
     isReversal: r.reversalOfId != null,
     createdAt: r.createdAt.toISOString(),
+    ...running.get(String(r.id)),
   }));
   return { items, total, page: q.page, pageSize: q.pageSize };
+}
+
+/** Udhar List Old/Final: per-party running sum in the Statement's order (txnDate, id) over all scoped rows,
+ *  read back only for the page's rows. final = running sum incl. the row, old = final − row. */
+async function runningBalances(ctx: TenantContext, rows: { id: bigint; partyId: number }[]): Promise<Map<string, { old: BalanceDto; final: BalanceDto }>> {
+  if (rows.length === 0 || ctx.branchIds.length === 0) return new Map();
+  const partyIds = [...new Set(rows.map((r) => r.partyId))];
+  const ids = rows.map((r) => r.id);
+  const res = await prisma.$queryRaw<Array<{ id: string; amount: unknown; gold: unknown; silver: unknown; run_amount: unknown; run_gold: unknown; run_silver: unknown }>>(Prisma.sql`
+    SELECT id::text AS id, amount, gold, silver, run_amount, run_gold, run_silver FROM (
+      SELECT id, amount, gold, silver,
+        SUM(amount) OVER w AS run_amount, SUM(gold) OVER w AS run_gold, SUM(silver) OVER w AS run_silver
+      FROM "UdharEntry"
+      WHERE "businessId" = ${ctx.businessId!} AND "branchId" IN (${Prisma.join(ctx.branchIds)}) AND "partyId" IN (${Prisma.join(partyIds)})
+      WINDOW w AS (PARTITION BY "partyId" ORDER BY "txnDate", id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+    ) t WHERE id IN (${Prisma.join(ids)})`);
+  return new Map(
+    res.map((r) => {
+      const fa = D(r.run_amount), fg = D(r.run_gold), fs = D(r.run_silver);
+      return [r.id, { old: bal(fa.minus(D(r.amount)), fg.minus(D(r.gold)), fs.minus(D(r.silver))), final: bal(fa, fg, fs) }];
+    }),
+  );
 }
 
 /** Udhar Ledger: party-wise balances (SQL groupBy). */

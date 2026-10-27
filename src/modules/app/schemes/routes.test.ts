@@ -3,7 +3,8 @@ import { api, bearer, loginAs } from '../../../../test/helpers/app';
 import { db, truncateAll } from '../../../../test/helpers/db';
 import { createBusiness, createPlan, createSubscription, createUser } from '../../../../test/helpers/factory';
 
-// Lead-approved read-only widenings: GET enrollments (+/:id) also for schemes.add_money; GET /schemes also for schemes.anjuman.
+// Lead-approved read-only widenings: GET enrollments (+/:id) also for schemes.add_money; GET /schemes also for schemes.anjuman/enroll/add_money/groups;
+// GET /schemes/groups also for add_money/enroll/all; GET /schemes/dues for due_list or due_amount.
 const MODULES = ['schemes'];
 
 async function grant(userId: number, keys: string[]) {
@@ -41,6 +42,29 @@ describe('scheme read routes accept the alternate permission (GET only)', () => 
     await truncateAll();
     const none = await userWith([]);
     expect((await api.get('/api/app/schemes').set('Authorization', bearer(none))).status).toBe(403);
+  });
+
+  it('enrol / add-money / groups roles read GET /schemes; add-money / enrol read GET /schemes/groups', async () => {
+    for (const key of ['schemes.enroll', 'schemes.add_money', 'schemes.groups']) {
+      await truncateAll();
+      const token = await userWith([key]);
+      expect((await api.get('/api/app/schemes').set('Authorization', bearer(token))).status).toBe(200);
+      expect((await api.get('/api/app/schemes/groups').set('Authorization', bearer(token))).status).toBe(200);
+    }
+    await truncateAll();
+    const none = await userWith(['schemes.transactions']);
+    expect((await api.get('/api/app/schemes/groups').set('Authorization', bearer(none))).status).toBe(403);
+  });
+
+  it('GET /schemes/dues accepts schemes.due_list or schemes.due_amount', async () => {
+    for (const key of ['schemes.due_list', 'schemes.due_amount']) {
+      await truncateAll();
+      const token = await userWith([key]);
+      expect((await api.get('/api/app/schemes/dues').set('Authorization', bearer(token))).status).toBe(200);
+    }
+    await truncateAll();
+    const none = await userWith(['schemes.add_money']);
+    expect((await api.get('/api/app/schemes/dues').set('Authorization', bearer(none))).status).toBe(403);
   });
 
   it('write routes are not widened', async () => {
