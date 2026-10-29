@@ -38,6 +38,16 @@ describe('settings resolution', () => {
     const c = ctx({ businessId: business.id, scopeBranchId: root.id, branchIds: [root.id] });
     await expect(svc.putSetting(c, 'nope.key', undefined, {})).rejects.toMatchObject({ status: 400 });
   });
+  it('task99: billing.columns defaults, save, and validation', async () => {
+    const { business, root } = await createBusiness({ name: 'A' });
+    const c = ctx({ businessId: business.id, scopeBranchId: root.id, branchIds: [root.id], activeBranchId: root.id });
+    const d = await svc.getSettings(c);
+    expect(d['billing.columns']).toEqual({});
+    await svc.putSetting(c, 'billing.columns', undefined, { sell: ['karat', 'net', 'rate'] });
+    const s = await svc.getSettings(c);
+    expect(s['billing.columns']).toEqual({ sell: ['karat', 'net', 'rate'] });
+    await expect(svc.putSetting(c, 'billing.columns', undefined, { purchase: ['gross'] })).rejects.toBeTruthy(); // gross is a fixed column
+  });
 });
 
 describe('rate limits', () => {

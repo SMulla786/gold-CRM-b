@@ -265,8 +265,16 @@ export const INVOICE_PRINT_COLUMNS = [
   'hsn', 'karat', 'pcs', 'gross', 'less', 'net', 'tunch', 'wastage', 'fine', 'stone', 'rate', 'labour', 'other', 'disc', 'total',
 ] as const;
 
+/** task99: optional (show/hide) columns of the bill entry grid (BillForm OPTIONAL_COLS keys; Item/Gross/Total are fixed). */
+export const BILL_GRID_COLUMNS = [
+  'hsn', 'karat', 'pcs', 'less', 'tunch', 'wastage', 'net', 'fine', 'stone', 'rate', 'labour', 'unit', 'other', 'disc',
+  // purchase-only columns (original Supp item / Supp tag / Remark / HUID / RFID)
+  'suppItem', 'suppTag', 'remark', 'huid', 'rfid',
+] as const;
+export type BillGridColumn = (typeof BILL_GRID_COLUMNS)[number];
+
 /** TASK-98: printed bill formats (billing.invoice.format). A4_GST = the standard tax invoice. */
-export const INVOICE_FORMATS = ['A4_GST', 'A4_ESTIMATE', 'A5', 'THERMAL_80', 'THERMAL_58', 'A4_IMAGES'] as const;
+export const INVOICE_FORMATS = ['A4_GST', 'A4_ESTIMATE', 'A5', 'THERMAL_80', 'THERMAL_58', 'A4_IMAGES', 'A6'] as const;
 export type InvoiceFormat = (typeof INVOICE_FORMATS)[number];
 
 /** Every allowed setting key with its value schema. Value defaults = shop defaults when no row exists. */
@@ -354,6 +362,8 @@ export const SETTING_SCHEMAS = {
     showHsn: z.boolean().default(true),
     showSignature: z.boolean().default(true),
     showTerms: z.boolean().default(true),
+    /** original: show_metal_payment_weight — METAL payment rows print gross/fine/rate, not only the ₹ amount */
+    showMetalPaymentWeight: z.boolean().default(false),
   }),
   /** TASK-98 (original: metal_pay_rate_from_amount): on a metal payment row, type the ₹ amount and the rate is worked back as amount ÷ fine */
   'calc.metalPayRate': z.object({ fromAmount: z.boolean().default(false) }),
@@ -365,6 +375,12 @@ export const SETTING_SCHEMAS = {
     showOther: z.boolean().default(true),
     showAdvance: z.boolean().default(true),
     showReturn: z.boolean().default(true),
+  }),
+  /** task99 bill-grid visible optional columns per bill kind (replaces the per-browser 'ju.billcols').
+   *  Missing kind = not saved yet (BillForm falls back to the browser copy, then all columns). */
+  'billing.columns': z.object({
+    sell: z.array(z.enum(BILL_GRID_COLUMNS)).optional(),
+    purchase: z.array(z.enum(BILL_GRID_COLUMNS)).optional(),
   }),
 } as const;
 export type SettingKey = keyof typeof SETTING_SCHEMAS;

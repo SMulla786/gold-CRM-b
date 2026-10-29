@@ -104,6 +104,16 @@ for (const kind of ['logo', 'signature', 'watermark'] as const) {
     const rel = await saveInvoiceImage(req.ctx!, INVOICE_FIELD[kind], req.file.buffer);
     res.status(201).json({ url: `/api/app/files/invoice/${kind}`, path: rel });
   });
+  // TASK-98 Remove: same guard as upload; nulls the invoice.media field, then deletes its file (uuid-named and referenced
+  // only by this field — the same thing upload does to a replaced file). No file / no row → still 204.
+  appRouter.delete(`/settings/invoice/${kind}`, requirePermission(MISC, 'edit'), requireMpin, async (req, res) => {
+    const field = INVOICE_FIELD[kind];
+    const abs = await invoiceImagePath(req.ctx!, field).catch(() => null); // traversal-guarded absolute path, null when unset
+    const media = (await svc.getSettings(req.ctx!))['invoice.media'];
+    await svc.putSetting(req.ctx!, 'invoice.media', undefined, { ...media, [field]: null });
+    if (abs) await (await import('node:fs/promises')).rm(abs, { force: true }).catch(() => {});
+    res.status(204).end();
+  });
   appRouter.get(`/files/invoice/${kind}`, async (req, res) => {
     const abs = await invoiceImagePath(req.ctx!, INVOICE_FIELD[kind]);
     res.type(CONTENT_TYPE[path.extname(abs)] ?? 'application/octet-stream').sendFile(abs);
