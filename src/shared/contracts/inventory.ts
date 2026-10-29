@@ -174,21 +174,44 @@ export const stockRowInput = z.object({
   /** TASK-98: label code type (default BARCODE) + RFID EPC (unique per business) */
   codeType: z.enum(STOCK_CODE_TYPES).optional(),
   epcCode: epcCode.optional(),
+  /** group (C): money discount off the line total (total = metal value + labour + stone + other - discount, only when rate is given) */
+  discount: decimalInput.optional(),
+  /** group (C): entry method BOTH — this row's own method (required then; ignored for LOOSE/TAG entries) */
+  method: z.enum(['LOOSE', 'TAG']).optional(),
 });
+/** group (C) purchase "Elements / Stones" on a stock item (descriptive; stoneCharge carries the money). */
+export const stockStoneInput = z.object({
+  name: z.string().trim().min(1).max(60),
+  pcs: z.coerce.number().int().min(0).default(0),
+  weight: weight.default(0),
+  unit: z.enum(['CT', 'GM']).default('CT'),
+  rate: decimalInput.default(0),
+  amount: decimalInput.default(0),
+});
+export interface StockStoneDto {
+  id: number;
+  name: string;
+  pcs: number;
+  weight: string;
+  unit: 'CT' | 'GM';
+  rate: string;
+  amount: string;
+}
 export const stockEntryBody = z
   .object({
     stockClass,
-    /** LOOSE or TAG (BOTH is only an item-name setting) */
-    method: z.enum(['LOOSE', 'TAG']),
+    /** LOOSE or TAG for every row, or BOTH = each row carries its own method (group C) */
+    method: z.enum(['LOOSE', 'TAG', 'BOTH']),
     /** default = active branch (X-Branch-Id) */
     branchId: id.optional(),
     txnDate: z.coerce.date().optional(),
     rows: z.array(stockRowInput).min(1).max(500),
   })
-  .refine((b) => b.rows.every((r) => r.less <= r.gross), { message: 'less cannot exceed gross', path: ['rows'] });
+  .refine((b) => b.rows.every((r) => r.less <= r.gross), { message: 'less cannot exceed gross', path: ['rows'] })
+  .refine((b) => b.method !== 'BOTH' || b.rows.every((r) => r.method), { message: 'Pick Loose or Tag for every row', path: ['rows'] });
 
 /** TASK-98: epcCode null clears it. */
-export const updateStockItemBody = stockRowInput.omit({ itemNameId: true, tagNo: true }).partial().extend({ epcCode: epcCode.nullable().optional() });
+export const updateStockItemBody = stockRowInput.omit({ itemNameId: true, tagNo: true, method: true }).partial().extend({ epcCode: epcCode.nullable().optional() });
 
 /** Stock list status filter: a real status, or ALL = every status except DELETED. */
 export const STOCK_LIST_STATUSES = [...STOCK_STATUSES, 'ALL'] as const;
@@ -250,6 +273,11 @@ export interface StockItemDto {
   /** TASK-98 — always sent by the API (optional only so older hand-built literals keep compiling) */
   codeType?: StockCodeType;
   epcCode?: string | null;
+  /** group (C) — always sent by the API */
+  discount?: string;
+  total?: string | null;
+  /** group (C) purchase stones; sent on GET /stock/:id only */
+  stones?: StockStoneDto[];
 }
 
 /** GET /stock — totals are over ALL filtered rows, not just the page. */

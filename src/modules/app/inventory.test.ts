@@ -4,6 +4,7 @@ import { createBranch, createBusiness } from '../../../test/helpers/factory';
 import * as inv from './inventory';
 import * as acc from './accounts';
 import type { TenantContext } from '../../middleware/context';
+import { stockEntryBody } from '../../shared/contracts/inventory';
 
 const ctxFor = (businessId: number, branchId: number): TenantContext => ({
   userId: 1,
@@ -87,6 +88,36 @@ describe('stock entry + ledger core', () => {
   });
 });
 
+describe('INV-06 / INV-07 — entry method BOTH, line discount + total', () => {
+  it('BOTH: each row keeps its own method; only TAG rows get a tag; an item name that disallows the row method -> 400', async () => {
+    const s = await setup();
+    const both = await inv.createItemName(s.ctx, { groupId: s.group.id, name: 'Gold Chain', method: 'BOTH', tagPrefix: 'GC', tagDigits: 4 });
+    const entry = await inv.createStockEntry(s.ctx, { stockClass: 'GOLD', method: 'BOTH', rows: [row({ itemNameId: both.id, method: 'TAG' }), row({ itemNameId: both.id, method: 'LOOSE', pcs: 3 }), row({ itemNameId: s.itemName.id, method: 'TAG' })] });
+    expect(entry.items.map((i) => [i.method, i.tagNo])).toEqual([['TAG', 'GC0001'], ['LOOSE', null], ['TAG', 'GR0001']]);
+    await expect(inv.createStockEntry(s.ctx, { stockClass: 'GOLD', method: 'BOTH', rows: [row({ itemNameId: s.itemName.id, method: 'LOOSE' })] })).rejects.toMatchObject({ status: 400 });
+    await expect(inv.createStockEntry(s.ctx, { stockClass: 'GOLD', method: 'BOTH', rows: [row({ itemNameId: both.id })] })).rejects.toMatchObject({ status: 400 });
+    expect(stockEntryBody.safeParse({ stockClass: 'GOLD', method: 'BOTH', rows: [row({ itemNameId: both.id })] }).success).toBe(false);
+    // a row method on a plain TAG entry is ignored
+    const tag = await inv.createStockEntry(s.ctx, { stockClass: 'GOLD', method: 'TAG', rows: [row({ itemNameId: s.itemName.id, method: 'LOOSE' })] });
+    expect(tag.items[0]!.method).toBe('TAG');
+  });
+
+  it('discount comes off the line total; total feeds purchase cost + ledger amount; edit keeps the discount; discount > value -> 400', async () => {
+    const s = await setup();
+    const entry = await inv.createStockEntry(s.ctx, { stockClass: 'GOLD', method: 'TAG', rows: [row({ itemNameId: s.itemName.id, tunch: 100, rate: 100, labour: 5, discount: 30 }), row({ itemNameId: s.itemName.id, tunch: 100, discount: 30 })] });
+    const [a, b] = entry.items;
+    // 10 g × ₹100 + ₹5/g labour on 10 g − ₹30
+    expect([a!.discount, a!.total, a!.purchaseCost].map(Number)).toEqual([30, 1020, 1020]);
+    expect(b!.total).toBeNull(); // no rate → no total, no cost
+    const led = await db.ledgerEntry.findFirst({ where: { source: 'STOCK_INSERT', sourceId: String(entry.entryNo), stockItemId: a!.id } });
+    expect(Number(led!.amount)).toBe(1020);
+    await inv.updateStock(s.ctx, a!.id, { gross: 20 });
+    const edited = await inv.getStock(s.ctx, a!.id);
+    expect([edited.discount, edited.total].map(Number)).toEqual([30, 2070]);
+    await expect(inv.createStockEntry(s.ctx, { stockClass: 'GOLD', method: 'TAG', rows: [row({ itemNameId: s.itemName.id, tunch: 100, rate: 1, discount: 50 })] })).rejects.toMatchObject({ status: 400 });
+  });
+});
+
 describe('TASK-16b additions', () => {
   it('H1 updateItemName rejects a cross-tenant groupId -> 404', async () => {
     const s = await setup();
@@ -124,6 +155,23 @@ describe('TASK-25 Phase 2b — bulk + transfer', () => {
     }
     await inv.deleteStock(s.ctx, ids[0]!);
     await expect(inv.bulkEditStock(s.ctx, ids, { gross: 30 })).rejects.toMatchObject({ status: 409 });
+  });
+
+  it('bulk edit with only codeType sets it on every id and leaves other fields alone; epcCode -> 400', async () => {
+    const s = await setup();
+    const entry = await inv.createStockEntry(s.ctx, { stockClass: 'GOLD', method: 'TAG', rows: [row({ itemNameId: s.itemName.id, karatCode: '22K', labour: 12, rate: 6000 }), row({ itemNameId: s.itemName.id, karatCode: '22K', gross: 5, wastage: 2 })] });
+    const ids = entry.items.map((i) => i.id);
+    const before = await db.stockItem.findMany({ where: { id: { in: ids } }, orderBy: { id: 'asc' } });
+    expect((await inv.bulkEditStock(s.ctx, ids, { codeType: 'QR' })).updated).toBe(2);
+    const after = await db.stockItem.findMany({ where: { id: { in: ids } }, orderBy: { id: 'asc' } });
+    for (const [i, b] of before.entries()) {
+      const a = after[i]!;
+      expect(a.codeType).toBe('QR');
+      for (const k of ['pcs', 'gross', 'less', 'tunch', 'wastage', 'net', 'fine', 'stoneCharge', 'labour', 'labourUnit', 'other', 'rate', 'purchaseCost', 'karatCode', 'huid', 'remarks', 'epcCode'] as const) expect(String(a[k])).toBe(String(b[k]));
+    }
+    await expect(inv.bulkEditStock(s.ctx, ids, { epcCode: 'ABCDEF12' })).rejects.toMatchObject({ status: 400 });
+    await expect(inv.bulkEditStock(s.ctx, ids, { codeType: 'RFID', epcCode: null })).rejects.toMatchObject({ status: 400 });
+    expect((await db.stockItem.findMany({ where: { id: { in: ids } } })).every((r) => r.codeType === 'QR' && r.epcCode == null)).toBe(true);
   });
 
   it('bulk delete soft-deletes + reverses every id; a missing id -> 404', async () => {

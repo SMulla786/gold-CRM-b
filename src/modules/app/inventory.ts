@@ -226,6 +226,9 @@ const stockDto = (s: any, branchName: string, hsnCode: string | null): StockItem
   createdAt: s.createdAt.toISOString(),
   codeType: s.codeType,
   epcCode: s.epcCode ?? null,
+  discount: num(s.discount),
+  total: s.total != null ? num(s.total) : null,
+  ...(s.stones ? { stones: s.stones.map((x: any) => ({ id: x.id, name: x.name, pcs: x.pcs, weight: num(x.weight), unit: x.unit, rate: num(x.rate), amount: num(x.amount) })) } : {}),
 });
 
 async function decorateStock(ctx: TenantContext, items: any[]): Promise<StockItemDto[]> {
@@ -277,16 +280,19 @@ function resolveRow(row: any, itemName: any, touchByCode: Map<string, number>) {
   const line = computeLine({
     pcs: row.pcs, gross: row.gross, less: row.less, tunch, wastage: row.wastage,
     stoneCharge: row.stoneCharge, labour: row.labour, labourUnit: row.labourUnit, other: row.other,
-    rate: row.rate, rateUnitGrams: 1, basis: 'NET',
+    rate: row.rate, rateUnitGrams: 1, basis: 'NET', discount: row.discount ?? 0,
   });
   // Keep string/number weights as-is (no Number() round-trip for money/weights).
-  const purchaseCost: string | number | null = row.purchaseCost != null ? row.purchaseCost : row.rate != null ? line.total : null;
-  return { karatCode, tunch, net: line.net, fine: line.fine, purchaseCost };
+  const total = row.rate != null ? line.total : null;
+  // A negative total would become a negative purchase cost and ledger amount.
+  if (total != null && Number(total) < 0) throw new HttpError(400, 'VALIDATION', 'Discount cannot exceed the line total');
+  const purchaseCost: string | number | null = row.purchaseCost != null ? row.purchaseCost : total;
+  return { karatCode, tunch, net: line.net, fine: line.fine, purchaseCost, total };
 }
 
 // ───────────── Stock entry ─────────────
 
-export async function createStockEntry(ctx: TenantContext, body: { stockClass: StockClass; method: 'LOOSE' | 'TAG'; branchId?: number; txnDate?: Date; rows: any[] }): Promise<StockEntryResultDto> {
+export async function createStockEntry(ctx: TenantContext, body: { stockClass: StockClass; method: 'LOOSE' | 'TAG' | 'BOTH'; branchId?: number; txnDate?: Date; rows: any[] }): Promise<StockEntryResultDto> {
   const branchId = body.branchId ?? ctx.activeBranchId ?? ctx.scopeBranchId;
   if (branchId == null || !ctx.branchIds.includes(branchId)) throw new HttpError(404, 'NOT_FOUND', 'Branch not found');
   const sdb = scopedDb(ctx);
@@ -295,12 +301,15 @@ export async function createStockEntry(ctx: TenantContext, body: { stockClass: S
   const nameIds = [...new Set(body.rows.map((r) => r.itemNameId))];
   const itemNames = await sdb.itemName.findMany({ where: { id: { in: nameIds } }, include: { group: true } });
   const byId = new Map(itemNames.map((n) => [n.id, n]));
+  // BOTH entries: every row carries its own LOOSE/TAG (contract-enforced); otherwise the entry's method applies to all rows.
+  const methodOf = (r: any): 'LOOSE' | 'TAG' => (body.method === 'BOTH' ? r.method : body.method);
   for (const r of body.rows) {
     const n = byId.get(r.itemNameId);
     if (!n) throw new HttpError(404, 'NOT_FOUND', `Item name ${r.itemNameId} not found`);
     if (n.group.stockClass !== body.stockClass) throw new HttpError(400, 'VALIDATION', 'Item name does not match stock class');
-    if (n.method !== 'BOTH' && n.method !== body.method) throw new HttpError(400, 'VALIDATION', `Item "${n.name}" does not allow ${body.method}`);
-    if (body.method === 'TAG' && !r.tagNo && (!n.tagPrefix || !n.tagDigits)) throw new HttpError(400, 'VALIDATION', `Item "${n.name}" has no tag prefix/digits for auto-tagging`);
+    if (!methodOf(r)) throw new HttpError(400, 'VALIDATION', 'Pick Loose or Tag for every row');
+    if (n.method !== 'BOTH' && n.method !== methodOf(r)) throw new HttpError(400, 'VALIDATION', `Item "${n.name}" does not allow ${methodOf(r)}`);
+    if (methodOf(r) === 'TAG' && !r.tagNo && (!n.tagPrefix || !n.tagDigits)) throw new HttpError(400, 'VALIDATION', `Item "${n.name}" has no tag prefix/digits for auto-tagging`);
   }
   const touchByCode = new Map((await sdb.karatMapping.findMany({ select: { code: true, touch: true } })).map((k) => [k.code, Number(k.touch)]));
   const lctx = { businessId: ctx.businessId!, branchIds: ctx.branchIds, userId: ctx.userId };
@@ -311,15 +320,16 @@ export async function createStockEntry(ctx: TenantContext, body: { stockClass: S
     for (const row of body.rows) {
       const n = byId.get(row.itemNameId)!;
       const r = resolveRow(row, n, touchByCode);
-      const tagNo = body.method === 'TAG' ? (row.tagNo ?? (await nextTagNo(tx, ctx.businessId!, n.tagPrefix!, n.tagDigits!))) : null;
-      const pcs = body.method === 'TAG' ? (row.pcs ?? 1) : row.pcs;
+      const method = methodOf(row);
+      const tagNo = method === 'TAG' ? (row.tagNo ?? (await nextTagNo(tx, ctx.businessId!, n.tagPrefix!, n.tagDigits!))) : null;
+      const pcs = method === 'TAG' ? (row.pcs ?? 1) : row.pcs;
       const item = await tx.stockItem.create({
         data: {
-          businessId: ctx.businessId!, branchId, stockClass: body.stockClass, groupId: n.groupId, itemNameId: n.id, method: body.method,
+          businessId: ctx.businessId!, branchId, stockClass: body.stockClass, groupId: n.groupId, itemNameId: n.id, method,
           tagNo, huid: row.huid ?? null, karatCode: r.karatCode, pcs, gross: row.gross, less: row.less, net: r.net, tunch: r.tunch, wastage: row.wastage,
           fine: r.fine, stoneCharge: row.stoneCharge, labour: row.labour, labourUnit: row.labourUnit, other: row.other, rate: row.rate ?? null,
           purchaseCost: r.purchaseCost, status: 'AVAILABLE', source: 'STOCK_INSERT', sourceId: String(entryNo), entryNo, remarks: row.remarks ?? null, createdById: ctx.userId,
-          codeType: row.codeType ?? 'BARCODE', epcCode: row.epcCode ?? null,
+          codeType: row.codeType ?? 'BARCODE', epcCode: row.epcCode ?? null, discount: row.discount ?? 0, total: r.total,
         },
       });
       await ledger.post(tx, lctx, [{
@@ -369,7 +379,7 @@ export async function listStock(ctx: TenantContext, query: any): Promise<StockLi
 }
 
 export async function getStock(ctx: TenantContext, id: number): Promise<StockItemDto> {
-  const item = await scopedDb(ctx).stockItem.findUnique({ where: { id }, include: { group: true, itemName: true } });
+  const item = await scopedDb(ctx).stockItem.findUnique({ where: { id }, include: { group: true, itemName: true, stones: { orderBy: { id: 'asc' } } } });
   if (!item) throw new HttpError(404, 'NOT_FOUND', 'Stock item not found');
   return (await decorateStock(ctx, [item]))[0]!;
 }
@@ -407,9 +417,9 @@ const lctxOf = (ctx: TenantContext) => ({ businessId: ctx.businessId!, branchIds
 
 /** Recompute one item, reverse ALL its ledger rows (any source, so a transferred item nets to 0 at both branches), repost the fresh IN at its current branch. */
 async function applyStockEdit(tx: Prisma.TransactionClient, lctx: ledger.LedgerContext, item: any, body: any, touchByCode: Map<string, number>): Promise<void> {
-  const merged = { pcs: item.pcs, gross: numN(item.gross), less: numN(item.less), tunch: numN(item.tunch), wastage: numN(item.wastage), stoneCharge: numN(item.stoneCharge), labour: numN(item.labour), labourUnit: item.labourUnit, other: numN(item.other), rate: item.rate != null ? numN(item.rate) : undefined, purchaseCost: item.purchaseCost != null ? numN(item.purchaseCost) : undefined, karatCode: item.karatCode ?? undefined, huid: item.huid ?? undefined, remarks: item.remarks ?? undefined, codeType: item.codeType, epcCode: item.epcCode ?? undefined, ...body };
+  const merged = { pcs: item.pcs, gross: numN(item.gross), less: numN(item.less), tunch: numN(item.tunch), wastage: numN(item.wastage), stoneCharge: numN(item.stoneCharge), labour: numN(item.labour), labourUnit: item.labourUnit, other: numN(item.other), rate: item.rate != null ? numN(item.rate) : undefined, purchaseCost: item.purchaseCost != null ? numN(item.purchaseCost) : undefined, karatCode: item.karatCode ?? undefined, huid: item.huid ?? undefined, remarks: item.remarks ?? undefined, codeType: item.codeType, epcCode: item.epcCode ?? undefined, discount: numN(item.discount), ...body };
   const r = resolveRow(merged, item.itemName, touchByCode);
-  await tx.stockItem.update({ where: { id: item.id }, data: { pcs: merged.pcs, gross: merged.gross, less: merged.less, tunch: r.tunch, wastage: merged.wastage, net: r.net, fine: r.fine, stoneCharge: merged.stoneCharge, labour: merged.labour, labourUnit: merged.labourUnit, other: merged.other, rate: merged.rate ?? null, purchaseCost: r.purchaseCost, karatCode: r.karatCode, huid: merged.huid ?? null, remarks: merged.remarks ?? null, codeType: merged.codeType, epcCode: merged.epcCode ?? null } });
+  await tx.stockItem.update({ where: { id: item.id }, data: { pcs: merged.pcs, gross: merged.gross, less: merged.less, tunch: r.tunch, wastage: merged.wastage, net: r.net, fine: r.fine, stoneCharge: merged.stoneCharge, labour: merged.labour, labourUnit: merged.labourUnit, other: merged.other, rate: merged.rate ?? null, purchaseCost: r.purchaseCost, karatCode: r.karatCode, huid: merged.huid ?? null, remarks: merged.remarks ?? null, codeType: merged.codeType, epcCode: merged.epcCode ?? null, discount: merged.discount ?? 0, total: r.total } });
   await ledger.reverseForItem(tx, lctx, item.id);
   await ledger.post(tx, lctx, [{ branchId: item.branchId, asset: ledger.assetForStockClass(item.stockClass), direction: 'IN', karatCode: r.karatCode, pcs: merged.pcs, gross: merged.gross, net: r.net, fine: r.fine, amount: r.purchaseCost, source: 'STOCK_INSERT', sourceId: String(item.id), stockItemId: item.id, narration: `Edit stock item #${item.id}` }]);
 }
@@ -482,6 +492,8 @@ export async function removeStockPhoto(ctx: TenantContext, id: number): Promise<
 // ───────────── Bulk edit / delete (one tx, reuse the single-item path) ─────────────
 
 export async function bulkEditStock(ctx: TenantContext, ids: number[], patch: any): Promise<BulkResultDto> {
+  // EPC is unique per business — one value can never be applied to many items.
+  if (patch && 'epcCode' in patch) throw new HttpError(400, 'VALIDATION', 'EPC code cannot be bulk-edited — set it per item');
   return { updated: await editStock(ctx, [...new Set(ids)], patch) };
 }
 
