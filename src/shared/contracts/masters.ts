@@ -4,6 +4,7 @@
  */
 import { z } from 'zod';
 import { gstin, id, mobile, pageQuery } from './common';
+import { LEDGER_ASSETS, LEDGER_SOURCES } from '../enums';
 
 const optStr = (max = 200) => z.string().trim().max(max).optional().or(z.literal('').transform(() => undefined));
 const dateStr = z.coerce.date().optional();
@@ -272,6 +273,8 @@ export const BILL_GRID_COLUMNS = [
   'suppItem', 'suppTag', 'remark', 'huid', 'rfid',
 ] as const;
 export type BillGridColumn = (typeof BILL_GRID_COLUMNS)[number];
+/** task99: Day Book Settings page sizes. */
+export const DAYBOOK_PAGE_SIZES = [10, 50, 100] as const;
 
 /** TASK-98: printed bill formats (billing.invoice.format). A4_GST = the standard tax invoice. */
 export const INVOICE_FORMATS = ['A4_GST', 'A4_ESTIMATE', 'A5', 'THERMAL_80', 'THERMAL_58', 'A4_IMAGES', 'A6'] as const;
@@ -375,6 +378,15 @@ export const SETTING_SCHEMAS = {
     showOther: z.boolean().default(true),
     showAdvance: z.boolean().default(true),
     showReturn: z.boolean().default(true),
+  }),
+  /** task99 Day Book Settings (/app/daybook/settings) — presentation only: which asset column groups the
+   *  All-in-One / Summary show, the default source filter, the All-in-One page size, and the running-balance column. */
+  'daybook.prefs': z.object({
+    assets: z.array(z.enum(LEDGER_ASSETS)).default([...LEDGER_ASSETS]),
+    /** null = all sources */
+    defaultSource: z.enum(LEDGER_SOURCES).nullable().default(null),
+    pageSize: z.union([z.literal(10), z.literal(50), z.literal(100)]).default(50),
+    showRunningBalance: z.boolean().default(true),
   }),
   /** task99 bill-grid visible optional columns per bill kind (replaces the per-browser 'ju.billcols').
    *  Missing kind = not saved yet (BillForm falls back to the browser copy, then all columns). */

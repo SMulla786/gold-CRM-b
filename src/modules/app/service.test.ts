@@ -38,14 +38,19 @@ describe('settings resolution', () => {
     const c = ctx({ businessId: business.id, scopeBranchId: root.id, branchIds: [root.id] });
     await expect(svc.putSetting(c, 'nope.key', undefined, {})).rejects.toMatchObject({ status: 400 });
   });
-  it('task99: billing.columns defaults, save, and validation', async () => {
+  it('task99: daybook.prefs + billing.columns defaults, save, and validation', async () => {
     const { business, root } = await createBusiness({ name: 'A' });
     const c = ctx({ businessId: business.id, scopeBranchId: root.id, branchIds: [root.id], activeBranchId: root.id });
     const d = await svc.getSettings(c);
+    expect(d['daybook.prefs']).toEqual({ assets: ['MONEY', 'GOLD', 'SILVER', 'STONE', 'ARTIFICIAL', 'FRANCHISE'], defaultSource: null, pageSize: 50, showRunningBalance: true });
     expect(d['billing.columns']).toEqual({});
+    await svc.putSetting(c, 'daybook.prefs', undefined, { assets: ['MONEY', 'GOLD'], defaultSource: 'SELL_BILL', pageSize: 100, showRunningBalance: false });
     await svc.putSetting(c, 'billing.columns', undefined, { sell: ['karat', 'net', 'rate'] });
     const s = await svc.getSettings(c);
+    expect(s['daybook.prefs']).toEqual({ assets: ['MONEY', 'GOLD'], defaultSource: 'SELL_BILL', pageSize: 100, showRunningBalance: false });
     expect(s['billing.columns']).toEqual({ sell: ['karat', 'net', 'rate'] });
+    await expect(svc.putSetting(c, 'daybook.prefs', undefined, { pageSize: 20 })).rejects.toBeTruthy();
+    await expect(svc.putSetting(c, 'daybook.prefs', undefined, { assets: ['PLATINUM'] })).rejects.toBeTruthy();
     await expect(svc.putSetting(c, 'billing.columns', undefined, { purchase: ['gross'] })).rejects.toBeTruthy(); // gross is a fixed column
   });
 });
