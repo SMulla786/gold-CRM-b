@@ -5,9 +5,10 @@
 import { z } from 'zod';
 import { STOCK_CLASSES } from '../enums';
 import { id, pageQuery } from './common';
-import { CHARGE_UNITS, stockRowInput } from './inventory';
+import { CHARGE_UNITS, stockRowInput, stockStoneInput } from './inventory';
 import { decimalInput, METALS, PARTY_TYPES } from './masters';
 import type { PartyRefDto } from './masters';
+import type { StockStoneDto } from './inventory';
 
 export const BILL_KINDS = ['SELL', 'PURCHASE'] as const;
 export type BillKind = (typeof BILL_KINDS)[number];
@@ -55,6 +56,8 @@ export const billLineInput = z.object({
   saleRate: decimalInput.optional(),
   saleLabour: decimalInput.optional(),
   saleLabourUnit: z.enum(CHARGE_UNITS).optional(),
+  /** PURCHASE (group C): stone elements saved on the created stock item. Descriptive — stoneCharge stays the line's stone money. Ignored on SELL. */
+  stones: z.array(stockStoneInput).max(20).optional(),
   /** PURCHASE: HUID / RFID EPC / remark written onto the created stock item (same rules as New Stock). Ignored on SELL. */
   huid: stockRowInput.shape.huid,
   epcCode: stockRowInput.shape.epcCode,
@@ -193,6 +196,8 @@ export interface BillLineDto {
   huid?: string | null;
   epcCode?: string | null;
   remarks?: string | null;
+  /** PURCHASE (INV-12): the created stock item's stone elements (getBill only) */
+  stones?: StockStoneDto[];
 }
 
 export interface BillPaymentDto {

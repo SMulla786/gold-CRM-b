@@ -9,7 +9,7 @@ import { computeBill, computeLine, fineWeight, metalToMoney, moneyToMetal, netWe
 import type { BillBody, BillDto, BillKind, BillLineDto, BillListItemDto, BillPayInput, BillPaymentDto, BillType, LedgerSource, Paged, PartyRefDto, StockClass } from '../../../shared';
 import type { TenantContext } from '../../../middleware/context';
 import { getSettings } from '../service';
-import { nextTagNo } from '../inventory';
+import { nextTagNo, stoneDto } from '../inventory';
 import { docKey, formatBillNo, seriesStart } from './numbering';
 import { redeemInTx, redeemRateFor, reopenForBill } from '../schemes/service';
 
@@ -308,6 +308,8 @@ async function writeBillContents(tx: Prisma.TransactionClient, ctx: TenantContex
           pcs: r.pcs, gross: r.gross, less: r.less, net: r.calc.net, tunch: r.tunch, wastage: r.wastage, fine: r.calc.fine, stoneCharge: r.input.stoneCharge, labour: r.input.saleLabour ?? r.input.labour,
           labourUnit: r.input.saleLabourUnit ?? r.input.labourUnit, other: r.input.other, rate: r.input.saleRate ?? (r.input.rate || null), purchaseCost: r.calc.total, status: 'AVAILABLE', source: 'PURCHASE_BILL', sourceId: String(billId), createdById: ctx.userId,
           remarks: r.input.remarks ?? null, ...(r.input.epcCode ? { codeType: 'RFID' as const, epcCode: r.input.epcCode } : {}),
+          // INV-12: descriptive stone elements (stoneCharge above stays the line's stone money)
+          ...(r.input.stones?.length ? { stones: { create: r.input.stones.map((st) => ({ businessId: ctx.businessId!, ...st })) } } : {}),
         },
       });
       stockItemId = created.id;
@@ -562,7 +564,7 @@ export async function deleteBill(ctx: TenantContext, id: number, returnStock: bo
 
 // ───────────── List / get + DTO mappers ─────────────
 
-const lineDto = (i: any, stock?: Map<number, { huid: string | null; epcCode: string | null; remarks: string | null }>): BillLineDto => ({
+const lineDto = (i: any, stock?: Map<number, Pick<BillLineDto, 'huid' | 'epcCode' | 'remarks' | 'stones'>>): BillLineDto => ({
   id: i.id, stockItemId: i.stockItemId, itemNameId: i.itemNameId, stockClass: i.stockClass, description: i.description, hsnCode: i.hsnCode, tagNo: i.tagNo, karatCode: i.karatCode,
   pcs: i.pcs, gross: String(i.gross), less: String(i.less), net: String(i.net), tunch: String(i.tunch), wastage: String(i.wastage), fine: String(i.fine), stoneCharge: String(i.stoneCharge),
   rate: String(i.rate), labour: String(i.labour), labourUnit: i.labourUnit, other: String(i.other), discount: String(i.discount), discountUnit: i.discountUnit, metalAmount: String(i.metalAmount), labourAmount: String(i.labourAmount), total: String(i.total),
@@ -608,9 +610,9 @@ export async function getBill(ctx: TenantContext, id: number): Promise<BillDto> 
   const creator = (await userNames(ctx, bill.createdById != null ? [bill.createdById] : [])).get(bill.createdById!) ?? null;
   const baIds = [...new Set(bill.payments.map((p) => p.bankAccountId).filter((x): x is number => x != null))];
   const baMap = new Map((baIds.length ? await sdb.bankAccount.findMany({ where: { id: { in: baIds } }, select: { id: true, bankName: true } }) : []).map((b) => [b.id, b.bankName]));
-  // PURCHASE: the created stock items' HUID / RFID / remark, so an edit (which re-creates the stock) keeps them
+  // PURCHASE: the created stock items' HUID / RFID / remark / stones, so an edit (which re-creates the stock) keeps them
   const stockIds = bill.kind === 'PURCHASE' ? bill.items.map((i) => i.stockItemId).filter((x): x is number => x != null) : [];
-  const stockMap = new Map((stockIds.length ? await sdb.stockItem.findMany({ where: { id: { in: stockIds } }, select: { id: true, huid: true, epcCode: true, remarks: true } }) : []).map(({ id: sid, ...rest }) => [sid, rest]));
+  const stockMap = new Map((stockIds.length ? await sdb.stockItem.findMany({ where: { id: { in: stockIds } }, select: { id: true, huid: true, epcCode: true, remarks: true, stones: { orderBy: { id: 'asc' } } } }) : []).map(({ id: sid, stones, ...rest }) => [sid, { ...rest, stones: stones.map(stoneDto) }]));
   const jtIds = [...new Set(bill.payments.map((p) => p.jewelleryTypeId).filter((x): x is number => x != null))];
   const jtMap = new Map((jtIds.length ? await prisma.jewelleryType.findMany({ where: { id: { in: jtIds } }, select: { id: true, name: true } }) : []).map((t) => [t.id, t.name]));
   return {

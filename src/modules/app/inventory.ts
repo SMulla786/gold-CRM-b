@@ -8,6 +8,7 @@ import { logActivity } from '../../lib/activity';
 import { HttpError } from '../../middleware/error';
 import type { TenantContext } from '../../middleware/context';
 import { computeLine, stockRowInput } from '../../shared';
+import type { StockStoneDto } from '../../shared';
 import { stockImagePath } from './uploads';
 import type {
   BulkResultDto,
@@ -195,6 +196,8 @@ export async function updateItemName(ctx: TenantContext, itemNameId: number, bod
 
 // ───────────── Stock mapper + helpers ─────────────
 
+export const stoneDto = (x: any): StockStoneDto => ({ id: x.id, name: x.name, pcs: x.pcs, weight: num(x.weight), unit: x.unit, rate: num(x.rate), amount: num(x.amount) });
+
 const stockDto = (s: any, branchName: string, hsnCode: string | null): StockItemDto => ({
   id: s.id,
   branch: { id: s.branchId, name: branchName },
@@ -228,7 +231,7 @@ const stockDto = (s: any, branchName: string, hsnCode: string | null): StockItem
   epcCode: s.epcCode ?? null,
   discount: num(s.discount),
   total: s.total != null ? num(s.total) : null,
-  ...(s.stones ? { stones: s.stones.map((x: any) => ({ id: x.id, name: x.name, pcs: x.pcs, weight: num(x.weight), unit: x.unit, rate: num(x.rate), amount: num(x.amount) })) } : {}),
+  ...(s.stones ? { stones: s.stones.map(stoneDto) } : {}),
 });
 
 async function decorateStock(ctx: TenantContext, items: any[]): Promise<StockItemDto[]> {

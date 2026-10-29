@@ -83,3 +83,37 @@ describe('purchase line extras', () => {
     expect(bill.items[0]).toMatchObject({ supplierItem: null, supplierTag: null });
   });
 });
+
+describe('INV-12 purchase stones per item', () => {
+  const stones = [{ name: 'Ruby', pcs: 2, weight: 0.5, unit: 'CT', rate: 4000, amount: 2000 }, { name: 'CZ', pcs: 10 }];
+
+  it('stones land on the created stock item (tenant-tagged), are echoed by getBill + GET /stock/:id, and do not change the money', async () => {
+    const s = await setup();
+    const plain = await billing.createBill(s.ctx, purchase(s, { stoneCharge: 2000 }));
+    const bill = await billing.createBill(s.ctx, purchase(s, { stoneCharge: 2000, stones }));
+    expect(bill.final).toBe(plain.final); // descriptive: stoneCharge stays the line's stone money
+    expect(bill.items[0]!.stones!.map(({ id: _id, ...x }) => x)).toEqual([
+      { name: 'Ruby', pcs: 2, weight: '0.5', unit: 'CT', rate: '4000', amount: '2000' },
+      { name: 'CZ', pcs: 10, weight: '0', unit: 'CT', rate: '0', amount: '0' },
+    ]);
+    expect((await inv.getStock(s.ctx, bill.items[0]!.stockItemId!)).stones).toHaveLength(2);
+    expect(await db.stockItemStone.count({ where: { businessId: s.ctx.businessId! } })).toBe(2);
+    expect(plain.items[0]!.stones).toEqual([]);
+  });
+
+  it('edit re-creates the stock with the stones sent back; the deleted item keeps its own', async () => {
+    const s = await setup();
+    const bill = await billing.createBill(s.ctx, purchase(s, { stones }));
+    const edited = await billing.editBill(s.ctx, bill.id, purchase(s, { gross: 6, stones: [stones[0]] }));
+    expect(edited.items[0]!.stones!.map((x) => x.name)).toEqual(['Ruby']);
+    expect(await db.stockItemStone.count({ where: { stockItemId: bill.items[0]!.stockItemId! } })).toBe(2);
+  });
+
+  it('a blank stone name is rejected by the schema; stones on a sell line are ignored', async () => {
+    const s = await setup();
+    expect(() => purchase(s, { stones: [{ name: ' ' }] })).toThrow();
+    const bill = await billing.createBill(s.ctx, parse({ kind: 'SELL', billType: 'ROUGH', partyId: s.customer.id, items: [{ description: 'Ring', stockClass: 'GOLD', gross: 1, rate: 60000, stones }] }));
+    expect(bill.items[0]!.stones).toBeUndefined();
+    expect(await db.stockItemStone.count()).toBe(0);
+  });
+});
