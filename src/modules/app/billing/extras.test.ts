@@ -62,6 +62,24 @@ describe('bill list partyType filter', () => {
   });
 });
 
+describe('bill list kind / billType / min total filters (BILL-12)', () => {
+  it('kind separates sell from purchase; billType=ROUGH and minTotal narrow the list', async () => {
+    const s = await setup();
+    const line = (gross: number) => ({ itemNameId: s.itemName.id, gross, karatCode: '22K', rate: 5000 });
+    const big = await billing.createBill(s.ctx, parse({ kind: 'PURCHASE', billType: 'ROUGH', partyId: s.supplier.id, items: [line(10)] }));
+    const small = await billing.createBill(s.ctx, parse({ kind: 'PURCHASE', billType: 'ROUGH', partyId: s.supplier.id, items: [line(1)] }));
+    const gst = await billing.createBill(s.ctx, parse({ kind: 'PURCHASE', billType: 'GST', partyId: s.supplier.id, items: [line(1)] }));
+
+    expect((await list(s.ctx, { kind: 'SELL' })).total).toBe(0);
+    expect((await list(s.ctx, {})).total).toBe(3);
+    expect((await list(s.ctx, { billType: 'ROUGH' })).items.map((b) => b.id).sort()).toEqual([big.id, small.id].sort());
+    expect((await list(s.ctx, { billType: 'GST' })).items.map((b) => b.id)).toEqual([gst.id]);
+    // minTotal is inclusive and AND-ed with billType
+    expect((await list(s.ctx, { minTotal: big.final })).items.map((b) => b.id)).toEqual([big.id]);
+    expect((await list(s.ctx, { billType: 'GST', minTotal: big.final })).total).toBe(0);
+  });
+});
+
 describe('purchase default sale value', () => {
   const ledgerSnapshot = async (billId: number) => {
     const led = await db.ledgerEntry.findMany({ where: { source: 'PURCHASE_BILL', sourceId: String(billId) }, orderBy: { id: 'asc' } });
