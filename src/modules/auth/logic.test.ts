@@ -1,5 +1,16 @@
 import { describe, expect, it } from 'vitest';
-import { CORE_MODULES, buildPermissionMap, inSubtree, resolveAccess } from './logic';
+import { CORE_MODULES, buildPermissionMap, inSubtree, otpStubEnabled, resolveAccess } from './logic';
+
+describe('otpStubEnabled (ISS-14)', () => {
+  it('prints only in development with OTP_STUB=1', () => {
+    expect(otpStubEnabled('development', '1')).toBe(true);
+    expect(otpStubEnabled('development', undefined)).toBe(false);
+    expect(otpStubEnabled('development', '0')).toBe(false);
+    expect(otpStubEnabled('development', 'true')).toBe(false);
+    expect(otpStubEnabled('test', '1')).toBe(false);
+    expect(otpStubEnabled('production', '1')).toBe(false);
+  });
+});
 
 describe('buildPermissionMap', () => {
   const role = [{ key: 'billing.sell_bill', canView: true, canEdit: true, canDelete: false }];

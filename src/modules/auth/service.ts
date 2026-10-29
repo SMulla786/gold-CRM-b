@@ -6,7 +6,7 @@ import { HttpError } from '../../middleware/error';
 import { signAccessToken } from '../../middleware/auth';
 import { loadAccess } from '../../lib/access';
 import type { BranchRef, LoginResponse, MeDto, PermissionMap } from '../../shared';
-import { ALL_PERMISSIONS, buildPermissionMap } from './logic';
+import { ALL_PERMISSIONS, buildPermissionMap, otpStubEnabled } from './logic';
 
 const REFRESH_TTL_MS = env.REFRESH_TOKEN_TTL_DAYS * 86400000;
 const hashToken = (t: string): string => createHash('sha256').update(t).digest('hex');
@@ -172,7 +172,8 @@ export async function forgotPassword(loginStr: string): Promise<void> {
   if (!user) return; // no account enumeration
   const otp = String(randomInt(100000, 1000000));
   await prisma.otpCode.create({ data: { userId: user.id, purpose: 'PASSWORD_RESET', codeHash: await argon2.hash(otp), expiresAt: new Date(Date.now() + 10 * 60000) } });
-  if (env.NODE_ENV !== 'production') console.log(`[OTP stub] password reset for ${user.username}: ${otp}`);
+  // Terminal only: process.stdout.write bypasses the logger's file transports and the console.log tee in lib/fileLog.ts.
+  if (otpStubEnabled(env.NODE_ENV, env.OTP_STUB)) process.stdout.write(`[OTP stub] password reset for ${user.username}: ${otp}\n`);
 }
 
 export async function resetPassword(input: { login: string; otp: string; next: string }): Promise<void> {

@@ -9,6 +9,8 @@ const schema = z.object({
   ACCESS_TOKEN_TTL: z.string().default('15m'),
   REFRESH_TOKEN_TTL_DAYS: z.coerce.number().default(30),
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
+  /** '1' prints password-reset OTPs to the terminal (development only; see otpStubEnabled). */
+  OTP_STUB: z.string().optional(),
 });
 
 export const env = schema.parse(process.env);

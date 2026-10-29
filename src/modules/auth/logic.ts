@@ -26,6 +26,9 @@ export function buildPermissionMap(rolePerms: PermRow[], overrides: PermRow[]): 
   return map;
 }
 
+/** The no-SMS OTP stub prints only when explicitly asked for in development (never test, staging-as-production or production). */
+export const otpStubEnabled = (nodeEnv: string, flag: string | undefined): boolean => nodeEnv === 'development' && flag === '1';
+
 /** Subtree test on the materialised path, e.g. inSubtree('/1/4/9/', '/1/4/') === true. */
 export const inSubtree = (branchPath: string, rootPath: string): boolean => branchPath.startsWith(rootPath);
 
