@@ -1,0 +1,85 @@
+import { afterAll, beforeEach, describe, expect, it } from 'vitest';
+import { db, truncateAll } from '../../../../test/helpers/db';
+import { createBusiness } from '../../../../test/helpers/factory';
+import { billBody } from '../../../shared';
+import * as inv from '../inventory';
+import * as billing from './service';
+import type { TenantContext } from '../../../middleware/context';
+
+// Purchase Bill parity: Supp item / Supp tag kept on the bill line; HUID / RFID / Remark land on the created stock item.
+
+const ctxFor = (businessId: number, branchId: number): TenantContext => ({
+  userId: 1, level: 'ADMIN', isOwner: true, businessId,
+  scopeBranchId: branchId, branchIds: [branchId], activeBranchId: branchId,
+  readOnly: false, modules: ['billing', 'inventory', 'settings', 'daybook'], limits: null, permissions: {}, impersonatorId: null,
+});
+
+beforeEach(truncateAll);
+afterAll(() => db.$disconnect());
+
+const parse = (o: Record<string, unknown>) => billBody.parse(o);
+
+async function setup() {
+  const { business, root } = await createBusiness({ name: 'A' });
+  const ctx = ctxFor(business.id, root.id);
+  const [group] = await inv.createItemGroups(ctx, { stockClass: 'GOLD', names: ['Rings'], gstRate: 3 });
+  const itemName = await inv.createItemName(ctx, { groupId: group!.id, name: 'Gold Ring', method: 'TAG', tagPrefix: 'GR', tagDigits: 4 });
+  const supplier = await db.party.create({ data: { businessId: business.id, type: 'SUPPLIER', name: 'Supp', mobile: '9000000003', countryCode: '+91' } });
+  const customer = await db.party.create({ data: { businessId: business.id, type: 'CUSTOMER', name: 'Cust', mobile: '9000000001', countryCode: '+91' } });
+  return { ctx, itemName: itemName!, supplier, customer };
+}
+
+const purchase = (s: Awaited<ReturnType<typeof setup>>, line: Record<string, unknown>) =>
+  parse({ kind: 'PURCHASE', billType: 'ROUGH', partyId: s.supplier.id, items: [{ itemNameId: s.itemName.id, gross: 5, rate: 5000, ...line }] });
+
+describe('purchase line extras', () => {
+  it('supplier item / tag stay on the bill line; HUID, RFID EPC and remark go onto the stock item', async () => {
+    const s = await setup();
+    const bill = await billing.createBill(s.ctx, purchase(s, { supplierItem: 'Ladies ring 22k', supplierTag: 'SR-77', huid: 'ab12cd', epcCode: 'e2801170', remarks: 'from Mumbai lot' }));
+    // getBill echoes the stock item's HUID / RFID / remark so the edit form can send them back
+    expect(bill.items[0]).toMatchObject({ supplierItem: 'Ladies ring 22k', supplierTag: 'SR-77', huid: 'AB12CD', epcCode: 'E2801170', remarks: 'from Mumbai lot' });
+    const item = await db.stockItem.findUniqueOrThrow({ where: { id: bill.items[0]!.stockItemId! } });
+    expect(item).toMatchObject({ huid: 'AB12CD', codeType: 'RFID', epcCode: 'E2801170', remarks: 'from Mumbai lot' });
+  });
+
+  it('edit re-creates the stock with the same RFID EPC (the old, deleted item frees it)', async () => {
+    const s = await setup();
+    const line = { supplierItem: 'Ladies ring', huid: 'AB12CD', epcCode: 'E2801170', remarks: 'lot 1' };
+    const bill = await billing.createBill(s.ctx, purchase(s, line));
+    const edited = await billing.editBill(s.ctx, bill.id, purchase(s, { ...line, gross: 6, remarks: 'lot 1 (fixed)' }));
+    expect(edited.items[0]).toMatchObject({ supplierItem: 'Ladies ring', huid: 'AB12CD', epcCode: 'E2801170', remarks: 'lot 1 (fixed)', gross: '6' });
+    const old = await db.stockItem.findUniqueOrThrow({ where: { id: bill.items[0]!.stockItemId! } });
+    expect(old).toMatchObject({ status: 'DELETED', epcCode: null });
+  });
+
+  it('edit of a TAG purchase keeps its tag no. (was 409: the deleted old item still held the tag)', async () => {
+    const s = await setup();
+    const bill = await billing.createBill(s.ctx, purchase(s, { tagNo: 'GR9001' }));
+    const edited = await billing.editBill(s.ctx, bill.id, purchase(s, { tagNo: 'GR9001', gross: 6 }));
+    expect(edited.items[0]).toMatchObject({ tagNo: 'GR9001', gross: '6' });
+    expect(await db.stockItem.count({ where: { tagNo: 'GR9001', status: 'AVAILABLE' } })).toBe(1);
+  });
+
+  it('without the extras nothing changes (BARCODE, nulls)', async () => {
+    const s = await setup();
+    const bill = await billing.createBill(s.ctx, purchase(s, {}));
+    expect(bill.items[0]).toMatchObject({ supplierItem: null, supplierTag: null });
+    const item = await db.stockItem.findUniqueOrThrow({ where: { id: bill.items[0]!.stockItemId! } });
+    expect(item).toMatchObject({ huid: null, codeType: 'BARCODE', epcCode: null, remarks: null });
+  });
+
+  it('bad HUID / EPC are rejected by the schema; a duplicate EPC → 409 and no bill', async () => {
+    const s = await setup();
+    expect(() => purchase(s, { huid: 'ABC' })).toThrow();
+    expect(() => purchase(s, { epcCode: 'not-hex' })).toThrow();
+    await billing.createBill(s.ctx, purchase(s, { epcCode: 'E2801170' }));
+    await expect(billing.createBill(s.ctx, purchase(s, { epcCode: 'E2801170' }))).rejects.toMatchObject({ code: 'P2002' });
+    expect(await db.bill.count()).toBe(1);
+  });
+
+  it('supplier fields are ignored on a sell bill', async () => {
+    const s = await setup();
+    const bill = await billing.createBill(s.ctx, parse({ kind: 'SELL', billType: 'ROUGH', partyId: s.customer.id, items: [{ description: 'Ring', stockClass: 'GOLD', gross: 1, rate: 60000, supplierItem: 'x', supplierTag: 'y' }] }));
+    expect(bill.items[0]).toMatchObject({ supplierItem: null, supplierTag: null });
+  });
+});

@@ -5,7 +5,7 @@
 import { z } from 'zod';
 import { STOCK_CLASSES } from '../enums';
 import { id, pageQuery } from './common';
-import { CHARGE_UNITS } from './inventory';
+import { CHARGE_UNITS, stockRowInput } from './inventory';
 import { decimalInput, METALS, PARTY_TYPES } from './masters';
 import type { PartyRefDto } from './masters';
 
@@ -55,6 +55,13 @@ export const billLineInput = z.object({
   saleRate: decimalInput.optional(),
   saleLabour: decimalInput.optional(),
   saleLabourUnit: z.enum(CHARGE_UNITS).optional(),
+  /** PURCHASE: HUID / RFID EPC / remark written onto the created stock item (same rules as New Stock). Ignored on SELL. */
+  huid: stockRowInput.shape.huid,
+  epcCode: stockRowInput.shape.epcCode,
+  remarks: stockRowInput.shape.remarks,
+  /** PURCHASE: the supplier's own item name / tag no. (original "Supp item" / "Supp tag"); kept on the bill line, descriptive */
+  supplierItem: z.string().trim().max(120).optional(),
+  supplierTag: z.string().trim().max(30).optional(),
 });
 export type BillLineInput = z.infer<typeof billLineInput>;
 
@@ -71,6 +78,8 @@ export const billPaymentInput = z.discriminatedUnion('mode', [
     /** per settings rate unit; amount = fine × rate / unit */
     rate: decimalInput,
     remark: z.string().max(200).optional(),
+    /** group (C): jewellery type of the received metal (global or own business list); descriptive, sell/purchase bills only */
+    jewelleryTypeId: id.optional(),
   }),
 ]);
 export type BillPaymentInput = z.infer<typeof billPaymentInput>;
@@ -177,6 +186,13 @@ export interface BillLineDto {
   metalAmount: string;
   labourAmount: string;
   total: string;
+  /** PURCHASE: supplier's item name / tag no. (null on SELL) */
+  supplierItem?: string | null;
+  supplierTag?: string | null;
+  /** PURCHASE: the created stock item's HUID / RFID EPC / remark (getBill only) */
+  huid?: string | null;
+  epcCode?: string | null;
+  remarks?: string | null;
 }
 
 export interface BillPaymentDto {
@@ -194,6 +210,8 @@ export interface BillPaymentDto {
   remark: string | null;
   /** TASK-98: SCHEME payments — the redeemed enrollment */
   schemeEnrollmentId?: number | null;
+  /** group (C) METAL payments */
+  jewelleryType?: { id: number; name: string } | null;
   txnDate: string;
   isActive: boolean;
   createdAt: string;
