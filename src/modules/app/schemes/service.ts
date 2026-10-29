@@ -287,9 +287,9 @@ export const redeemRateFor = async (ctx: TenantContext, scheme: { type: string }
 
 /**
  * The redeem tx body (scheme page + TASK-98 bill SCHEME payments): lock, maturity, close, credit the party's udhar with the maturity value.
- * early 'auto' (bills) = withdraw when not matured yet. billId (bills) is stored with the pre-redeem status so the bill can reopen it.
+ * early 'auto' (bills) = withdraw when not matured yet. billId (bills) / justBillId (Just Bills) is stored with the pre-redeem status so the bill can reopen it.
  */
-export async function redeemInTx(tx: Prisma.TransactionClient, ctx: TenantContext, e: any, scheme: any, opts: { early: boolean | 'auto'; redeemRate: number; billId?: number }): Promise<Prisma.Decimal> {
+export async function redeemInTx(tx: Prisma.TransactionClient, ctx: TenantContext, e: any, scheme: any, opts: { early: boolean | 'auto'; redeemRate: number; billId?: number; justBillId?: number }): Promise<Prisma.Decimal> {
   const id = e.id;
   const gold = scheme.type === 'GOLD';
   // lock the row BEFORE reading payments, so a concurrent addPayment is either included here or blocked out (BUG-13)
@@ -302,7 +302,7 @@ export async function redeemInTx(tx: Prisma.TransactionClient, ctx: TenantContex
   const m = schemeMaturity({ type: scheme.type, payments: payments.map((p) => ({ amount: p.amount, fine: p.fine })), bonusType: scheme.bonusType, bonusValue: scheme.bonusValue, emiAmount: e.emiAmount, redeemRate: opts.redeemRate, rateUnitGrams: GOLD_UNIT, early });
   const r = await tx.schemeEnrollment.updateMany({
     where: { id, status: { in: ['ACTIVE', 'WON'] } },
-    data: { status: early ? 'WITHDRAWN' : 'CLOSED', redeemValue: m.maturityValue, redeemFine: gold ? m.maturity : null, redeemRate: gold ? opts.redeemRate : null, closedAt: new Date(), ...(opts.billId != null ? { redeemBillId: opts.billId, statusBeforeRedeem: status as any } : {}) },
+    data: { status: early ? 'WITHDRAWN' : 'CLOSED', redeemValue: m.maturityValue, redeemFine: gold ? m.maturity : null, redeemRate: gold ? opts.redeemRate : null, closedAt: new Date(), ...(opts.billId != null ? { redeemBillId: opts.billId, statusBeforeRedeem: status as any } : {}), ...(opts.justBillId != null ? { redeemJustBillId: opts.justBillId, statusBeforeRedeem: status as any } : {}) },
   });
   if (r.count !== 1) throw new HttpError(409, 'CONFLICT', 'Enrollment was just closed');
   // credit the customer (shop owes them the maturity value); a Sell Bill nets it like an order advance
@@ -319,6 +319,16 @@ export async function reopenForBill(tx: Prisma.TransactionClient, ctx: TenantCon
   await udhar.reverse(tx, lctxOf(ctx), { source: 'SCHEME', sourceId: String(enrollmentId) });
   await tx.schemeEnrollment.update({ where: { id: enrollmentId }, data: { status: e.statusBeforeRedeem, redeemValue: null, redeemFine: null, redeemRate: null, closedAt: null, redeemBillId: null, statusBeforeRedeem: null } });
   await logActivity(tx, ctx, { module: 'SCHEME', action: 'EDITED', entity: 'SchemeEnrollment', entityId: String(enrollmentId), summary: `Enrollment ${e.assignId} reopened (bill #${billId} undone)` });
+}
+
+/** Just Bill SCHEME payment undo (just bill delete) — mirrors reopenForBill but checks/clears redeemJustBillId. */
+export async function reopenForJustBill(tx: Prisma.TransactionClient, ctx: TenantContext, enrollmentId: number, justBillId: number): Promise<void> {
+  await lockEnrollment(tx, enrollmentId);
+  const e = await tx.schemeEnrollment.findUniqueOrThrow({ where: { id: enrollmentId } });
+  if (e.redeemJustBillId !== justBillId || e.statusBeforeRedeem == null) throw new HttpError(409, 'CONFLICT', 'Scheme enrollment was not redeemed by this just bill');
+  await udhar.reverse(tx, lctxOf(ctx), { source: 'SCHEME', sourceId: String(enrollmentId) });
+  await tx.schemeEnrollment.update({ where: { id: enrollmentId }, data: { status: e.statusBeforeRedeem, redeemValue: null, redeemFine: null, redeemRate: null, closedAt: null, redeemJustBillId: null, statusBeforeRedeem: null } });
+  await logActivity(tx, ctx, { module: 'SCHEME', action: 'EDITED', entity: 'SchemeEnrollment', entityId: String(enrollmentId), summary: `Enrollment ${e.assignId} reopened (just bill #${justBillId} deleted)` });
 }
 
 export async function listEnrollments(ctx: TenantContext, q: any): Promise<{ items: EnrollmentDto[]; total: number; page: number; pageSize: number }> {

@@ -5,7 +5,7 @@
 import { z } from 'zod';
 import { id, mobile, pageQuery } from './common';
 import { CHARGE_UNITS } from './inventory';
-import { billPaymentInput, DISCOUNT_UNITS } from './billing';
+import { billPayInput, DISCOUNT_UNITS } from './billing';
 import type { BillPaymentDto } from './billing';
 import { decimalInput } from './masters';
 import type { PartyRefDto } from './masters';
@@ -28,13 +28,11 @@ export const justBillLineInput = z.object({
 export type JustBillLineInput = z.infer<typeof justBillLineInput>;
 
 /**
- * TASK-98: Just Bill payments = billPaymentInput + UDHAR_ADVANCE (uses `amount` of the linked party's existing udhar credit,
- * 409 OVER_BALANCE if more; no cash/bank movement). billPaymentInput itself stays unchanged (order advances use it).
+ * TASK-98: Just Bill payments = the sell-bill pay input (billPayInput): CASH / ONLINE / METAL + the no-cash modes
+ * SCHEME (redeems the linked party's enrollment, uses `amount` of its value, 409 if more) and UDHAR_ADVANCE (uses `amount` of the
+ * party's existing udhar credit, 409 OVER_BALANCE if more). Neither no-cash mode moves cash/bank. billPaymentInput stays unchanged (order advances use it).
  */
-export const justBillPayInput = z.discriminatedUnion('mode', [
-  ...billPaymentInput.options,
-  z.object({ mode: z.literal('UDHAR_ADVANCE'), amount: decimalInput.positive(), remark: z.string().max(200).optional() }),
-]);
+export const justBillPayInput = billPayInput;
 export type JustBillPayInput = z.infer<typeof justBillPayInput>;
 
 export const justBillBody = z
@@ -48,7 +46,7 @@ export const justBillBody = z
     discount: decimalInput.default(0),
     discountUnit: z.enum(DISCOUNT_UNITS).default('FIXED'),
     gstPercent: z.coerce.number().min(0).max(28).default(0),
-    /** CASH / ONLINE / METAL (KACHA = old gold/silver received) + UDHAR_ADVANCE (party's credit) */
+    /** CASH / ONLINE / METAL (KACHA = old gold/silver received) + SCHEME (party's enrollment) + UDHAR_ADVANCE (party's credit) */
     payments: z.array(justBillPayInput).max(20).default([]),
     remark: z.string().trim().max(300).optional(),
   })
@@ -74,6 +72,8 @@ export interface JustBillLineDto {
   makingUnit: (typeof CHARGE_UNITS)[number];
   other: string;
   total: string;
+  /** line photo: GET /api/app/justbill/items/:id/photo (null when none) */
+  photoUrl?: string | null;
 }
 
 export interface JustBillListItemDto {

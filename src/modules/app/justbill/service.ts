@@ -11,6 +11,7 @@ import type { TenantContext } from '../../../middleware/context';
 import { getSettings } from '../service';
 import { computePayments, sumAmounts, type PayCalc } from '../billing/service';
 import { fyStartYear, formatBillNo } from '../billing/numbering';
+import { redeemInTx, redeemRateFor, reopenForJustBill } from '../schemes/service';
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
@@ -36,22 +37,50 @@ function justPaymentLedgerRow(pc: PayCalc, paymentId: number, justBillId: number
   return { ...base, asset: 'MONEY', bankAccountId: pc.bankAccountId ?? null, amount: pc.amount, narration: 'Just bill payment' };
 }
 
+const isNoCash = (pc: PayCalc) => pc.input.mode === 'SCHEME' || pc.input.mode === 'UDHAR_ADVANCE';
+
+/** Pre-tx (mirrors billing/service checkNoCashPays): each SCHEME enrollment in scope, this party's, used once; loads scheme + redeem rate onto the PayCalc. */
+async function checkSchemePays(ctx: TenantContext, partyId: number, payCalcs: PayCalc[]): Promise<void> {
+  const seen = new Set<number>();
+  for (const pc of payCalcs) {
+    if (pc.input.mode !== 'SCHEME') continue;
+    const enrollmentId = pc.input.enrollmentId;
+    if (seen.has(enrollmentId)) throw new HttpError(400, 'VALIDATION', 'The same scheme enrollment is used twice');
+    seen.add(enrollmentId);
+    const e = await scopedDb(ctx).schemeEnrollment.findUnique({ where: { id: enrollmentId } });
+    if (!e) throw new HttpError(404, 'NOT_FOUND', 'Enrollment not found');
+    if (e.partyId !== partyId) throw new HttpError(409, 'CONFLICT', 'Scheme enrollment belongs to another party');
+    pc.enrollment = e;
+    pc.scheme = await scopedDb(ctx).scheme.findUniqueOrThrow({ where: { id: e.schemeId } });
+    pc.redeemRate = await redeemRateFor(ctx, pc.scheme);
+  }
+}
+
 /**
- * TASK-98 Udhar advance on a Just Bill — mirrors billing/service postNoCashPays (UDHAR_ADVANCE half). No ledger row (nothing enters the shop);
- * the bill takes `amount` of the party's udhar credit as a +amount udhar row under sourceId `<justBillId>-A` (reversed by deleteJustBill).
- * Credit = −Σ party udhar amount excluding this just bill's own balance row (source JUST_BILL, sourceId `<id>`); over-balance → 409 OVER_BALANCE.
+ * TASK-98 no-cash pays on a Just Bill — mirrors billing/service postNoCashPays. No ledger row (nothing enters the shop):
+ * UDHAR_ADVANCE uses the party's credit; SCHEME first redeems the enrollment (credit = maturity value, redeemJustBillId set) and uses that.
+ * Either way the bill takes `amount` of the party's credit as a +amount udhar row under sourceId `<justBillId>-A` (reversed by deleteJustBill).
+ * Advance credit = −Σ party udhar amount excluding this just bill's own balance row (source JUST_BILL, sourceId `<id>`); over-balance / over-value → 409 OVER_BALANCE.
  */
-async function postAdvancePays(tx: Prisma.TransactionClient, ctx: TenantContext, jb: { id: number; billNo: string; branchId: number; partyId: number }, payCalcs: PayCalc[], txnDate: Date, lctx: ledger.LedgerContext): Promise<void> {
-  const adv = payCalcs.filter((pc) => pc.input.mode === 'UDHAR_ADVANCE');
-  if (!adv.length) return;
+async function postNoCashPays(tx: Prisma.TransactionClient, ctx: TenantContext, jb: { id: number; billNo: string; branchId: number; partyId: number }, payCalcs: PayCalc[], txnDate: Date, lctx: ledger.LedgerContext): Promise<void> {
+  const special = payCalcs.filter(isNoCash);
+  if (!special.length) return;
   await ledger.assertDaysOpen(tx, lctx, [{ branchId: jb.branchId, txnDate }]);
-  const advance = adv.reduce((a, pc) => a.plus(D(pc.amount)), new Prisma.Decimal(0));
-  await tx.$queryRaw`SELECT id FROM "Party" WHERE id = ${jb.partyId} FOR UPDATE`; // serialize concurrent uses of the same credit
-  const sum = await tx.udharEntry.aggregate({ where: { businessId: ctx.businessId!, partyId: jb.partyId, NOT: { source: 'JUST_BILL', sourceId: String(jb.id) } }, _sum: { amount: true } });
-  const credit = Prisma.Decimal.max(D(sum._sum.amount).negated(), 0);
-  if (advance.gt(credit)) throw new HttpError(409, 'CONFLICT', `Udhar advance available is ₹${credit.toFixed(2)}`, { code: 'OVER_BALANCE' });
-  for (const pc of adv) {
-    await udhar.post(tx, lctx, [{ branchId: jb.branchId, partyId: jb.partyId, txnDate, amount: D(pc.amount), source: 'JUST_BILL', sourceId: `${jb.id}-A`, narration: `${jb.billNo} udhar advance` }]);
+  const advance = special.filter((pc) => pc.input.mode === 'UDHAR_ADVANCE').reduce((a, pc) => a.plus(D(pc.amount)), new Prisma.Decimal(0));
+  if (advance.gt(0)) {
+    await tx.$queryRaw`SELECT id FROM "Party" WHERE id = ${jb.partyId} FOR UPDATE`; // serialize concurrent uses of the same credit
+    const sum = await tx.udharEntry.aggregate({ where: { businessId: ctx.businessId!, partyId: jb.partyId, NOT: { source: 'JUST_BILL', sourceId: String(jb.id) } }, _sum: { amount: true } });
+    const credit = Prisma.Decimal.max(D(sum._sum.amount).negated(), 0);
+    if (advance.gt(credit)) throw new HttpError(409, 'CONFLICT', `Udhar advance available is ₹${credit.toFixed(2)}`, { code: 'OVER_BALANCE' });
+  }
+  for (const pc of special) {
+    let narration = `${jb.billNo} udhar advance`;
+    if (pc.input.mode === 'SCHEME') {
+      const value = await redeemInTx(tx, ctx, pc.enrollment, pc.scheme, { early: 'auto', redeemRate: pc.redeemRate!, justBillId: jb.id });
+      if (D(pc.amount).gt(value)) throw new HttpError(409, 'CONFLICT', `Scheme ${pc.enrollment.assignId} value is ₹${value.toFixed(2)}`, { code: 'OVER_BALANCE' });
+      narration = `${jb.billNo} scheme ${pc.enrollment.assignId}`;
+    }
+    await udhar.post(tx, lctx, [{ branchId: jb.branchId, partyId: jb.partyId, txnDate, amount: D(pc.amount), source: 'JUST_BILL', sourceId: `${jb.id}-A`, narration }]);
   }
 }
 
@@ -87,7 +116,9 @@ export async function createJustBill(ctx: TenantContext, body: JustBillBody): Pr
     }
   });
   if (body.partyId == null && body.payments.some((p) => p.mode === 'UDHAR_ADVANCE')) throw new HttpError(400, 'VALIDATION', 'Link a party to use udhar advance');
+  if (body.partyId == null && body.payments.some((p) => p.mode === 'SCHEME')) throw new HttpError(400, 'VALIDATION', 'Link a party to use a scheme');
   const payCalcs = await computePayments(ctx, body.payments, s);
+  if (body.partyId != null) await checkSchemePays(ctx, body.partyId, payCalcs);
   const paid = sumAmounts(payCalcs);
   const billCalc = computeBill({ lineTotals: lineCalcs.map((l) => l.total), discount: body.discount, discountUnit: body.discountUnit, gstPercent: body.gstPercent, interState, roundTo: 1 });
   const bal = D(billCalc.final).minus(paid);
@@ -117,10 +148,10 @@ export async function createJustBill(ctx: TenantContext, body: JustBillBody): Pr
       const it = body.items[i]!;
       await tx.justBillItem.create({ data: { justBillId: jb.id, name: it.name, karat: it.karat ?? null, purity: it.purity ?? null, quantity: it.quantity, unit: it.unit, rate: it.rate, making: it.making, makingUnit: it.makingUnit, other: it.other, total: lineCalcs[i]!.total } });
     }
-    if (body.partyId != null) await postAdvancePays(tx, ctx, { id: jb.id, billNo, branchId, partyId: body.partyId }, payCalcs, billDate, lctx);
+    if (body.partyId != null) await postNoCashPays(tx, ctx, { id: jb.id, billNo, branchId, partyId: body.partyId }, payCalcs, billDate, lctx);
     for (const pc of payCalcs) {
-      const pay = await tx.justBillPayment.create({ data: { justBillId: jb.id, mode: pc.input.mode, bankAccountId: pc.bankAccountId ?? null, metal: pc.metal ?? null, metalForm: pc.metalForm ?? null, gross: pc.gross ?? null, net: pc.net ?? null, tunch: pc.tunch ?? null, fine: pc.fine ?? null, rate: pc.rate ?? null, amount: pc.amount, remark: pc.input.remark ?? null, txnDate: billDate, isActive: true, createdById: ctx.userId } });
-      if (pc.input.mode !== 'UDHAR_ADVANCE') await ledger.post(tx, lctx, [justPaymentLedgerRow(pc, pay.id, jb.id, branchId, billDate)]);
+      const pay = await tx.justBillPayment.create({ data: { justBillId: jb.id, mode: pc.input.mode, bankAccountId: pc.bankAccountId ?? null, metal: pc.metal ?? null, metalForm: pc.metalForm ?? null, gross: pc.gross ?? null, net: pc.net ?? null, tunch: pc.tunch ?? null, fine: pc.fine ?? null, rate: pc.rate ?? null, amount: pc.amount, remark: pc.input.remark ?? null, schemeEnrollmentId: pc.enrollment?.id ?? null, txnDate: billDate, isActive: true, createdById: ctx.userId } });
+      if (!isNoCash(pc)) await ledger.post(tx, lctx, [justPaymentLedgerRow(pc, pay.id, jb.id, branchId, billDate)]);
     }
     if (body.partyId != null && !bal.isZero()) {
       await udhar.post(tx, lctx, [{ branchId, partyId: body.partyId, txnDate: billDate, source: 'JUST_BILL', sourceId: String(jb.id), amount: bal, narration: billNo }]); // + = party owes (same sign as SELL)
@@ -140,18 +171,20 @@ export async function deleteJustBill(ctx: TenantContext, id: number): Promise<vo
   await prisma.$transaction(async (tx) => {
     const flipped = await tx.justBill.updateMany({ where: { id, status: 'ACTIVE' }, data: { status: 'DELETED', deletedAt: new Date() } });
     if (flipped.count !== 1) throw new HttpError(409, 'CONFLICT', 'Just bill is not active');
+    // reopen every enrollment this just bill's active SCHEME payments redeemed (mirrors billing reopenSchemes)
+    for (const p of jb.payments) if (p.mode === 'SCHEME' && p.isActive && p.schemeEnrollmentId != null) await reopenForJustBill(tx, ctx, p.schemeEnrollmentId, id);
     await tx.justBillPayment.updateMany({ where: { justBillId: id }, data: { isActive: false } });
     for (const p of jb.payments) await ledger.reverse(tx, lctx, { source: 'JUST_BILL', sourceId: `${id}-P${p.id}` });
     await udhar.reverse(tx, lctx, { source: 'JUST_BILL', sourceId: String(id) });
-    await udhar.reverse(tx, lctx, { source: 'JUST_BILL', sourceId: `${id}-A` }); // TASK-98 udhar advance uses
+    await udhar.reverse(tx, lctx, { source: 'JUST_BILL', sourceId: `${id}-A` }); // TASK-98 udhar advance / scheme uses
     await logActivity(tx, ctx, { module: 'JUST_BILL', action: 'DELETED', entity: 'JUST_BILL', entityId: String(id), summary: `Deleted just bill ${jb.billNo}` });
   });
 }
 
 // ───────────── DTO mappers + list/get ─────────────
 
-const lineDto = (i: any): JustBillLineDto => ({ id: i.id, name: i.name, karat: i.karat, purity: i.purity != null ? String(i.purity) : null, quantity: String(i.quantity), unit: i.unit, rate: String(i.rate), making: String(i.making), makingUnit: i.makingUnit, other: String(i.other), total: String(i.total) });
-const paymentDto = (p: any, baMap: Map<number, string>): BillPaymentDto => ({ id: p.id, mode: p.mode, bankAccount: p.bankAccountId != null ? { id: p.bankAccountId, name: baMap.get(p.bankAccountId) ?? '' } : null, metal: p.metal, metalForm: p.metalForm, gross: p.gross != null ? String(p.gross) : null, net: p.net != null ? String(p.net) : null, tunch: p.tunch != null ? String(p.tunch) : null, fine: p.fine != null ? String(p.fine) : null, rate: p.rate != null ? String(p.rate) : null, amount: String(p.amount), remark: p.remark, txnDate: dateOnly(p.txnDate), isActive: p.isActive, createdAt: p.createdAt.toISOString() });
+const lineDto = (i: any): JustBillLineDto => ({ id: i.id, name: i.name, karat: i.karat, purity: i.purity != null ? String(i.purity) : null, quantity: String(i.quantity), unit: i.unit, rate: String(i.rate), making: String(i.making), makingUnit: i.makingUnit, other: String(i.other), total: String(i.total), photoUrl: i.photoUrl ? `/api/app/justbill/items/${i.id}/photo` : null });
+const paymentDto = (p: any, baMap: Map<number, string>): BillPaymentDto => ({ id: p.id, mode: p.mode, bankAccount: p.bankAccountId != null ? { id: p.bankAccountId, name: baMap.get(p.bankAccountId) ?? '' } : null, metal: p.metal, metalForm: p.metalForm, gross: p.gross != null ? String(p.gross) : null, net: p.net != null ? String(p.net) : null, tunch: p.tunch != null ? String(p.tunch) : null, fine: p.fine != null ? String(p.fine) : null, rate: p.rate != null ? String(p.rate) : null, amount: String(p.amount), remark: p.remark, schemeEnrollmentId: p.schemeEnrollmentId ?? null, txnDate: dateOnly(p.txnDate), isActive: p.isActive, createdAt: p.createdAt.toISOString() });
 const partyRef = (p: any): PartyRefDto | null => (p ? { id: p.id, type: p.type, name: p.name, mobile: p.mobile, shopName: p.shopName } : null);
 const gramWeight = (items: any[]) => items.filter((i) => i.unit === 'GRAM').reduce((a, i) => a.plus(D(i.quantity)), new Prisma.Decimal(0)).toFixed(3);
 

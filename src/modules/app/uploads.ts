@@ -124,3 +124,12 @@ export async function saveGirviDoc(ctx: TenantContext, batchId: number, buffer: 
   return rel;
 }
 export const girviDocPath = (ctx: TenantContext, batchId: number): Promise<string> => imagePath(() => scopedGirviBatch(ctx, batchId), 'docUrl');
+
+// Just Bill line photo — JustBillItem has no tenant columns, so it is visible only when its just bill is in the caller's scope.
+async function scopedJustBillItem(ctx: TenantContext, itemId: number) {
+  const item = await prisma.justBillItem.findUnique({ where: { id: itemId } });
+  return item && (await scopedDb(ctx).justBill.findFirst({ where: { id: item.justBillId }, select: { id: true } })) ? item : null;
+}
+export const saveJustBillItemPhoto = (ctx: TenantContext, itemId: number, buffer: Buffer): Promise<string> =>
+  saveImage(ctx, () => scopedJustBillItem(ctx, itemId), (rel) => prisma.justBillItem.update({ where: { id: itemId }, data: { photoUrl: rel } }), 'justbill', 'photoUrl', buffer, 'Just bill item not found');
+export const justBillItemPhotoPath = (ctx: TenantContext, itemId: number): Promise<string> => imagePath(() => scopedJustBillItem(ctx, itemId), 'photoUrl');
