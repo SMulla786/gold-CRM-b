@@ -726,7 +726,7 @@ model TagSequence {
 
 /// One row = one tagged piece (TAG) or one loose lot (LOOSE, quantities decrease as it is sold/issued).
 model StockItem {
-  id           Int           @id @default(autoincrement())
+  id           Int              @id @default(autoincrement())
   businessId   Int
   branchId     Int
   stockClass   StockClass
@@ -736,21 +736,21 @@ model StockItem {
   tagNo        String?
   huid         String?
   karatCode    String?
-  pcs          Int           @default(0)
-  gross        Decimal       @default(0) @db.Decimal(14, 3)
-  less         Decimal       @default(0) @db.Decimal(14, 3)
-  net          Decimal       @default(0) @db.Decimal(14, 3)
-  tunch        Decimal       @default(0) @db.Decimal(6, 3)
-  wastage      Decimal       @default(0) @db.Decimal(6, 3)
-  fine         Decimal       @default(0) @db.Decimal(14, 3)
-  stoneCharge  Decimal       @default(0) @db.Decimal(14, 2)
-  labour       Decimal       @default(0) @db.Decimal(12, 2)
-  labourUnit   ChargeUnit    @default(PER_GRAM)
-  other        Decimal       @default(0) @db.Decimal(14, 2)
+  pcs          Int              @default(0)
+  gross        Decimal          @default(0) @db.Decimal(14, 3)
+  less         Decimal          @default(0) @db.Decimal(14, 3)
+  net          Decimal          @default(0) @db.Decimal(14, 3)
+  tunch        Decimal          @default(0) @db.Decimal(6, 3)
+  wastage      Decimal          @default(0) @db.Decimal(6, 3)
+  fine         Decimal          @default(0) @db.Decimal(14, 3)
+  stoneCharge  Decimal          @default(0) @db.Decimal(14, 2)
+  labour       Decimal          @default(0) @db.Decimal(12, 2)
+  labourUnit   ChargeUnit       @default(PER_GRAM)
+  other        Decimal          @default(0) @db.Decimal(14, 2)
   /// sale rate override (else today's rate); purchase cost for valuation/margin
-  rate         Decimal?      @db.Decimal(14, 2)
-  purchaseCost Decimal?      @db.Decimal(14, 2)
-  status       StockStatus   @default(AVAILABLE)
+  rate         Decimal?         @db.Decimal(14, 2)
+  purchaseCost Decimal?         @db.Decimal(14, 2)
+  status       StockStatus      @default(AVAILABLE)
   /// LedgerSource that created it (PURCHASE_BILL, IMPORT, STOCK_INSERT, ORDER_RECEIVE, STOCK_TRANSFER) + document id
   source       String
   sourceId     String?
@@ -760,18 +760,39 @@ model StockItem {
   remarks      String?
   soldAt       DateTime?
   createdById  Int?
-  createdAt    DateTime      @default(now())
-  updatedAt    DateTime      @updatedAt
+  createdAt    DateTime         @default(now())
+  updatedAt    DateTime         @updatedAt
   /// TASK-98: label code printed on the tag (BARCODE default); RFID items carry an EPC code (unique per business; NULLs distinct)
-  codeType     StockCodeType @default(BARCODE)
+  codeType     StockCodeType    @default(BARCODE)
   epcCode      String?
-  group        ItemGroup     @relation(fields: [groupId], references: [id])
-  itemName     ItemName      @relation(fields: [itemNameId], references: [id])
+  /// group (C): New Stock discount (money) and line total (metal value + labour + stone + other - discount; null when no rate)
+  discount     Decimal          @default(0) @db.Decimal(14, 2)
+  total        Decimal?         @db.Decimal(14, 2)
+  group        ItemGroup        @relation(fields: [groupId], references: [id])
+  itemName     ItemName         @relation(fields: [itemNameId], references: [id])
+  stones       StockItemStone[]
 
   @@unique([businessId, epcCode])
   @@unique([businessId, tagNo])
   @@index([businessId, branchId, stockClass, status])
   @@index([businessId, huid])
+}
+
+/// group (C) purchase "Elements / Stones" per item. Descriptive only: the item's stoneCharge carries the money (Σ amount).
+model StockItemStone {
+  id          Int       @id @default(autoincrement())
+  businessId  Int
+  stockItemId Int
+  name        String
+  pcs         Int       @default(0)
+  weight      Decimal   @default(0) @db.Decimal(14, 3)
+  /// CT or GM
+  unit        String    @default("CT")
+  rate        Decimal   @default(0) @db.Decimal(14, 2)
+  amount      Decimal   @default(0) @db.Decimal(14, 2)
+  stockItem   StockItem @relation(fields: [stockItemId], references: [id], onDelete: Cascade)
+
+  @@index([stockItemId])
 }
 
 /// Every money / stock movement in every module. Day-Book, asset ledgers, balances and dashboards read from here.
@@ -1014,6 +1035,9 @@ model BillItem {
   metalAmount  Decimal      @db.Decimal(14, 2)
   labourAmount Decimal      @db.Decimal(14, 2)
   total        Decimal      @db.Decimal(14, 2)
+  /// PURCHASE: the supplier's own item name / tag no. for this line (original "Supp item" / "Supp tag"), descriptive
+  supplierItem String?
+  supplierTag  String?
   bill         Bill         @relation(fields: [billId], references: [id], onDelete: Cascade)
 
   @@index([billId])
@@ -1043,6 +1067,8 @@ model BillPayment {
   udharTxnId         Int?
   /// SCHEME payments: the enrollment redeemed by this bill
   schemeEnrollmentId Int?
+  /// METAL payments (group C): jewellery type of the received metal, descriptive
+  jewelleryTypeId    Int?
   createdById        Int?
   createdAt          DateTime        @default(now())
   bill               Bill            @relation(fields: [billId], references: [id], onDelete: Cascade)
@@ -1183,31 +1209,35 @@ model JustBillItem {
   makingUnit ChargeUnit @default(PER_GRAM)
   other      Decimal    @default(0) @db.Decimal(14, 2)
   total      Decimal    @db.Decimal(14, 2)
+  /// optional line photo: /api/app/justbill/items/:id/photo
+  photoUrl   String?
   justBill   JustBill   @relation(fields: [justBillId], references: [id], onDelete: Cascade)
 
   @@index([justBillId])
 }
 
 model JustBillPayment {
-  id            Int             @id @default(autoincrement())
-  justBillId    Int
-  mode          BillPaymentMode
-  bankAccountId Int?
-  metal         MetalKind?
+  id                 Int             @id @default(autoincrement())
+  justBillId         Int
+  mode               BillPaymentMode
+  bankAccountId      Int?
+  metal              MetalKind?
   /// BULLION = metal received, KACHA = old gold/silver
-  metalForm     MetalForm?
-  gross         Decimal?        @db.Decimal(14, 3)
-  net           Decimal?        @db.Decimal(14, 3)
-  tunch         Decimal?        @db.Decimal(6, 3)
-  fine          Decimal?        @db.Decimal(14, 3)
-  rate          Decimal?        @db.Decimal(14, 2)
-  amount        Decimal         @db.Decimal(14, 2)
-  remark        String?
-  txnDate       DateTime        @db.Date
-  isActive      Boolean         @default(true)
-  createdById   Int?
-  createdAt     DateTime        @default(now())
-  justBill      JustBill        @relation(fields: [justBillId], references: [id], onDelete: Cascade)
+  metalForm          MetalForm?
+  gross              Decimal?        @db.Decimal(14, 3)
+  net                Decimal?        @db.Decimal(14, 3)
+  tunch              Decimal?        @db.Decimal(6, 3)
+  fine               Decimal?        @db.Decimal(14, 3)
+  rate               Decimal?        @db.Decimal(14, 2)
+  amount             Decimal         @db.Decimal(14, 2)
+  remark             String?
+  txnDate            DateTime        @db.Date
+  isActive           Boolean         @default(true)
+  /// SCHEME payments: the enrollment redeemed by this just bill
+  schemeEnrollmentId Int?
+  createdById        Int?
+  createdAt          DateTime        @default(now())
+  justBill           JustBill        @relation(fields: [justBillId], references: [id], onDelete: Cascade)
 
   @@index([justBillId])
 }
@@ -1669,6 +1699,8 @@ enum TradeSide {
 enum KachaProcessType {
   MELT
   REFINE
+  /// TASK-99: 'Send to process' batch — no ledger; a later REFINE (parentId) consumes it
+  PROCESS
 }
 
 enum BhavStatus {
@@ -1689,8 +1721,23 @@ model Exchange {
   txnDate       DateTime       @db.Date
   /// Σ line fine
   totalFine     Decimal        @db.Decimal(14, 3)
+  /// TASK-99: totalFine after the kacha round-off setting (null = saved before TASK-99)
+  exactFine     Decimal?       @db.Decimal(14, 3)
   /// signed ± adjustment
   diffFine      Decimal        @default(0) @db.Decimal(14, 3)
+  /// TASK-99: diff inputs — % of the WEIGHT|FINE base plus grams, each side (diffFine = plus − minus)
+  diffPctPlus   Decimal        @default(0) @db.Decimal(6, 3)
+  diffGmPlus    Decimal        @default(0) @db.Decimal(14, 3)
+  diffPctMinus  Decimal        @default(0) @db.Decimal(6, 3)
+  diffGmMinus   Decimal        @default(0) @db.Decimal(14, 3)
+  /// 'WEIGHT' | 'FINE' snapshot of exchange.defaults at save time
+  diffPlusBy    String?
+  diffMinusBy   String?
+  /// TASK-99: fine bullion moved the other way in the same exchange (BUY: shop gives, SELL: party gives)
+  givenFine     Decimal        @default(0) @db.Decimal(14, 3)
+  /// TASK-99: inline udhar jama/udhar + bhav cut posted with this exchange (shape: trade.ts inlineUdharInput / tradeBhavCutInput)
+  inlineUdhar   Json?
+  bhavCut       Json?
   /// totalFine + diffFine — the kacha fine that moves
   afterFine     Decimal        @db.Decimal(14, 3)
   /// settings units (gold /10 g, silver /1 kg); 0 = settled as metal credit
@@ -1713,13 +1760,19 @@ model Exchange {
 }
 
 model ExchangeLine {
-  id         Int      @id @default(autoincrement())
-  exchangeId Int
-  weight     Decimal  @db.Decimal(14, 3)
-  touch      Decimal  @db.Decimal(6, 3)
-  fine       Decimal  @db.Decimal(14, 3)
-  serialNo   String?
-  exchange   Exchange @relation(fields: [exchangeId], references: [id], onDelete: Cascade)
+  id           Int      @id @default(autoincrement())
+  exchangeId   Int
+  weight       Decimal  @db.Decimal(14, 3)
+  touch        Decimal  @db.Decimal(6, 3)
+  fine         Decimal  @db.Decimal(14, 3)
+  serialNo     String?
+  /// TASK-99 weighing block (weight stays the authoritative net)
+  grossWeight  Decimal? @db.Decimal(14, 3)
+  lessWeight   Decimal? @db.Decimal(14, 3)
+  meltWeight   Decimal? @db.Decimal(14, 3)
+  sampleWeight Decimal? @db.Decimal(14, 3)
+  sampleId     Int?
+  exchange     Exchange @relation(fields: [exchangeId], references: [id], onDelete: Cascade)
 
   @@index([exchangeId])
 }
@@ -1740,41 +1793,67 @@ model KachaProcess {
   /// inFine − outFine − ravalFine (process loss; negative = gain)
   difference  Decimal          @db.Decimal(14, 3)
   exchangeId  Int?
+  /// TASK-99: every exchange in this process / melt (exchangeId stays the first, for older readers)
+  exchangeIds Int[]            @default([])
+  /// TASK-99: REFINE of a PROCESS batch
+  parentId    Int?
+  /// TASK-99: gross kacha weight of the linked exchanges
+  kachaWeight Decimal?         @db.Decimal(14, 3)
+  /// TASK-99 REFINE: DIFFERENCE SELF, signed (+ gain / − loss the shop books itself); record only
+  selfDiff    Decimal          @default(0) @db.Decimal(14, 3)
   remark      String?
   reverted    Boolean          @default(false)
   createdById Int?
   createdAt   DateTime         @default(now())
 
   @@index([businessId, branchId, metal, txnDate])
+  @@index([parentId])
 }
 
 model BuySell {
-  id            Int           @id @default(autoincrement())
+  id            Int                   @id @default(autoincrement())
   businessId    Int
   branchId      Int
   buySellNo     Int
   side          TradeSide
   partyId       Int
   metal         MetalKind
-  txnDate       DateTime      @db.Date
+  txnDate       DateTime              @db.Date
   /// Σ line weight (bullion fine)
-  totalWeight   Decimal       @db.Decimal(14, 3)
-  discount      Decimal       @default(0) @db.Decimal(14, 2)
+  totalWeight   Decimal               @db.Decimal(14, 3)
+  discount      Decimal               @default(0) @db.Decimal(14, 2)
   /// Σ line amount − discount
-  totalAmount   Decimal       @db.Decimal(14, 2)
-  cash          Decimal       @default(0) @db.Decimal(14, 2)
-  online        Decimal       @default(0) @db.Decimal(14, 2)
+  totalAmount   Decimal               @db.Decimal(14, 2)
+  cash          Decimal               @default(0) @db.Decimal(14, 2)
+  online        Decimal               @default(0) @db.Decimal(14, 2)
   bankAccountId Int?
   bhavBookingId Int?
   narration     String?
+  /// TASK-99: inline udhar jama/udhar + bhav cut posted with this trade
+  inlineUdhar   Json?
+  bhavCut       Json?
   createdById   Int?
-  createdAt     DateTime      @default(now())
+  createdAt     DateTime              @default(now())
   lines         BuySellLine[]
+  /// TASK-99: delivered against several bhav bookings (bhavBookingId = the first, for older readers)
+  deliveries    BuySellBhavDelivery[]
 
   @@unique([businessId, branchId, buySellNo])
   @@index([businessId, branchId, txnDate])
   @@index([businessId, partyId])
   @@index([bhavBookingId])
+}
+
+/// TASK-99: weight of a buy-sell delivered against one bhav booking
+model BuySellBhavDelivery {
+  id        Int     @id @default(autoincrement())
+  buySellId Int
+  bookingId Int
+  weight    Decimal @db.Decimal(14, 3)
+  buySell   BuySell @relation(fields: [buySellId], references: [id], onDelete: Cascade)
+
+  @@index([buySellId])
+  @@index([bookingId])
 }
 
 model BuySellLine {
@@ -1920,6 +1999,8 @@ model SchemeEnrollment {
   closedAt           DateTime?
   /// TASK-98: set when a bill's SCHEME payment redeemed it — bill delete/edit reopens it to statusBeforeRedeem
   redeemBillId       Int?
+  /// set when a Just Bill's SCHEME payment redeemed it (separate from redeemBillId so a JustBill id never collides with a Bill id)
+  redeemJustBillId   Int?
   statusBeforeRedeem SchemeEnrollmentStatus?
   createdById        Int?
   createdAt          DateTime                @default(now())

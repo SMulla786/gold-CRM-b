@@ -49,7 +49,8 @@ export async function revertKacha(ctx: TenantContext, id: number): Promise<Kacha
     if (upd.count !== 1) throw new HttpError(409, 'CONFLICT', 'Already reverted');
     // Reverting removes the raval kacha that was added back — the pool must still hold it.
     if (D(kp.ravalFine).gt(0)) await assertKachaAvailable(tx, kp.branchId, kp.metal, kp.ravalFine);
-    await ledger.reverse(tx, lctx, { source: srcOf(kp.type), sourceId: String(id) });
+    // PROCESS batches post no ledger rows (schema KachaProcessType.PROCESS); only MELT/REFINE have rows to reverse.
+    if (kp.type !== 'PROCESS') await ledger.reverse(tx, lctx, { source: srcOf(kp.type), sourceId: String(id) });
     await logActivity(tx, ctx, { module: 'EXCHANGE', action: 'REVERSED', entity: 'KACHA', entityId: String(id), summary: `Reverted kacha ${kp.type} #${id}` });
   });
   return getKacha(ctx, id);

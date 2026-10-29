@@ -43,6 +43,7 @@ const TENANT_MODELS: Record<string, Scope> = {
   ItemGroup: 'business',
   ItemName: 'business',
   StockItem: 'branch',
+  StockItemStone: 'business',
   LedgerEntry: 'branch',
   IncomeExpense: 'branch',
   DayBook: 'branch',
