@@ -194,6 +194,25 @@ describe('reports activity + GST', () => {
     expect((await activity(ctx, { page: 1, pageSize: 20, q: 'inv-1' })).items.map((r) => r.entityId)).toEqual(['2']);
   });
 
+  it('activity entity + entityId filter = one record history (edit-history popup)', async () => {
+    const { business, root } = await createBusiness({ name: 'A' });
+    await db.activityLog.createMany({
+      data: [
+        { businessId: business.id, branchId: root.id, userId: 1, module: 'UDHAR', action: 'CREATED', entity: 'UdharTxn', entityId: '7', summary: 'Udhar #7' },
+        { businessId: business.id, branchId: root.id, userId: 1, module: 'UDHAR', action: 'EDITED', entity: 'UdharTxn', entityId: '7', summary: 'Edited udhar #7' },
+        { businessId: business.id, branchId: root.id, userId: 1, module: 'UDHAR', action: 'CREATED', entity: 'UdharTxn', entityId: '8', summary: 'Udhar #8' },
+        { businessId: business.id, branchId: root.id, userId: 1, module: 'GIRVI', action: 'CREATED', entity: 'GIRVI', entityId: '7', summary: 'Girvi #7' },
+      ],
+    });
+    const ctx = ctxFor(business.id, [root.id], root.id);
+    const res = await activity(ctx, { page: 1, pageSize: 20, entity: 'UdharTxn', entityId: '7' });
+    expect(res.items.map((r) => r.summary)).toEqual(['Edited udhar #7', 'Udhar #7']);
+    expect((await activity(ctx, { page: 1, pageSize: 20, entity: 'GIRVI' })).total).toBe(1);
+    // other business's rows stay out even with a matching entity
+    const B = await createBusiness({ name: 'B' });
+    expect((await activity(ctxFor(B.business.id, [B.root.id], B.root.id), { page: 1, pageSize: 20, entity: 'UdharTxn', entityId: '7' })).total).toBe(0);
+  });
+
   it('GST register lists ACTIVE GST bills with HSN codes; ROUGH excluded', async () => {
     const { business, root } = await createBusiness({ name: 'A' });
     const p = await party(business.id);

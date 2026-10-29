@@ -50,6 +50,9 @@ export const activityQuery = pageQuery.extend({
   module: z.string().optional(),
   action: z.enum(ACTIVITY_ACTIONS).optional(),
   userId: z.coerce.number().int().positive().optional(),
+  /** additive: one record's history (edit-history popup) — exact ActivityLog.entity / entityId as logActivity writes them (e.g. 'UdharTxn', 'GIRVI') */
+  entity: z.string().trim().min(1).max(40).optional(),
+  entityId: z.string().trim().min(1).max(40).optional(),
 });
 export interface ActivityDto {
   id: string;
