@@ -1,4 +1,4 @@
-import { rm } from 'node:fs/promises';
+import { rm, stat } from 'node:fs/promises';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { db, truncateAll } from '../../../../test/helpers/db';
 import { createBusiness } from '../../../../test/helpers/factory';
@@ -154,5 +154,35 @@ describe('girvi item photo (GIR-05)', () => {
     await expect(saveGirviItemPhoto(b.ctx, itemId, png)).rejects.toMatchObject({ status: 404 });
     await expect(girviItemPhotoPath(b.ctx, itemId)).rejects.toMatchObject({ status: 404 });
     await rm(await girviItemPhotoPath(s.ctx, itemId), { force: true });
+  });
+
+  it('C4: replacing the item clears its photo; the old path is kept in the activity meta and the file is not deleted; a new photo can follow', async () => {
+    const s = await setup();
+    const g = await loan(s);
+    const itemId = g.items[0]!.id;
+    const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0]);
+    const rel = await saveGirviItemPhoto(s.ctx, itemId, png);
+    const oldFile = await girviItemPhotoPath(s.ctx, itemId);
+
+    const r = await replace(s, g.id, itemId, {});
+    expect(r.items.find((i) => i.id === itemId)!.photoUrl).toBeNull();
+    expect(r.items.find((i) => i.id !== itemId)!.photoUrl).toBeNull(); // untouched sibling (never had one)
+    const log = await db.activityLog.findFirstOrThrow({ where: { entity: 'GIRVI', entityId: String(g.id), action: 'EDITED' } });
+    expect(log.meta).toEqual({ itemId, oldPhotoUrl: rel });
+    expect((await stat(oldFile)).isFile()).toBe(true);
+    await expect(girviItemPhotoPath(s.ctx, itemId)).rejects.toMatchObject({ status: 404 });
+
+    const rel2 = await saveGirviItemPhoto(s.ctx, itemId, png);
+    expect((await girvi.getGirvi(s.ctx, g.id, new Date())).items.find((i) => i.id === itemId)!.photoUrl).toBe(rel2);
+    await rm(oldFile, { force: true });
+    await rm(await girviItemPhotoPath(s.ctx, itemId), { force: true });
+  });
+
+  it('C4: replacing an item that never had a photo logs oldPhotoUrl null', async () => {
+    const s = await setup();
+    const g = await loan(s);
+    await replace(s, g.id, g.items[0]!.id, {});
+    const log = await db.activityLog.findFirstOrThrow({ where: { entity: 'GIRVI', entityId: String(g.id), action: 'EDITED' } });
+    expect(log.meta).toEqual({ itemId: g.items[0]!.id, oldPhotoUrl: null });
   });
 });
