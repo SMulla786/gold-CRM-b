@@ -2,7 +2,7 @@ import { Prisma } from '@prisma/client';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { db, truncateAll } from '../../../test/helpers/db';
 import { createBranch, createBusiness } from '../../../test/helpers/factory';
-import { billBody, exchangeBody, kachaProcessBody, openingBalanceBody } from '../../shared';
+import { addBillPaymentsBody, billBody, exchangeBody, kachaProcessBody, openingBalanceBody } from '../../shared';
 import { businessDate } from '../../lib/ledger';
 import { getOldMetalSummary } from './accounts';
 import { createOpeningBalances } from './opening';
@@ -147,32 +147,122 @@ describe('old metal summary (ACC-05)', () => {
   });
 });
 
-// Known gap (sent to the money owner, not fixed here): bill METAL payments in KACHA post to the pool without
-// assertKachaAvailable, so it can go negative. it.fails pins today's behaviour — flip each to it() with the fix.
-describe('kacha pool guard on bills (ACC-05 gap)', () => {
-  const sellKacha = (s: S, payments: unknown[] = [{ mode: 'METAL', metal: 'GOLD', metalForm: 'KACHA', gross: 2, tunch: 100, rate: 60000 }]) =>
+// ACC-05 (G2b): a bill write may never take a kacha pool below zero — purchase paid in kacha, later payments, edits on
+// the projected post-edit balance, deletes on the projected post-reversal balance (naming what used the kacha since).
+describe('kacha pool guard on bills (ACC-05)', () => {
+  const kachaPay = (gross: number) => ({ mode: 'METAL', metal: 'GOLD', metalForm: 'KACHA', gross, tunch: 100, rate: 60000 });
+  const sellKacha = (s: S, payments: unknown[] = [kachaPay(2)]) =>
     billBody.parse({ kind: 'SELL', billType: 'ROUGH', partyId: s.party.id, items: [{ description: 'Ring', stockClass: 'GOLD', gross: 10, rate: 60000 }], payments });
-
-  it.fails('a purchase bill paid in more kacha than the pool holds → 409', async () => {
-    const s = await setup();
+  async function purchaser(s: S) {
     const supplier = await db.party.create({ data: { businessId: s.business.id, type: 'SUPPLIER', name: 'Supp', mobile: '9000000003', countryCode: '+91' } });
     const [group] = await inv.createItemGroups(s.ctx, { stockClass: 'GOLD', names: ['Rings'], gstRate: 3 });
     const name = await inv.createItemName(s.ctx, { groupId: group!.id, name: 'Gold Ring', method: 'TAG', tagPrefix: 'GR', tagDigits: 4 });
-    const body = billBody.parse({ kind: 'PURCHASE', billType: 'ROUGH', partyId: supplier.id, items: [{ itemNameId: name!.id, gross: 5, rate: 5000 }], payments: [{ mode: 'METAL', metal: 'GOLD', metalForm: 'KACHA', gross: 3, tunch: 100, rate: 50000 }] });
-    await expect(billing.createBill(s.ctx, body)).rejects.toMatchObject({ status: 409 }); // today: created, card −3.000
+    return (payments: unknown[]) => billBody.parse({ kind: 'PURCHASE', billType: 'ROUGH', partyId: supplier.id, items: [{ itemNameId: name!.id, gross: 5, rate: 5000 }], payments });
+  }
+  const gold = async (s: S) => Object.fromEntries(await card(s)).GOLD;
+  const short = (available: string, needed: string) => ({ status: 409, details: { code: 'KACHA_SHORT', metal: 'GOLD', available, needed } });
+
+  it('purchase paid in kacha: more than the pool holds → 409 and nothing saved; within the pool → saved and drawn', async () => {
+    const s = await setup();
+    const purchase = await purchaser(s);
+    await expect(billing.createBill(s.ctx, purchase([kachaPay(3)]))).rejects.toMatchObject(short('0.000', '3.000'));
+    expect(await db.bill.count({ where: { businessId: s.business.id } })).toBe(0);
+    expect(await gold(s)).toBe('0.000');
+
+    await ex(s, 'BUY', 5);
+    await billing.createBill(s.ctx, purchase([kachaPay(3)]));
+    expect(await gold(s)).toBe('2.000');
   });
 
-  it.fails('deleting a sell bill whose kacha was already melted → 409', async () => {
+  it('a later kacha payment on a purchase bill: refused past the pool (bill + ledger untouched), accepted within it', async () => {
+    const s = await setup();
+    const purchase = await purchaser(s);
+    const b = await billing.createBill(s.ctx, purchase([{ mode: 'CASH', amount: 1000 }]));
+    await ex(s, 'BUY', 2);
+    await expect(billing.addBillPayments(s.ctx, b.id, addBillPaymentsBody.parse({ payments: [kachaPay(3)] }))).rejects.toMatchObject(short('2.000', '3.000'));
+    expect((await billing.getBill(s.ctx, b.id)).paid).toBe((await db.bill.findUniqueOrThrow({ where: { id: b.id } })).paid.toString());
+    expect(await db.billPayment.count({ where: { billId: b.id } })).toBe(1);
+    expect(await gold(s)).toBe('2.000');
+    await billing.addBillPayments(s.ctx, b.id, addBillPaymentsBody.parse({ payments: [kachaPay(2)] }));
+    expect(await gold(s)).toBe('0.000');
+  });
+
+  it('delete of a sell bill whose kacha was melted → 409 naming the melt, bill still ACTIVE; after the melt is reverted it deletes', async () => {
+    const s = await setup();
+    const b = await billing.createBill(s.ctx, sellKacha(s));
+    const melt = await proc(s, { type: 'MELT', inFine: 2, outFine: 1.9 });
+    const err = await billing.deleteBill(s.ctx, b.id, false).catch((e: unknown) => e);
+    expect(err).toMatchObject({ ...short('0.000', '2.000'), details: { usedBy: [{ source: 'EXCHANGE_MELT_PROCESS', fine: '2.000' }] } });
+    expect((err as Error).message).toMatch(/used since by EXCHANGE_MELT_PROCESS .* revert those first/);
+    expect((await db.bill.findUniqueOrThrow({ where: { id: b.id } })).status).toBe('ACTIVE');
+    expect(await db.billPayment.count({ where: { billId: b.id, isActive: true } })).toBe(1);
+
+    await kacha.revertKacha(s.ctx, melt.id);
+    await billing.deleteBill(s.ctx, b.id, false);
+    expect(await gold(s)).toBe('0.000');
+  });
+
+  it('delete is allowed when the pool still covers the reversal (other kacha came in meanwhile)', async () => {
+    const s = await setup();
+    const b = await billing.createBill(s.ctx, sellKacha(s));
+    await ex(s, 'BUY', 3);
+    await proc(s, { type: 'MELT', inFine: 2, outFine: 1.9 });
+    await billing.deleteBill(s.ctx, b.id, false);
+    expect(await gold(s)).toBe('1.000');
+  });
+
+  it('edit is checked on the projected post-edit balance: dropping melted kacha → 409 (bill unchanged); keeping it, or adding more on a sell, is fine', async () => {
     const s = await setup();
     const b = await billing.createBill(s.ctx, sellKacha(s));
     await proc(s, { type: 'MELT', inFine: 2, outFine: 1.9 });
-    await expect(billing.deleteBill(s.ctx, b.id, false)).rejects.toMatchObject({ status: 409 }); // today: deleted, card −2.000
+    await expect(billing.editBill(s.ctx, b.id, sellKacha(s, [{ mode: 'CASH', amount: 1000 }]))).rejects.toMatchObject({ status: 409, details: { code: 'KACHA_SHORT', usedBy: [{ source: 'EXCHANGE_MELT_PROCESS' }] } });
+    expect((await billing.getBill(s.ctx, b.id)).payments.map((p) => [p.mode, p.metalForm])).toEqual([['METAL', 'KACHA']]);
+    await expect(billing.editBill(s.ctx, b.id, sellKacha(s, [kachaPay(1)]))).rejects.toMatchObject({ status: 409 }); // 2 g → 1 g: still short
+
+    await billing.editBill(s.ctx, b.id, sellKacha(s, [kachaPay(2), { mode: 'CASH', amount: 1000 }]));
+    await billing.editBill(s.ctx, b.id, sellKacha(s, [kachaPay(3)]));
+    expect(await gold(s)).toBe('1.000');
   });
 
-  it.fails('editing a sell bill to drop a kacha payment that was already melted → 409', async () => {
+  it('edit of a purchase: paying more kacha than the pool holds → 409; the same kacha again is fine', async () => {
     const s = await setup();
-    const b = await billing.createBill(s.ctx, sellKacha(s));
-    await proc(s, { type: 'MELT', inFine: 2, outFine: 1.9 });
-    await expect(billing.editBill(s.ctx, b.id, sellKacha(s, [{ mode: 'CASH', amount: 1000 }]))).rejects.toMatchObject({ status: 409 });
+    const purchase = await purchaser(s);
+    await ex(s, 'BUY', 3);
+    const b = await billing.createBill(s.ctx, purchase([kachaPay(2)]));
+    await expect(billing.editBill(s.ctx, b.id, purchase([kachaPay(4)]))).rejects.toMatchObject(short('1.000', '2.000'));
+    await billing.editBill(s.ctx, b.id, purchase([kachaPay(2), { mode: 'CASH', amount: 500 }]));
+    expect(await gold(s)).toBe('1.000');
+  });
+
+  it('concurrency: two purchases racing for the same 3 g → exactly one saved; a bill racing a melt never overdraws', async () => {
+    const s = await setup();
+    const purchase = await purchaser(s);
+    await ex(s, 'BUY', 3);
+    const runs = await Promise.allSettled([billing.createBill(s.ctx, purchase([kachaPay(2)])), billing.createBill(s.ctx, purchase([kachaPay(2)]))]);
+    expect(runs.map((r) => r.status).sort()).toEqual(['fulfilled', 'rejected']);
+    expect(await gold(s)).toBe('1.000');
+
+    const race = await Promise.allSettled([billing.createBill(s.ctx, purchase([kachaPay(1)])), proc(s, { type: 'MELT', inFine: 1, outFine: 0.9 })]);
+    expect(race.map((r) => r.status).sort()).toEqual(['fulfilled', 'rejected']);
+    expect(await gold(s)).toBe('0.000');
+  });
+
+  it('an already negative pool (legacy data) blocks only writes that make it worse; a sell taking kacha in is fine', async () => {
+    const s = await setup();
+    const purchase = await purchaser(s);
+    await db.ledgerEntry.create({ data: { businessId: s.business.id, branchId: s.root.id, txnDate: businessDate(), asset: 'GOLD', metalForm: 'KACHA', direction: 'OUT', fine: 5, amount: 0, source: 'OPENING', sourceId: 'legacy' } });
+    await billing.createBill(s.ctx, sellKacha(s));
+    expect(await gold(s)).toBe('-3.000');
+    await expect(billing.createBill(s.ctx, purchase([kachaPay(1)]))).rejects.toMatchObject(short('-3.000', '1.000'));
+  });
+
+  it('pools are per branch and per business: kacha held elsewhere never funds this branch', async () => {
+    const s = await setup();
+    const purchase = await purchaser(s);
+    const branch2 = await createBranch({ businessId: s.business.id, parentId: s.root.id, name: 'B2', isAdminNode: false });
+    await ex({ ...s, ctx: ctxFor(s.business.id, branch2.id) }, 'BUY', 5);
+    const other = await setup('B');
+    await ex(other, 'BUY', 5);
+    await expect(billing.createBill(s.ctx, purchase([kachaPay(1)]))).rejects.toMatchObject(short('0.000', '1.000'));
   });
 });

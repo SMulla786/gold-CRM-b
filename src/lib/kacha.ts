@@ -31,14 +31,15 @@ export async function kachaBalance(client: Queryer, branchId: number, metal: Met
  * MUST run inside a $transaction (the xact lock releases on commit/rollback).
  */
 export async function assertKachaAvailable(tx: Queryer, branchId: number, metal: Metal, fine: Prisma.Decimal | string | number): Promise<void> {
+  const bal = await lockedKacha(tx, branchId, metal);
+  const need = new Prisma.Decimal(fine);
+  if (bal.lessThan(need)) throw new HttpError(409, 'CONFLICT', `Not enough kacha ${metal.toLowerCase()}: have ${bal.toString()}g, need ${need.toString()}g`);
+}
+
+/** Takes the per-(branch, metal) pool lock (held until the transaction ends) and returns the kacha fine balance. $transaction only. */
+export async function lockedKacha(tx: Queryer, branchId: number, metal: Metal): Promise<Prisma.Decimal> {
   // $executeRaw (not $queryRaw): the lock returns void, which $queryRaw can't deserialize. ::int4 — Prisma binds
   // JS numbers as bigint, and only the two-key pg_advisory_xact_lock(int4, int4) overload fits a (branch, metal) pair.
   await tx.$executeRaw(Prisma.sql`SELECT pg_advisory_xact_lock(${branchId}::int4, ${metalKey(metal)}::int4)`);
-  const rows = await tx.$queryRaw<{ bal: Prisma.Decimal }[]>(Prisma.sql`
-    SELECT COALESCE(SUM(CASE WHEN direction = 'IN' THEN fine ELSE -fine END), 0)::numeric AS bal
-    FROM "LedgerEntry"
-    WHERE "branchId" = ${branchId} AND asset::text = ${metal} AND "metalForm"::text = 'KACHA'`);
-  const bal = new Prisma.Decimal(rows[0]?.bal ?? 0);
-  const need = new Prisma.Decimal(fine);
-  if (bal.lessThan(need)) throw new HttpError(409, 'CONFLICT', `Not enough kacha ${metal.toLowerCase()}: have ${bal.toString()}g, need ${need.toString()}g`);
+  return new Prisma.Decimal((await kachaBalance(tx, branchId, metal)).kacha);
 }
