@@ -153,5 +153,22 @@ export interface StatementDto {
   closing: BalanceDto;
 }
 
-/** Pending bills (balance ≠ 0), both kinds. */
-export const pendingBillsQuery = pageQuery.extend({ partyId: id.optional(), type: z.enum(PARTY_TYPES).optional() });
+/** Pending bills (balance ≠ 0), both kinds. UDH-07: `kind` = Sale Only / Purchase Only tab; from–to on the bill date. */
+export const pendingBillsQuery = pageQuery.extend({
+  partyId: id.optional(),
+  type: z.enum(PARTY_TYPES).optional(),
+  kind: z.enum(['SELL', 'PURCHASE']).optional(), // = BILL_KINDS (billing.ts), inlined so this section needs no new import
+  from: z.coerce.date().optional(),
+  to: z.coerce.date().optional(),
+});
+
+/**
+ * UDH-07 summary cards over EVERY bill matching the filters (not just the page). Rupees only (BILL-15 R4).
+ * Each due = final − paid, the list's Due Balance; totalDue = saleDue + purchaseDue (the sum of that column).
+ */
+export interface PendingBillsSummaryDto {
+  count: number;
+  saleDue: string;
+  purchaseDue: string;
+  totalDue: string;
+}

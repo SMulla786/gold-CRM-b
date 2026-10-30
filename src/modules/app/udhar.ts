@@ -15,6 +15,7 @@ import type {
   PartyRefDto,
   PartyType,
   Paged,
+  PendingBillsSummaryDto,
   StatementDto,
   InlineUdharInput,
   TradeUdharDto,
@@ -561,9 +562,13 @@ function summarizeItems(items: { description: string; pcs: number }[]): string {
 }
 
 /** Pending bills (balance ≠ 0), both kinds. Reads Bill (empty until billing lands). */
-export async function pendingBills(ctx: TenantContext, q: { page: number; pageSize: number; q?: string; partyId?: number; type?: PartyType }): Promise<Paged<BillListItemDto>> {
+export async function pendingBills(
+  ctx: TenantContext,
+  q: { page: number; pageSize: number; q?: string; partyId?: number; type?: PartyType; kind?: 'SELL' | 'PURCHASE'; from?: Date; to?: Date },
+): Promise<Paged<BillListItemDto> & { summary: PendingBillsSummaryDto }> {
   const sdb = scopedDb(ctx);
-  if (ctx.branchIds.length === 0) return { items: [], total: 0, page: q.page, pageSize: q.pageSize };
+  const noSummary: PendingBillsSummaryDto = { count: 0, saleDue: '0.00', purchaseDue: '0.00', totalDue: '0.00' };
+  if (ctx.branchIds.length === 0) return { items: [], total: 0, page: q.page, pageSize: q.pageSize, summary: noSummary };
   // Pending = ACTIVE bill with final ≠ paid (a column-vs-column comparison Prisma can't express through the scoped client),
   // so resolve the matching ids with a scoped raw query (type filters on the party via a join), then page them normally.
   const conds: Prisma.Sql[] = [
@@ -574,13 +579,24 @@ export async function pendingBills(ctx: TenantContext, q: { page: number; pageSi
   ];
   if (q.partyId) conds.push(Prisma.sql`b."partyId" = ${q.partyId}`);
   if (q.type) conds.push(Prisma.sql`p.type::text = ${q.type}`);
+  if (q.kind) conds.push(Prisma.sql`b.kind::text = ${q.kind}`);
+  // bill date range, same business-day rule as the bill list (billing listBills)
+  if (q.from) conds.push(Prisma.sql`b."billDate" >= ${dateOnly(ledger.businessDate(q.from))}::date`);
+  if (q.to) conds.push(Prisma.sql`b."billDate" <= ${dateOnly(ledger.businessDate(q.to))}::date`);
   if (q.q) {
     const kw = `%${q.q}%`;
     conds.push(Prisma.sql`(b."billNo" ILIKE ${kw} OR p.name ILIKE ${kw} OR p.mobile ILIKE ${kw})`);
   }
   const join = q.type || q.q ? Prisma.sql`JOIN "Party" p ON p.id = b."partyId"` : Prisma.empty;
-  const ids = (await prisma.$queryRaw<{ id: number }[]>(Prisma.sql`SELECT b.id FROM "Bill" b ${join} WHERE ${Prisma.join(conds, ' AND ')}`)).map((r) => r.id);
-  if (ids.length === 0) return { items: [], total: 0, page: q.page, pageSize: q.pageSize };
+  const rows = await prisma.$queryRaw<{ id: number; kind: string; due: string }[]>(
+    Prisma.sql`SELECT b.id, b.kind::text AS kind, (b.final - b.paid)::text AS due FROM "Bill" b ${join} WHERE ${Prisma.join(conds, ' AND ')}`,
+  );
+  const ids = rows.map((r) => r.id);
+  // UDH-07 cards over every matching bill (not just this page), in rupees (BILL-15 R4); due = final − paid as in the list
+  const dueOf = (kind: string) => rows.filter((r) => r.kind === kind).reduce((a, r) => a.plus(r.due), D(0));
+  const [saleDue, purchaseDue] = [dueOf('SELL'), dueOf('PURCHASE')];
+  const summary: PendingBillsSummaryDto = { count: rows.length, saleDue: money(saleDue), purchaseDue: money(purchaseDue), totalDue: money(saleDue.plus(purchaseDue)) };
+  if (ids.length === 0) return { items: [], total: 0, page: q.page, pageSize: q.pageSize, summary };
 
   const bills = await sdb.bill.findMany({
     where: { id: { in: ids } },
@@ -611,7 +627,7 @@ export async function pendingBills(ctx: TenantContext, q: { page: number; pageSi
     createdBy: b.createdById != null ? (creatorMap.get(b.createdById) ?? null) : null,
     createdAt: b.createdAt.toISOString(),
   }));
-  return { items, total: ids.length, page: q.page, pageSize: q.pageSize };
+  return { items, total: ids.length, page: q.page, pageSize: q.pageSize, summary };
 }
 
 // ───────────── helpers ─────────────
