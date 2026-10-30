@@ -1,6 +1,7 @@
 import argon2 from 'argon2';
 import type { Prisma } from '@prisma/client';
 import { prisma } from '../../lib/prisma';
+import { checkedGeo } from '../../lib/geo';
 import { signAccessToken } from '../../middleware/auth';
 import { HttpError } from '../../middleware/error';
 import { buildMe } from '../auth/service';
@@ -290,8 +291,10 @@ export async function businessDetail(businessId: number): Promise<BusinessDetail
   };
 }
 
-export async function updateBusiness(businessId: number, body: Record<string, unknown>): Promise<BusinessDetailDto> {
-  await prisma.business.update({ where: { id: businessId }, data: body });
+export async function updateBusiness(businessId: number, body: Record<string, unknown> & { stateId?: number | null; districtId?: number | null }): Promise<BusinessDetailDto> {
+  const current = await prisma.business.findUnique({ where: { id: businessId }, select: { stateId: true, districtId: true } });
+  if (!current) throw new HttpError(404, 'NOT_FOUND', 'Business not found');
+  await prisma.business.update({ where: { id: businessId }, data: { ...body, ...(await checkedGeo(body, current)) } });
   return businessDetail(businessId);
 }
 
@@ -480,6 +483,7 @@ async function provisionBusiness(
   },
 ): Promise<{ id: number }> {
   const plan = await tx.plan.findUniqueOrThrow({ where: { id: data.planId } });
+  await checkedGeo({ stateId: data.stateId, districtId: data.districtId }); // create + signup approval
   const business = await tx.business.create({
     data: { name: data.name, ownerName: data.ownerName, mobile: data.mobile, alternateMobile: data.alternateMobile ?? null, email: data.email ?? null, gstin: data.gstin ?? null, address: data.address ?? null, stateId: data.stateId ?? null, districtId: data.districtId ?? null },
   });

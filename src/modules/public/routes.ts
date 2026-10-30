@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import { prisma } from '../../lib/prisma';
+import { checkedGeo } from '../../lib/geo';
 import { id as idSchema, signupBody } from '../../shared';
 import type { GeoDto, SignupRequestDto } from '../../shared';
 
@@ -18,6 +19,7 @@ publicRouter.get('/states/:id/districts', async (req, res) => {
 
 publicRouter.post('/signup', async (req, res) => {
   const b = signupBody.parse(req.body);
+  await checkedGeo({ stateId: b.stateId, districtId: b.districtId }); // a bad pair would only fail later, at approval
   const row = await prisma.signupRequest.create({
     data: {
       shopName: b.shopName,

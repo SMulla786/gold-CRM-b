@@ -48,8 +48,8 @@ describe('branch dialog details (ADM-05)', () => {
     expect(await db.branch.count({ where: { businessId: s.business.id } })).toBe(1);
   });
 
-  // Known gap (sent to the lead): state/district ids are not checked — an unknown id hits the FK (P2003, unmapped → 500)
-  // and a district from another state is saved as is. it.fails pins it; flip with the fix.
+  // regression: state/district ids were not checked — an unknown id hit the FK (P2003, unmapped → 500) and a district
+  // from another state was saved as is (lib/geo.ts checkedGeo; business create/update in test/admin/business-geo.test.ts)
   it('an unknown state id → 400', async () => {
     const s = await setup();
     const res = await api.post('/api/admin/branches').set('Authorization', s.auth).send({ parentId: s.root.id, name: 'X Branch', stateId: 99 });
