@@ -175,6 +175,24 @@ describe('orders', () => {
     expect((await orders.listOrders(s.ctx, { ...page, statuses: ['PENDING'] })).total).toBe(0);
     expect((await orders.listOrders(s.ctx, { ...page, status: 'CANCELLED', statuses: ['IN_PROCESS', 'CANCELLED'] })).items.map((o) => o.id)).toEqual([o2.id]);
   });
+  it('task99: list q searches order no / party name / party mobile / item name', async () => {
+    const s = await setup();
+    const other = await db.party.create({ data: { businessId: s.business.id, type: 'CUSTOMER', name: 'Ramesh Patil', mobile: '9876543210', countryCode: '+91' } });
+    const [group] = await inv.createItemGroups(s.ctx, { stockClass: 'GOLD', names: ['Chains'], gstRate: 3 });
+    const chain = await inv.createItemName(s.ctx, { groupId: group!.id, name: 'Rope Chain', method: 'TAG', tagPrefix: 'RC', tagDigits: 4 });
+    const o1 = await makeOrder(s.ctx, s.itemName.id, s.customer.id);
+    const o2 = await makeOrder(s.ctx, chain!.id, other.id);
+    const page = { page: 1, pageSize: 20 };
+    const ids = async (q: string) => (await orders.listOrders(s.ctx, { ...page, q })).items.map((o) => o.id).sort();
+    expect(await ids(String(o2.orderNo))).toEqual([o2.id]);
+    expect(await ids(`#${o1.orderNo}`)).toEqual([o1.id]);
+    expect(await ids('ramesh')).toEqual([o2.id]);
+    expect(await ids('98765')).toEqual([o2.id]);
+    expect(await ids('rope')).toEqual([o2.id]);
+    expect(await ids('gold ring')).toEqual([o1.id]);
+    expect(await ids('zzz-nothing')).toEqual([]);
+    expect((await orders.listOrders(s.ctx, { ...page, q: '  ' })).total).toBe(2); // blank q = no filter
+  });
   it('TASK-98: next-no peeks without consuming (two calls equal, then create gets it); next-tag peek likewise', async () => {
     const s = await setup();
     expect((await orders.peekNextOrderNo(s.ctx)).nextNo).toBe(1); // no DocSequence row yet

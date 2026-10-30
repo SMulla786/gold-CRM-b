@@ -213,13 +213,22 @@ function docNoOf(kw: string): number | null {
 
 export async function listOrders(ctx: TenantContext, q: { page: number; pageSize: number; q?: string; status?: string; statuses?: string[]; partyId?: number }): Promise<{ items: OrderDto[]; total: number; page: number; pageSize: number }> {
   const sdb = scopedDb(ctx);
-  // keyword: order no / party name / party mobile
+  // keyword: order no / party name / party mobile / item name (task99)
   const kw = q.q?.trim();
   let kwWhere = {};
   if (kw) {
-    const partyIds = (await sdb.party.findMany({ where: { OR: [{ name: { contains: kw, mode: 'insensitive' } }, { mobile: { contains: kw } }] }, select: { id: true } })).map((p) => p.id);
+    const [parties, names] = await Promise.all([
+      sdb.party.findMany({ where: { OR: [{ name: { contains: kw, mode: 'insensitive' } }, { mobile: { contains: kw } }] }, select: { id: true } }),
+      sdb.itemName.findMany({ where: { name: { contains: kw, mode: 'insensitive' } }, select: { id: true } }),
+    ]);
     const no = docNoOf(kw);
-    kwWhere = { OR: [{ partyId: { in: partyIds } }, ...(no != null ? [{ orderNo: no }] : [])] };
+    kwWhere = {
+      OR: [
+        { partyId: { in: parties.map((p) => p.id) } },
+        ...(names.length ? [{ items: { some: { itemNameId: { in: names.map((n) => n.id) } } } }] : []),
+        ...(no != null ? [{ orderNo: no }] : []),
+      ],
+    };
   }
   // statuses (any of) narrows further by status when both are given
   const statuses = q.statuses?.length ? (q.status ? q.statuses.filter((x) => x === q.status) : q.statuses) : null;
