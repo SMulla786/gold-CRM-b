@@ -174,27 +174,47 @@ export interface ExchangeDto {
 
 export const kachaProcessBody = z
   .object({
-    type: z.enum(['MELT', 'REFINE']),
+    /** G5 PROCESS = 'send to process' batch: reserves the full fine of its exchanges, no ledger; a REFINE with parentId consumes it */
+    type: z.enum(['MELT', 'REFINE', 'PROCESS']),
     metal: z.enum(METALS),
     txnDate: z.coerce.date().optional(),
-    /** kacha fine consumed */
-    inFine: weight.positive(),
-    /** bullion produced (melt weight / refined bread) */
-    outFine: weight,
+    /** kacha fine consumed (PROCESS: omitted — the server reserves its exchanges' fine) */
+    inFine: weight.optional(),
+    /** bullion produced (melt weight / refined bread); 0 on PROCESS */
+    outFine: weight.default(0),
     /** REFINE only: residue that stays kacha */
     ravalFine: weight.default(0),
     exchangeId: id.optional(),
+    /** PROCESS only: the exchanges batched together */
+    exchangeIds: z.array(id).min(1).max(100).optional(),
+    /** REFINE only: the PROCESS batch it refines */
+    parentId: id.optional(),
+    /** REFINE only: DIFFERENCE SELF, signed (+ gain / − loss the shop books itself); record only, no ledger */
+    selfDiff: z.coerce.number().finite().min(-1_000_000).max(1_000_000).default(0),
     remark: z.string().trim().max(200).optional(),
   })
-  .refine((b) => b.type === 'REFINE' || b.ravalFine === 0, { message: 'Raval applies to refining only', path: ['ravalFine'] });
+  .refine((b) => b.type === 'REFINE' || b.ravalFine === 0, { message: 'Raval applies to refining only', path: ['ravalFine'] })
+  .refine((b) => b.type === 'PROCESS' || (b.inFine ?? 0) > 0, { message: 'Enter the kacha fine', path: ['inFine'] })
+  .refine((b) => b.type !== 'PROCESS' || (b.exchangeIds?.length && b.inFine === undefined && b.outFine === 0 && b.exchangeId === undefined && b.parentId === undefined), {
+    message: 'A process batch takes exchanges only (no fine, bullion, single exchange or parent)', path: ['exchangeIds'] })
+  .refine((b) => b.type === 'PROCESS' || b.exchangeIds === undefined, { message: 'Only a process batch lists exchanges', path: ['exchangeIds'] })
+  .refine((b) => b.parentId === undefined || (b.type === 'REFINE' && b.exchangeId === undefined), { message: 'Only a refine (without an exchange) can belong to a process batch', path: ['parentId'] })
+  .refine((b) => b.type === 'REFINE' || b.selfDiff === 0, { message: 'Self difference applies to refining only', path: ['selfDiff'] });
 
-export const kachaListQuery = pageQuery.extend({ metal: z.enum(METALS).optional(), type: z.enum(['MELT', 'REFINE']).optional() });
+export const kachaListQuery = pageQuery.extend({
+  metal: z.enum(METALS).optional(),
+  type: z.enum(['MELT', 'REFINE', 'PROCESS']).optional(),
+  /** G5 grouped view: the refines of one process batch */
+  parentId: z.coerce.number().int().positive().optional(),
+});
+/** G5 summary cards (non-reverted processes, by type) */
+export const kachaSummaryQuery = z.object({ metal: z.enum(METALS).optional(), from: z.coerce.date().optional(), to: z.coerce.date().optional() });
 /** metal omitted = All: top-level fields are GOLD (back-compat) and byMetal carries both metals separately */
 export const kachaBalanceQuery = z.object({ metal: z.enum(METALS).optional() });
 
 export interface KachaProcessDto {
   id: number;
-  type: 'MELT' | 'REFINE';
+  type: 'MELT' | 'REFINE' | 'PROCESS';
   metal: 'GOLD' | 'SILVER';
   txnDate: string;
   inFine: string;
@@ -206,13 +226,33 @@ export interface KachaProcessDto {
   reverted: boolean;
   createdBy: string | null;
   createdAt: string;
+  /** G5: REFINE self difference (record only) */
+  selfDiff?: string;
+  /** G5: the PROCESS batch a REFINE belongs to */
+  parentId?: number | null;
+  /** G5 PROCESS: its exchanges, their gross kacha weight, and the fine still reserved (not yet refined) */
+  exchanges?: Array<{ id: number; exchangeNo: number }>;
+  kachaWeight?: string | null;
+  reservedFine?: string;
+  /** G5 PROCESS detail: its refines */
+  children?: KachaProcessDto[];
+}
+
+export interface KachaSummaryDto {
+  metal: 'GOLD' | 'SILVER' | null;
+  byType: Array<{ type: 'MELT' | 'REFINE' | 'PROCESS'; count: number; inFine: string; outFine: string; ravalFine: string; difference: string; selfDiff: string }>;
+  /** kacha fine reserved by open PROCESS batches right now */
+  reservedFine: string;
 }
 
 /** GET /app/kacha/balance — the KACHA / BULLION cards */
 export interface KachaBalanceDto {
   metal: 'GOLD' | 'SILVER';
+  /** ledger kacha fine (reserved fine included) */
   kachaFine: string;
   bullionFine: string;
+  /** G5: kacha reserved by open PROCESS batches (not available to melts, sells or bills) */
+  reservedFine?: string;
   /** only when the query had no metal (All) */
   byMetal?: Array<{ metal: 'GOLD' | 'SILVER'; kachaFine: string; bullionFine: string }>;
 }

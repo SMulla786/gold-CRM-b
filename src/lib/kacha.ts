@@ -34,7 +34,19 @@ export async function kachaBalance(client: Queryer, branchId: number, metal: Met
   return { kacha: of('KACHA'), bullion: of('BULLION') };
 }
 
-const poolBalance = async (client: Queryer, branchId: number, p: Pool) => new Prisma.Decimal((await kachaBalance(client, branchId, p.metal))[p.form === 'KACHA' ? 'kacha' : 'bullion']);
+/** G5: kacha reserved by open PROCESS batches = Σ their fine − Σ the fine their active refines already took. */
+export async function reservedKacha(client: Queryer, branchId: number, metal: Metal): Promise<Prisma.Decimal> {
+  const rows = await client.$queryRaw<{ r: Prisma.Decimal | null }[]>(Prisma.sql`
+    SELECT COALESCE(SUM(GREATEST(p."inFine" - COALESCE((SELECT SUM(c."inFine") FROM "KachaProcess" c WHERE c."parentId" = p.id AND NOT c.reverted), 0), 0)), 0)::numeric AS r
+    FROM "KachaProcess" p WHERE p."branchId" = ${branchId} AND p.metal::text = ${metal} AND p.type::text = 'PROCESS' AND NOT p.reverted`);
+  return new Prisma.Decimal(rows[0]?.r ?? 0);
+}
+
+/** What a guard may draw: bullion = its ledger balance; kacha = ledger balance less what PROCESS batches reserve. */
+const poolBalance = async (client: Queryer, branchId: number, p: Pool) => {
+  const b = await kachaBalance(client, branchId, p.metal);
+  return p.form === 'BULLION' ? new Prisma.Decimal(b.bullion) : new Prisma.Decimal(b.kacha).minus(await reservedKacha(client, branchId, p.metal));
+};
 
 // $executeRaw (not $queryRaw): the lock returns void, which $queryRaw can't deserialize. ::int4 — Prisma binds JS numbers
 // as bigint, and only the two-key pg_advisory_xact_lock(int4, int4) overload fits a (branch, pool) pair. Held until commit.
