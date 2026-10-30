@@ -95,15 +95,46 @@ describe('repair ledger + export (REP-02)', () => {
     expect([gold.direction, Number(gold.fine), Number(gold.amount)]).toEqual(['OUT', 0.333, 2178.89]);
   });
 
-  it('a cancelled ticket keeps its advance: no refund row is posted and the DTO still shows the unpaid charges', async () => {
-    // pins current behaviour (owner question: should cancel refund the advance or credit the customer?)
+  it('C3 cancel: the advance stays as customer credit (udhar −advance), no refund row, no charges owed; MONEY IN untouched', async () => {
+    const s = await setup();
+    const t = await create(s, { advanceCash: 300, advanceOnline: 200, advanceBankId: s.bank.id });
+    const c = await repair.updateRepairStatus(s.ctx, t.id, { status: 'CANCELLED' });
+    expect([c.status, c.advance, c.balance]).toEqual(['CANCELLED', '500.00', '-500.00']);
+    expect(await posted(t.id)).toEqual({ moneyIn: '500.00', udhar: '-500.00' });
+    expect(await db.ledgerEntry.count({ where: { source: 'REPAIR', sourceId: String(t.id), direction: 'OUT' } })).toBe(0);
+    const u = await db.udharEntry.findFirstOrThrow({ where: { source: 'REPAIR', sourceId: String(t.id) } });
+    expect([u.partyId, u.narration]).toEqual([s.customer.id, `Repair #${t.ticketNo} cancelled — advance kept as credit`]);
+    expect((await repair.listRepairs(s.ctx, { page: 1, pageSize: 20, status: 'CANCELLED' })).items[0]!.balance).toBe('-500.00'); // ledger export
+    await expect(deliver(s, t.id, { cash: 1 })).rejects.toMatchObject({ status: 409 });
+  });
+
+  it('C3 cancel with no advance: no udhar row, balance 0.00; cancel from IN_PROGRESS (with a karigar) works the same way', async () => {
+    const s = await setup();
+    const none = await create(s, { advanceCash: 0 });
+    expect((await repair.updateRepairStatus(s.ctx, none.id, { status: 'CANCELLED' })).balance).toBe('0.00');
+    expect(await db.udharEntry.count({ where: { source: 'REPAIR', sourceId: String(none.id) } })).toBe(0);
+
+    const karigar = await db.party.create({ data: { businessId: s.business.id, type: 'KARIGAR', name: 'K', mobile: '9000000005', countryCode: '+91' } });
+    const t = await create(s, { advanceCash: 250, karigarId: karigar.id, initialStatus: 'IN_PROGRESS' });
+    const c = await repair.updateRepairStatus(s.ctx, t.id, { status: 'CANCELLED' });
+    expect([c.status, c.karigar?.id, c.balance]).toEqual(['CANCELLED', karigar.id, '-250.00']);
+    expect(await posted(t.id)).toEqual({ moneyIn: '250.00', udhar: '-250.00' });
+  });
+
+  it('C3 cancel twice (sequential or concurrent) → 409 and the credit is posted once; other tenant → 404', async () => {
     const s = await setup();
     const t = await create(s);
-    const c = await repair.updateRepairStatus(s.ctx, t.id, { status: 'CANCELLED' });
-    expect([c.status, c.advance, c.balance]).toEqual(['CANCELLED', '500.00', '700.00']);
-    expect(await posted(t.id)).toEqual({ moneyIn: '500.00', udhar: '0.00' });
-    expect(await db.ledgerEntry.count({ where: { source: 'REPAIR', sourceId: String(t.id), direction: 'OUT' } })).toBe(0);
-    await expect(deliver(s, t.id, { cash: 1 })).rejects.toMatchObject({ status: 409 });
+    const r = await Promise.allSettled([repair.updateRepairStatus(s.ctx, t.id, { status: 'CANCELLED' }), repair.updateRepairStatus(s.ctx, t.id, { status: 'CANCELLED' })]);
+    expect(r.filter((x) => x.status === 'fulfilled')).toHaveLength(1);
+    expect(r.filter((x) => x.status === 'rejected' && (x.reason as { status?: number }).status === 409)).toHaveLength(1);
+    await expect(repair.updateRepairStatus(s.ctx, t.id, { status: 'CANCELLED' })).rejects.toMatchObject({ status: 409 });
+    expect(await db.udharEntry.count({ where: { source: 'REPAIR', sourceId: String(t.id) } })).toBe(1);
+
+    const other = await setup('B');
+    const t2 = await create(s);
+    await expect(repair.updateRepairStatus(other.ctx, t2.id, { status: 'CANCELLED' })).rejects.toMatchObject({ status: 404 });
+    expect((await repair.getRepair(s.ctx, t2.id)).status).toBe('RECEIVED');
+    expect(await db.udharEntry.count({ where: { source: 'REPAIR', sourceId: String(t2.id) } })).toBe(0);
   });
 
   it('QA return to bench round trip: back to IN_PROGRESS, notes accumulate, then READY and deliver as normal; each return is logged', async () => {

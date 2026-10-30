@@ -85,9 +85,16 @@ export async function updateRepairStatus(ctx: TenantContext, id: number, body: {
     return getRepair(ctx, id);
   }
   if (body.status === 'CANCELLED') {
-    // guard on the current status so a concurrent move can't flip it out from under us
-    const c = await sdb.repairTicket.updateMany({ where: { id, status: t.status }, data: { status: 'CANCELLED', ...(body.karigarId != null ? { karigarId: body.karigarId } : {}) } });
-    if (c.count !== 1) throw new HttpError(409, 'CONFLICT', 'Ticket status just changed');
+    // Charges are dropped; any advance taken stays with the shop as the customer's credit (udhar −advance). No refund here —
+    // paying it back is its own transaction.
+    const advance = D(t.advanceCash).plus(t.advanceOnline);
+    await prisma.$transaction(async (tx) => {
+      // guard on the current status so a concurrent move (or a second cancel) can't flip it out from under us
+      const c = await tx.repairTicket.updateMany({ where: { id, status: t.status }, data: { status: 'CANCELLED', ...(body.karigarId != null ? { karigarId: body.karigarId } : {}) } });
+      if (c.count !== 1) throw new HttpError(409, 'CONFLICT', 'Ticket status just changed');
+      if (advance.gt(0)) await udhar.post(tx, lctxOf(ctx), [{ branchId: t.branchId, partyId: t.partyId, txnDate: ledger.businessDate(), amount: advance.negated(), source: 'REPAIR', sourceId: String(id), narration: `Repair #${t.ticketNo} cancelled — advance kept as credit` }]);
+      await logActivity(tx, ctx, { module: 'REPAIR', action: 'EDITED', entity: 'RepairTicket', entityId: String(id), summary: `Repair ticket #${t.ticketNo} cancelled${advance.gt(0) ? ` — ₹${money(advance)} advance kept as credit` : ''}` });
+    });
     return getRepair(ctx, id);
   }
   // forward only
@@ -187,7 +194,8 @@ export async function getRepair(ctx: TenantContext, id: number): Promise<RepairT
   const advance = D(t.advanceCash).plus(t.advanceOnline);
   const addedValue = D(t.addedFine ?? 0).times(t.addedRate ?? 0);
   const deliveryPaid = D(t.deliveryCash ?? 0).plus(t.deliveryOnline ?? 0);
-  const balance = D(t.labourCharge).plus(t.otherCharge).plus(addedValue).minus(advance).minus(deliveryPaid);
+  // CANCELLED: no charges are owed; the advance is the customer's credit (matches the udhar −advance posted on cancel)
+  const balance = t.status === 'CANCELLED' ? advance.negated() : D(t.labourCharge).plus(t.otherCharge).plus(addedValue).minus(advance).minus(deliveryPaid);
   return {
     id: t.id, ticketNo: t.ticketNo, party: party as any, metal: t.metal as any, category: t.category, description: t.description, pcs: t.pcs,
     gross: wt(t.gross), net: t.net != null ? wt(t.net) : null, karatCode: t.karatCode, hallmark: t.hallmark, photoUrl: t.photoUrl,
