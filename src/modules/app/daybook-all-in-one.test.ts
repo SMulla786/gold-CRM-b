@@ -6,6 +6,7 @@ import { billBody, exchangeBody, LEDGER_ASSETS } from '../../shared';
 import * as acc from './accounts';
 import * as billing from './billing/service';
 import * as exchange from './trade/exchange';
+import * as inv from './inventory';
 import type { DayBookAllInOneRowDto } from '../../shared';
 import type { TenantContext } from '../../middleware/context';
 
@@ -157,3 +158,29 @@ describe('day-book all-in-one (ACC-04)', () => {
     expect(rows[0]!.balance?.MONEY).toBe('-35995'); // −36000 + 5, never B's 700
   });
 });
+
+describe('day-book all-in-one: bill link (G2b C2)', () => {
+  it('a bill and its payments stay separate rows, each linked by billId; Σ MONEY over them = Σ payments (never the bill total); the bill row has MONEY 0', async () => {
+    const s = await setup();
+    const supplier = await db.party.create({ data: { businessId: s.business.id, type: 'SUPPLIER', name: 'Supp', mobile: '9000000003', countryCode: '+91' } });
+    const [group] = await inv.createItemGroups(s.ctx, { stockClass: 'GOLD', names: ['Rings'], gstRate: 3 });
+    const name = await inv.createItemName(s.ctx, { groupId: group!.id, name: 'Gold Ring', method: 'TAG', tagPrefix: 'GR', tagDigits: 4 });
+    const bill = await billing.createBill(s.ctx, billBody.parse({
+      kind: 'PURCHASE', billType: 'ROUGH', partyId: supplier.id, items: [{ itemNameId: name!.id, gross: 5, rate: 5000 }], // ₹25,000 final
+      payments: [{ mode: 'CASH', amount: 4000 }, { mode: 'ONLINE', amount: 6000, bankAccountId: s.bank.id }],
+    }));
+    const ex = await buy(s);
+
+    const rows = await all(s);
+    const ofBill = rows.filter((r) => r.billId === bill.id);
+    expect(ofBill.map((r) => r.sourceId).sort()).toEqual([String(bill.id), ...bill.payments.map((p) => `${bill.id}-P${p.id}`)].sort());
+    const own = ofBill.find((r) => r.sourceId === String(bill.id))!;
+    expect([own.assets.MONEY, own.assets.GOLD.in]).toEqual([{ in: '0', out: '0' }, '5']); // stock only, no money
+    const moneyOut = ofBill.reduce((t, r) => t + Number(r.assets.MONEY.out), 0);
+    expect([Number(bill.final), moneyOut]).toEqual([25000, 10000]); // payments, not the ₹25,000 total
+    expect(ofBill.reduce((t, r) => t + Number(r.assets.MONEY.in), 0)).toBe(0);
+    expect(rows.find((r) => r.sourceId === String(ex.id) && r.source === 'EXCHANGE')!.billId).toBeNull();
+    expect(rowTotals(rows)).toEqual(await ledgerTotals(s.business.id));
+  });
+});
+

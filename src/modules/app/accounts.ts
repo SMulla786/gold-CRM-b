@@ -24,6 +24,8 @@ const IE_SOURCE_MAP: Record<IeSourceType, LedgerSource[]> = {
 const UNIT: Record<LedgerAsset, 'amount' | 'fine' | 'pcs'> = { MONEY: 'amount', GOLD: 'fine', SILVER: 'fine', STONE: 'pcs', ARTIFICIAL: 'pcs', FRANCHISE: 'pcs' };
 
 /** Admin with X-Branch-Id:all sees the whole subtree; otherwise just the active branch (own branch for branch users). */
+/** Ledger sources whose sourceId starts with the bill id (same set the frontend links to /app/billing/view/:id). */
+const BILL_SOURCES = new Set<string>(['SELL_BILL', 'PURCHASE_BILL', 'ORDER_SELL_BILL', 'ORDER_PURCHASE_BILL']);
 const branchFilter = (ctx: TenantContext): number[] => (ctx.activeBranchId != null ? [ctx.activeBranchId] : ctx.branchIds);
 
 const dec = (d: unknown): string | null => (d != null ? String(d) : null);
@@ -569,6 +571,7 @@ export async function getDayBookAllInOne(ctx: TenantContext, q: { page: number; 
       txnDate: dateOnly(d.txnDate),
       source: d.source as LedgerSource,
       sourceId: d.sourceId,
+      billId: BILL_SOURCES.has(d.source) ? parseInt(d.sourceId, 10) : null, // '<billId>' or '<billId>-P<n>'
       party: rep?.partyId != null ? { id: rep.partyId, name: partyNames.get(rep.partyId) ?? '' } : null,
       narration: rep?.narration ?? null,
       assets,
