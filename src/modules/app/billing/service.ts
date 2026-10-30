@@ -234,12 +234,14 @@ interface Prepared {
   billCalc: ReturnType<typeof computeBill>;
   bal: Prisma.Decimal;
   keepWeight: string | null;
+  /** grams per keepRate unit used for keepWeight (null on MONEY) */
+  keepUnitGrams: number | null;
   billDate: Date;
   dueDate: Date | null;
 }
 
 /** Pre-tx read + validation shared by create and edit: party, interState, recomputed lines/payments, PAN + rate-limit checks, totals, keep weight, dates. */
-async function prepareBill(ctx: TenantContext, body: BillBody, branchId: number, s: Settings, allowSold: Set<number> = new Set()): Promise<Prepared> {
+async function prepareBill(ctx: TenantContext, body: BillBody, branchId: number, s: Settings, allowSold: Set<number> = new Set(), storedKeepUnit?: number): Promise<Prepared> {
   const sdb = scopedDb(ctx);
   const party = await sdb.party.findUnique({ where: { id: body.partyId } });
   if (!party) throw new HttpError(404, 'NOT_FOUND', 'Party not found');
@@ -272,8 +274,10 @@ async function prepareBill(ctx: TenantContext, body: BillBody, branchId: number,
   const gstExempt = numbering.gstOnRemainingMetal ? payCalcs.filter((p) => p.input.mode === 'METAL').reduce((a, p) => a.plus(D(p.amount)), new Prisma.Decimal(0)) : new Prisma.Decimal(0);
   const billCalc = computeBill({ lineTotals: lines.map((r) => r.calc.total), discount: body.discount, discountUnit: body.discountUnit, gstPercent: body.billType === 'ROUGH' ? 0 : body.gstPercent, interState, gstExemptAmount: gstExempt, roundTo: 1 });
   const bal = D(billCalc.final).minus(paid);
-  const keepWeight = bal.gt(0) && body.keepBalanceAs !== 'MONEY' ? moneyToMetal(bal, body.keepRate!, metalUnitGrams(body.keepBalanceAs, s)) : null;
-  return { party, interState, lines, payCalcs, paid, billCalc, bal, keepWeight, billDate: ledger.businessDate(body.billDate ?? new Date()), dueDate: body.dueDate ? ledger.businessDate(body.dueDate) : null };
+  // BILL-15 R2: an edit keeps the unit the bill was saved with; a new keep uses the current shop unit
+  const keepUnitGrams = body.keepBalanceAs === 'MONEY' ? null : (storedKeepUnit ?? metalUnitGrams(body.keepBalanceAs, s));
+  const keepWeight = bal.gt(0) && keepUnitGrams != null ? moneyToMetal(bal, body.keepRate!, keepUnitGrams) : null;
+  return { party, interState, lines, payCalcs, paid, billCalc, bal, keepWeight, keepUnitGrams, billDate: ledger.businessDate(body.billDate ?? new Date()), dueDate: body.dueDate ? ledger.businessDate(body.dueDate) : null };
 }
 
 /** The line/stock/ledger/payment/udhar writes applied onto an existing Bill row (no numbering) — shared by create and edit. Carries the TASK-30b in-tx concurrency guards. */
@@ -429,7 +433,7 @@ export async function createBill(ctx: TenantContext, body: BillBody): Promise<Bi
         sub: prep.billCalc.sub, discount: body.discount, discountUnit: body.discountUnit, discountAmount: prep.billCalc.discountAmount,
         gstPercent: body.billType === 'ROUGH' ? 0 : body.gstPercent, taxable: prep.billCalc.taxable, cgst: prep.billCalc.cgst, sgst: prep.billCalc.sgst, igst: prep.billCalc.igst,
         total: prep.billCalc.total, round: prep.billCalc.round, final: prep.billCalc.final, paid: prep.paid, keepBalanceAs: body.keepBalanceAs,
-        keepRate: body.keepBalanceAs !== 'MONEY' ? (body.keepRate ?? null) : null, keepWeight: prep.keepWeight, remark: body.remark ?? null, status: 'ACTIVE', createdById: ctx.userId,
+        keepRate: body.keepBalanceAs !== 'MONEY' ? (body.keepRate ?? null) : null, keepWeight: prep.keepWeight, keepRateUnitGrams: prep.keepUnitGrams, remark: body.remark ?? null, status: 'ACTIVE', createdById: ctx.userId,
         ...gstMeta(body),
       },
     });
@@ -462,7 +466,12 @@ export async function editBill(ctx: TenantContext, id: number, body: BillBody): 
   const s = await getSettings(ctx);
   // This bill's own stock items are still SOLD/reduced until the in-tx undo; allow them when re-resolving the new lines.
   const ownStockIds = new Set(bill.items.map((i) => i.stockItemId).filter((x): x is number => x != null));
-  const prep = await prepareBill(ctx, body, bill.branchId, s, ownStockIds);
+  // BILL-15 R6: a stored keep rate (or kept metal) changes only when the user confirms it; the change is logged below
+  const rateChanged = bill.keepBalanceAs !== 'MONEY' && (body.keepBalanceAs !== bill.keepBalanceAs || !D(body.keepRate ?? 0).eq(D(bill.keepRate)));
+  if (rateChanged && !body.keepRateChange) throw new HttpError(409, 'CONFLICT', 'This changes the bill’s stored keep rate — confirm the rate change', { code: 'KEEP_RATE_CHANGE' });
+  // BILL-15 R2: same kept metal → the unit frozen on the bill (legacy rows without one: the current shop unit, as before)
+  const storedUnit = body.keepBalanceAs === bill.keepBalanceAs && bill.keepRateUnitGrams != null ? Number(bill.keepRateUnitGrams) : undefined;
+  const prep = await prepareBill(ctx, body, bill.branchId, s, ownStockIds, storedUnit);
   const lctx = lctxOf(ctx);
 
   await prisma.$transaction(async (tx) => {
@@ -478,12 +487,18 @@ export async function editBill(ctx: TenantContext, id: number, body: BillBody): 
         sub: prep.billCalc.sub, discount: body.discount, discountUnit: body.discountUnit, discountAmount: prep.billCalc.discountAmount,
         gstPercent: body.billType === 'ROUGH' ? 0 : body.gstPercent, taxable: prep.billCalc.taxable, cgst: prep.billCalc.cgst, sgst: prep.billCalc.sgst, igst: prep.billCalc.igst,
         total: prep.billCalc.total, round: prep.billCalc.round, final: prep.billCalc.final, paid: prep.paid, keepBalanceAs: body.keepBalanceAs,
-        keepRate: body.keepBalanceAs !== 'MONEY' ? (body.keepRate ?? null) : null, keepWeight: prep.keepWeight, remark: body.remark ?? null,
+        keepRate: body.keepBalanceAs !== 'MONEY' ? (body.keepRate ?? null) : null, keepWeight: prep.keepWeight, keepRateUnitGrams: prep.keepUnitGrams, remark: body.remark ?? null,
         ...gstMeta(body),
       },
     });
     await writeBillContents(tx, ctx, { id: bill.id, branchId: bill.branchId, billNo: bill.billNo, billDate: bill.billDate }, body, prep, lctx);
     await logActivity(tx, ctx, { module: bill.kind, action: 'EDITED', entity: 'BILL', entityId: String(id), summary: `Edited ${bill.kind === 'SELL' ? 'sell' : 'purchase'} bill ${bill.billNo} ₹${prep.billCalc.final}`, partyName: prep.party.name });
+    if (rateChanged) {
+      const was = { keepBalanceAs: bill.keepBalanceAs, keepRate: String(bill.keepRate), unitGrams: bill.keepRateUnitGrams != null ? String(bill.keepRateUnitGrams) : null };
+      const now = { keepBalanceAs: body.keepBalanceAs, keepRate: body.keepBalanceAs !== 'MONEY' ? String(body.keepRate) : null, unitGrams: prep.keepUnitGrams != null ? String(prep.keepUnitGrams) : null };
+      // user + timestamp are the activity row's own userId / createdAt
+      await logActivity(tx, ctx, { module: bill.kind, action: 'EDITED', entity: 'BILL', entityId: String(id), summary: `Keep rate changed on ${bill.billNo}: ${was.keepBalanceAs} ₹${was.keepRate} → ${now.keepBalanceAs}${now.keepRate != null ? ` ₹${now.keepRate}` : ''}`, partyName: prep.party.name, meta: { change: 'KEEP_RATE', old: was, new: now } });
+    }
   });
   return getBill(ctx, id);
 }
@@ -625,7 +640,7 @@ export async function getBill(ctx: TenantContext, id: number): Promise<BillDto> 
     ...listItemFields(bill, partyRef(party), branch?.name ?? '', creator),
     dueDate: bill.dueDate ? bill.dueDate.toISOString().slice(0, 10) : null, interState: bill.interState, sub: String(bill.sub), discount: String(bill.discount), discountUnit: bill.discountUnit, discountAmount: String(bill.discountAmount),
     gstPercent: String(bill.gstPercent), taxable: String(bill.taxable), cgst: String(bill.cgst), sgst: String(bill.sgst), igst: String(bill.igst), total: String(bill.total), round: String(bill.round),
-    keepRate: bill.keepRate != null ? String(bill.keepRate) : null, remark: bill.remark, deletedWithStock: bill.deletedWithStock,
+    keepRate: bill.keepRate != null ? String(bill.keepRate) : null, keepRateUnitGrams: bill.keepRateUnitGrams != null ? String(bill.keepRateUnitGrams) : null, remark: bill.remark, deletedWithStock: bill.deletedWithStock,
     itcEligibility: bill.itcEligibility, itcBlockReason: bill.itcBlockReason, supplierInvoiceNo: bill.supplierInvoiceNo, supplyCategory: bill.supplyCategory, reverseCharge: bill.reverseCharge,
     items: bill.items.map((i) => lineDto(i, stockMap)), payments: bill.payments.map((p) => paymentDto(p, baMap, jtMap)),
   };

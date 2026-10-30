@@ -113,8 +113,10 @@ export const billBody = z
     gstPercent: z.coerce.number().min(0).max(28).default(3),
     payments: z.array(billPayInput).max(20).default([]),
     keepBalanceAs: z.enum(KEEP_BALANCE_AS).default('MONEY'),
-    /** required when keepBalanceAs is GOLD/SILVER; per settings rate unit */
+    /** required when keepBalanceAs is GOLD/SILVER; per the shop rate unit at save (frozen on the bill: keepRateUnitGrams) */
     keepRate: decimalInput.optional(),
+    /** BILL-15 R6 (edit only): true to confirm changing a stored keep rate / kept metal; without it such an edit is 409 KEEP_RATE_CHANGE */
+    keepRateChange: z.boolean().optional(),
     /** sent when the server answered PAN_REQUIRED; saved onto the party */
     pan: z
       .string()
@@ -259,6 +261,8 @@ export interface BillDto extends BillListItemDto {
   total: string;
   round: string;
   keepRate: string | null;
+  /** BILL-15 R2: grams per keepRate unit frozen on the bill (null: MONEY, or saved before the unit was stored) */
+  keepRateUnitGrams: string | null;
   remark: string | null;
   deletedWithStock: boolean | null;
   /** TASK-97 GST (always filled by the server) */

@@ -990,6 +990,8 @@ model Bill {
   /// rate per rate-unit used to convert the balance to metal (GOLD/SILVER keep)
   keepRate          Decimal?          @db.Decimal(14, 2)
   keepWeight        Decimal?          @db.Decimal(14, 3)
+  /// BILL-15 R2: grams per keepRate unit, frozen at save (e.g. 10 = ₹/10 g); null on MONEY bills and on bills saved before this column (those use the current shop unit)
+  keepRateUnitGrams Decimal?          @db.Decimal(10, 3)
   remark            String?
   status            BillStatus        @default(ACTIVE)
   /// set on delete: true = stock returned (sell: AVAILABLE again, purchase: DELETED)
