@@ -21,7 +21,7 @@ import type {
   SettingKey,
   SettingsDto,
 } from '../../shared';
-import { SETTING_KEYS } from '../../shared';
+import { RATE_UNIT_GRAMS, SETTING_KEYS } from '../../shared';
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 const partyRef = (p: any): PartyRefDto => ({ id: p.id, type: p.type, name: p.name, mobile: p.mobile, shopName: p.shopName });
@@ -255,18 +255,34 @@ async function metalRates(ctx: TenantContext, metal: Metal): Promise<CurrentRate
   let head = ctx.activeBranchId != null ? await pick(ctx.activeBranchId) : null;
   if (!head) head = await pick(0);
   if (!head) return { rateUnit: DEFAULT_UNIT[metal], updatedAt: null, rows: [] };
-  const [rows, karats] = await Promise.all([
+  const [rows, karats, prevRows] = await Promise.all([
     sdb.metalRate.findMany({ where: { metal, branchId: head.branchId, rateUnit: head.rateUnit, effectiveAt: head.effectiveAt } }),
     sdb.karatMapping.findMany({ where: { metal } }),
+    // newest earlier row per karat (same branch) — the trend arrow's "previous rate"
+    sdb.metalRate.findMany({ where: { metal, branchId: head.branchId, effectiveAt: { lt: head.effectiveAt } }, orderBy: { effectiveAt: 'desc' }, distinct: ['karatCode'] }),
   ]);
   const byCode = new Map(karats.map((k) => [k.code, k]));
-  const rateRows: RateRowDto[] = rows.map((r) => ({ karatCode: r.karatCode, title: byCode.get(r.karatCode)?.title ?? r.karatCode, touch: String(byCode.get(r.karatCode)?.touch ?? ''), sellRate: r.sellRate.toString(), buyRate: r.buyRate.toString() }));
+  const headGrams = RATE_UNIT_GRAMS[head.rateUnit as RateUnitKey];
+  // previous sell rate re-expressed in the current unit (a unit switch between saves must not read as a price jump)
+  const prevByCode = new Map(prevRows.map((p) => [p.karatCode, (Number(p.sellRate) * headGrams) / RATE_UNIT_GRAMS[p.rateUnit as RateUnitKey]]));
+  const rateRows: RateRowDto[] = rows.map((r) => {
+    const prev = prevByCode.get(r.karatCode);
+    return { karatCode: r.karatCode, title: byCode.get(r.karatCode)?.title ?? r.karatCode, touch: String(byCode.get(r.karatCode)?.touch ?? ''), sellRate: r.sellRate.toString(), buyRate: r.buyRate.toString(), prevSellRate: prev != null && Number.isFinite(prev) ? prev.toFixed(2) : null };
+  });
   return { rateUnit: head.rateUnit as RateUnitKey, updatedAt: head.effectiveAt.toISOString(), rows: rateRows };
 }
 
 export async function currentRates(ctx: TenantContext): Promise<CurrentRatesDto> {
-  const [gold, silver] = await Promise.all([metalRates(ctx, 'GOLD'), metalRates(ctx, 'SILVER')]);
-  return { branchId: ctx.activeBranchId, gold, silver };
+  const [gold, silver, display] = await Promise.all([metalRates(ctx, 'GOLD'), metalRates(ctx, 'SILVER'), rateDisplay(ctx)]);
+  return { branchId: ctx.activeBranchId, gold, silver, display };
+}
+
+/** 'rates.display' resolved like getSettings (branch row > business row > defaults), without loading every key. */
+async function rateDisplay(ctx: TenantContext): Promise<{ showBuy: boolean }> {
+  const rows = await scopedDb(ctx).setting.findMany({ where: { key: 'rates.display', branchId: { in: [0, ...(ctx.activeBranchId != null ? [ctx.activeBranchId] : [])] } } });
+  const raw = rows.find((r) => r.branchId !== 0)?.value ?? rows.find((r) => r.branchId === 0)?.value ?? {};
+  const parsed = SETTING_SCHEMAS['rates.display'].safeParse(raw);
+  return parsed.success ? parsed.data : { showBuy: true };
 }
 
 /** Returns offending rows if any rate is outside its limit; caller decides whether an override (with MPIN) is allowed. */
@@ -278,16 +294,33 @@ export async function checkRateLimits(ctx: TenantContext, body: { metal: Metal; 
   return body.rates.filter((r) => r.sellRate < min || r.sellRate > max || r.buyRate < min || r.buyRate > max);
 }
 
-export async function setRates(ctx: TenantContext, body: { metal: Metal; rateUnit: RateUnitKey; branchId?: number; rates: { karatCode: string; sellRate: number; buyRate: number }[] }): Promise<CurrentRatesDto> {
+type SetRatesInput = { metal: Metal; rateUnit: RateUnitKey; branchId?: number; rates: { karatCode: string; sellRate: number; buyRate: number }[] };
+
+/** Branch override rule shared by setRates + setRatesBatch: only admins, and the branch must exist. Returns the target branchId (0 = business-wide). */
+async function rateBranch(ctx: TenantContext, body: SetRatesInput): Promise<number> {
   const branchId = body.branchId ?? 0;
   if (branchId !== 0) {
     if (ctx.level !== 'ADMIN') throw new HttpError(403, 'FORBIDDEN', 'Only admins can set branch rate overrides');
     if (!(await scopedDb(ctx).branch.findUnique({ where: { id: branchId } }))) throw new HttpError(404, 'NOT_FOUND', 'Branch not found');
   }
+  return branchId;
+}
+const rateRowsData = (ctx: TenantContext, body: SetRatesInput, branchId: number, effectiveAt: Date) =>
+  body.rates.map((r) => ({ branchId, metal: body.metal, karatCode: r.karatCode, rateUnit: body.rateUnit, sellRate: r.sellRate, buyRate: r.buyRate, effectiveAt, createdById: ctx.userId })) as never;
+
+export async function setRates(ctx: TenantContext, body: SetRatesInput): Promise<CurrentRatesDto> {
+  const branchId = await rateBranch(ctx, body);
+  await scopedDb(ctx).metalRate.createMany({ data: rateRowsData(ctx, body, branchId, new Date()) });
+  return currentRates(ctx);
+}
+
+/** POST /rates/batch: every metal's rows in ONE transaction with one effectiveAt (all saved or none). Limits/MPIN are checked by the route. */
+export async function setRatesBatch(ctx: TenantContext, bodies: SetRatesInput[]): Promise<CurrentRatesDto> {
+  const branchIds: Awaited<ReturnType<typeof rateBranch>>[] = [];
+  for (const b of bodies) branchIds.push(await rateBranch(ctx, b));
+  const sdb = scopedDb(ctx);
   const effectiveAt = new Date();
-  await scopedDb(ctx).metalRate.createMany({
-    data: body.rates.map((r) => ({ branchId, metal: body.metal, karatCode: r.karatCode, rateUnit: body.rateUnit, sellRate: r.sellRate, buyRate: r.buyRate, effectiveAt, createdById: ctx.userId })) as never,
-  });
+  await sdb.$transaction(bodies.map((b, i) => sdb.metalRate.createMany({ data: rateRowsData(ctx, b, branchIds[i]!, effectiveAt) })));
   return currentRates(ctx);
 }
 

@@ -17,6 +17,7 @@ import {
   putSettingBody,
   rateHistoryQuery,
   rateLimitsBody,
+  setRatesBatchBody,
   setRatesBody,
   updateKaratBody,
   updatePartyBody,
@@ -165,6 +166,21 @@ appRouter.post('/rates', requirePermission(MISC, 'edit'), async (req, res) => {
     await assertMpin(req.ctx!.userId, req.header(HEADERS.MPIN)); // override requires MPIN
   }
   res.json(await svc.setRates(req.ctx!, body));
+});
+// Atomic multi-metal save (dashboard Edit rates dialog): same permission + per-metal limit check as POST /rates; one MPIN covers every override.
+appRouter.post('/rates/batch', requirePermission(MISC, 'edit'), async (req, res) => {
+  const { metals } = setRatesBatchBody.parse(req.body);
+  let needsMpin = false;
+  const offending: Array<{ metal: Metal; karatCode: string; sellRate: number; buyRate: number }> = [];
+  for (const body of metals) {
+    const off = await svc.checkRateLimits(req.ctx!, body);
+    if (!off.length) continue;
+    if (!body.overrideLimits) offending.push(...off.map((o) => ({ metal: body.metal, ...o })));
+    else needsMpin = true;
+  }
+  if (offending.length) throw new HttpError(400, 'VALIDATION', 'Rates outside allowed limits', { offending });
+  if (needsMpin) await assertMpin(req.ctx!.userId, req.header(HEADERS.MPIN)); // override requires MPIN
+  res.json(await svc.setRatesBatch(req.ctx!, metals));
 });
 appRouter.get('/rates/history', requirePermission(MISC, 'view'), async (req, res) => res.json(await svc.rateHistory(req.ctx!, rateHistoryQuery.parse(req.query))));
 appRouter.get('/rate-limits', requirePermission(MISC, 'view'), async (req, res) => res.json(await svc.listRateLimits(req.ctx!)));
