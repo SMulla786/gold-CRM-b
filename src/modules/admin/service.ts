@@ -91,6 +91,15 @@ export async function getBranchTree(ctx: TenantContext): Promise<BranchNodeDto> 
   return root;
 }
 
+/** Branch state/district must exist and agree (an unknown id would otherwise hit the FK → 500). */
+async function assertBranchGeo(stateId: number | null | undefined, districtId: number | null | undefined): Promise<void> {
+  if (stateId != null && !(await prisma.state.findUnique({ where: { id: stateId } }))) throw new HttpError(400, 'VALIDATION', 'Unknown state');
+  if (districtId == null) return;
+  const district = await prisma.district.findUnique({ where: { id: districtId } });
+  if (!district) throw new HttpError(400, 'VALIDATION', 'Unknown district');
+  if (stateId != null && district.stateId !== stateId) throw new HttpError(400, 'VALIDATION', 'District is not in the selected state');
+}
+
 export async function createBranch(ctx: TenantContext, body: {
   parentId: number;
   name: string;
@@ -109,6 +118,7 @@ export async function createBranch(ctx: TenantContext, body: {
   if (!parent) throw new HttpError(404, 'NOT_FOUND', 'Parent branch not found');
   const total = await prisma.branch.count({ where: { businessId: ctx.businessId! } });
   assertWithinLimit(total, ctx.limits?.maxBranches, 'branches');
+  await assertBranchGeo(body.stateId, body.districtId);
 
   const created = await prisma.$transaction(async (tx) => {
     const b = await tx.branch.create({
@@ -142,6 +152,11 @@ export async function updateBranch(ctx: TenantContext, branchId: number, body: R
   const protectedNode = branchId === ctx.scopeBranchId || branch.parentId === null;
   if (protectedNode && (body.isAdminNode !== undefined || body.isActive !== undefined)) {
     throw new HttpError(400, 'VALIDATION', 'Cannot change admin-node/active status of your own node or the root branch');
+  }
+  // a district edited alone is checked against the branch's current state; null clears either
+  if (body.stateId !== undefined || body.districtId !== undefined) {
+    const stateId = (body.stateId !== undefined ? body.stateId : branch.stateId) as number | null;
+    await assertBranchGeo(stateId, (body.districtId !== undefined ? body.districtId : branch.districtId) as number | null);
   }
   const updated = await sdb.branch.update({ where: { id: branchId }, data: body });
   return branchNode(updated);
