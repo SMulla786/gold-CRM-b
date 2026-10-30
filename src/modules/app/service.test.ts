@@ -42,15 +42,28 @@ describe('settings resolution', () => {
     const { business, root } = await createBusiness({ name: 'A' });
     const c = ctx({ businessId: business.id, scopeBranchId: root.id, branchIds: [root.id], activeBranchId: root.id });
     const d = await svc.getSettings(c);
-    expect(d['daybook.prefs']).toEqual({ assets: ['MONEY', 'GOLD', 'SILVER', 'STONE', 'ARTIFICIAL', 'FRANCHISE'], defaultSource: null, pageSize: 50, showRunningBalance: true });
+    expect(d['daybook.prefs']).toEqual({ assets: ['MONEY', 'GOLD', 'SILVER', 'STONE', 'ARTIFICIAL', 'FRANCHISE'], defaultSource: null, pageSize: 20, showRunningBalance: true });
     expect(d['billing.columns']).toEqual({});
     await svc.putSetting(c, 'daybook.prefs', undefined, { assets: ['MONEY', 'GOLD'], defaultSource: 'SELL_BILL', pageSize: 100, showRunningBalance: false });
     await svc.putSetting(c, 'billing.columns', undefined, { sell: ['karat', 'net', 'rate'] });
     const s = await svc.getSettings(c);
     expect(s['daybook.prefs']).toEqual({ assets: ['MONEY', 'GOLD'], defaultSource: 'SELL_BILL', pageSize: 100, showRunningBalance: false });
     expect(s['billing.columns']).toEqual({ sell: ['karat', 'net', 'rate'] });
-    await expect(svc.putSetting(c, 'daybook.prefs', undefined, { pageSize: 20 })).rejects.toBeTruthy();
+    await expect(svc.putSetting(c, 'daybook.prefs', undefined, { pageSize: 30 })).rejects.toBeTruthy();
     await expect(svc.putSetting(c, 'daybook.prefs', undefined, { assets: ['PLATINUM'] })).rejects.toBeTruthy();
+  });
+  it('SET-08: day-book page size 20 is the unsaved default; a saved 10/50/100 is kept; changing it saves the new size', async () => {
+    const { business, root } = await createBusiness({ name: 'A' });
+    const c = ctx({ businessId: business.id, scopeBranchId: root.id, branchIds: [root.id], activeBranchId: root.id });
+    const size = async () => (await svc.getSettings(c))['daybook.prefs'].pageSize;
+    expect(await size()).toBe(20);
+    // a row saved while 50 was the default keeps 50 (stored values are never rewritten)
+    await db.setting.create({ data: { businessId: business.id, branchId: 0, key: 'daybook.prefs', value: { assets: ['MONEY'], defaultSource: null, pageSize: 50, showRunningBalance: true } } });
+    expect(await size()).toBe(50);
+    await svc.putSetting(c, 'daybook.prefs', undefined, { pageSize: 100 });
+    expect(await size()).toBe(100);
+    await svc.putSetting(c, 'daybook.prefs', undefined, { assets: ['MONEY'], pageSize: 20 });
+    expect((await svc.getSettings(c))['daybook.prefs']).toMatchObject({ assets: ['MONEY'], pageSize: 20 });
     await expect(svc.putSetting(c, 'billing.columns', undefined, { purchase: ['gross'] })).rejects.toBeTruthy(); // gross is a fixed column
   });
 });

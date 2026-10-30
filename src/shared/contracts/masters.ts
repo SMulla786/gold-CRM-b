@@ -274,7 +274,7 @@ export const BILL_GRID_COLUMNS = [
 ] as const;
 export type BillGridColumn = (typeof BILL_GRID_COLUMNS)[number];
 /** task99: Day Book Settings page sizes. */
-export const DAYBOOK_PAGE_SIZES = [10, 50, 100] as const;
+export const DAYBOOK_PAGE_SIZES = [10, 20, 50, 100] as const;
 
 /** TASK-98: printed bill formats (billing.invoice.format). A4_GST = the standard tax invoice. */
 export const INVOICE_FORMATS = ['A4_GST', 'A4_ESTIMATE', 'A5', 'THERMAL_80', 'THERMAL_58', 'A4_IMAGES', 'A6'] as const;
@@ -385,7 +385,8 @@ export const SETTING_SCHEMAS = {
     assets: z.array(z.enum(LEDGER_ASSETS)).default([...LEDGER_ASSETS]),
     /** null = all sources */
     defaultSource: z.enum(LEDGER_SOURCES).nullable().default(null),
-    pageSize: z.union([z.literal(10), z.literal(50), z.literal(100)]).default(50),
+    /** 20 = the All-in-One page size before this setting existed, so unsaved shops keep it */
+    pageSize: z.union([z.literal(10), z.literal(20), z.literal(50), z.literal(100)]).default(20),
     showRunningBalance: z.boolean().default(true),
   }),
   /** task99 bill-grid visible optional columns per bill kind (replaces the per-browser 'ju.billcols').
