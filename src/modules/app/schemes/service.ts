@@ -438,6 +438,12 @@ async function buildSchemes(ctx: TenantContext, ids: number[]): Promise<SchemeDt
   const schemes = await sdb.scheme.findMany({ where: { id: { in: ids } } });
   const branches = await sdb.branch.findMany({ where: { id: { in: [...new Set(schemes.map((s) => s.branchId))] } }, select: { id: true, name: true } });
   const counts = await prisma.schemeEnrollment.groupBy({ by: ['schemeId'], where: { schemeId: { in: ids } }, _count: { _all: true } });
+  // money collected per scheme: same media that post a SCHEME money-in ledger row (postPayment); ids are already business-scoped above
+  const collectedRows = await prisma.$queryRaw<{ schemeId: number; s: Prisma.Decimal | null }[]>(Prisma.sql`
+    SELECT e."schemeId" AS "schemeId", COALESCE(SUM(p.amount),0)::numeric AS s FROM "SchemePayment" p JOIN "SchemeEnrollment" e ON e.id = p."enrollmentId"
+    WHERE e."schemeId" IN (${Prisma.join(schemes.map((x) => x.id).concat(0))}) AND NOT p."isReversed" AND p.medium::text IN ('CASH', 'ONLINE', 'TOKEN', 'CHEQUE')
+    GROUP BY 1`);
+  const collectedMap = new Map(collectedRows.map((r) => [r.schemeId, D(r.s)]));
   const branchMap = new Map(branches.map((b) => [b.id, b.name]));
   const countMap = new Map(counts.map((c) => [c.schemeId, c._count._all]));
   const byId = new Map(schemes.map((s) => [s.id, s]));
@@ -445,7 +451,7 @@ async function buildSchemes(ctx: TenantContext, ids: number[]): Promise<SchemeDt
     id: s.id, kind: s.kind, type: s.type, name: s.name, title: s.title, description: s.description, emiAmount: money(s.emiAmount), tenureMonths: s.tenureMonths,
     bonusType: s.bonusType, bonusValue: s.type === 'GOLD' ? wt(s.bonusValue) : money(s.bonusValue), startDate: s.startDate.toISOString().slice(0, 10),
     validityDate: s.validityDate?.toISOString().slice(0, 10) ?? null, isActive: s.isActive, branch: { id: s.branchId, name: branchMap.get(s.branchId) ?? '' },
-    memberCount: countMap.get(s.id) ?? 0, createdAt: s.createdAt.toISOString(),
+    memberCount: countMap.get(s.id) ?? 0, createdAt: s.createdAt.toISOString(), collected: money(collectedMap.get(s.id) ?? 0),
   }));
 }
 

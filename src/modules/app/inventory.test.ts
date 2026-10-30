@@ -301,6 +301,8 @@ describe('TASK-98 — shortage pcs limits + item group delete', () => {
     expect(await statusOf(s.group.id)).toBe('WARNING');
     await inv.updateItemGroup(s.ctx, s.group.id, { minWeight: 20 });
     expect(await statusOf(s.group.id)).toBe('SHORTAGE');
+    // DASH-02 dashboard "n low stock" badge = status filter: only SHORTAGE rows (the WARNING group is left out)
+    expect((await inv.shortage(s.ctx, { status: 'SHORTAGE' })).map((r) => r.id)).toEqual([s.group.id]);
 
     // pure helper: worse of weight and pcs wins
     expect(inv.shortageStatus({ net: 100, pcs: 0, minWeight: 5, minPcs: 1, maxPcs: null })).toBe('SHORTAGE');
