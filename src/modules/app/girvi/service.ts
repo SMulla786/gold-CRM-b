@@ -193,8 +193,11 @@ export async function replaceGirviItem(ctx: TenantContext, batchId: number, item
       throw new HttpError(409, 'CONFLICT', 'Item is with a lender (girvi transfer); receive it back first');
     }
     await tx.girviItem.update({ where: { id: itemId }, data: { category: body.category, name: body.name, gross: body.gross, net: body.net, purity: body.purity, fine, rate: body.rate, valuation, ratePercent: body.ratePercent ?? null } });
-    const total = (await tx.girviItem.aggregate({ where: { batchId }, _sum: { valuation: true } }))._sum.valuation ?? new Prisma.Decimal(0);
-    if (D(fresh.principal).gt(total)) throw new HttpError(400, 'VALIDATION', 'The outstanding loan would exceed the new valuation', { valuation: money(total) });
+    const sumOf = async (where: Prisma.GirviItemWhereInput) => (await tx.girviItem.aggregate({ where: { batchId, ...where }, _sum: { valuation: true } }))._sum.valuation ?? new Prisma.Decimal(0);
+    const total = await sumOf({});
+    // the loan is secured only by items still pledged; released items no longer count (batch.valuation stays the all-items total)
+    const pledged = await sumOf({ status: 'PLEDGED' });
+    if (D(fresh.principal).gt(pledged)) throw new HttpError(400, 'VALIDATION', 'The outstanding loan would exceed the new valuation', { valuation: money(pledged) });
     await tx.girviBatch.update({ where: { id: batchId }, data: { valuation: total } });
     await logActivity(tx, ctx, {
       module: 'GIRVI', action: 'EDITED', entity: 'GIRVI', entityId: String(batchId),
@@ -273,8 +276,8 @@ export async function listGirvi(ctx: TenantContext, query: any): Promise<Paged<G
     });
     const ids = { partyId: { in: parties.map((p) => p.id) } };
     const asNo = Number(query.q);
-    // a numeric q may be a girvi number; partyType still narrows it
-    where.AND = [query.q && Number.isInteger(asNo) && !query.partyType ? { OR: [{ girviNo: asNo }, ids] } : ids];
+    // a numeric q may be a girvi number (Int4: a 10-digit mobile must not reach it, it would overflow → 500); partyType still narrows it
+    where.AND = [query.q && Number.isInteger(asNo) && asNo > 0 && asNo <= 2_147_483_647 && !query.partyType ? { OR: [{ girviNo: asNo }, ids] } : ids];
   }
   const [rows, total] = await Promise.all([
     sdb.girviBatch.findMany({ where, include: { items: { select: { name: true, status: true, valuation: true, ratePercent: true } }, _count: { select: { txns: true } } }, orderBy: { id: 'desc' }, skip: (query.page - 1) * query.pageSize, take: query.pageSize }),
