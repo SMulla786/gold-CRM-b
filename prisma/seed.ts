@@ -3,9 +3,9 @@
  * SEED_DEMO=true also creates a demo business with a small branch tree and users (password = SEED_SUPERADMIN_PASSWORD).
  */
 import { PrismaClient, type Prisma } from '@prisma/client';
-import argon2 from 'argon2';
 import { INDIAN_STATES, MODULES, MODULE_KEYS } from '../src/shared';
 import { ensureBusinessDefaults } from '../src/modules/platform/service';
+import { seedPasswordHash } from './seed-password';
 
 const prisma = new PrismaClient();
 const env = (k: string, d?: string) => {
@@ -210,7 +210,7 @@ async function seedDemo(passwordHash: string) {
 }
 
 async function main() {
-  const passwordHash = await argon2.hash(env('SEED_SUPERADMIN_PASSWORD'));
+  const passwordHash = await seedPasswordHash(); // first: a refused password must leave the DB untouched
   await seedStates();
   await seedPermissions();
   await seedSystemRoles();
