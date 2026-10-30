@@ -379,6 +379,13 @@ export const SETTING_SCHEMAS = {
     showAdvance: z.boolean().default(true),
     showReturn: z.boolean().default(true),
   }),
+  /** G5 exchange defaults (owner 2026-10-30): round-off of the final MONEY amount only (weight / fine never), to `roundStep` rupees;
+   *  and the base the difference % applies to. */
+  'exchange.defaults': z.object({
+    roundOff: z.enum(['NONE', 'NEAREST', 'UP', 'DOWN']).default('NONE'),
+    roundStep: z.coerce.number().positive().max(1000).default(1),
+    diffBy: z.enum(['WEIGHT', 'FINE']).default('FINE'),
+  }),
   /** task99 Day Book Settings (/app/daybook/settings) — presentation only: which asset column groups the
    *  All-in-One / Summary show, the default source filter, the All-in-One page size, and the running-balance column. */
   'daybook.prefs': z.object({

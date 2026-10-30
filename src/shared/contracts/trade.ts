@@ -64,7 +64,17 @@ export const exchangeLineInput = z.object({
   weight: weight.positive(),
   touch: z.coerce.number().min(0).max(100),
   serialNo: z.string().trim().max(20).optional(),
+  /** G5 weighing block (record only; `weight` stays the authoritative net). Linking a sample never changes its custody. */
+  grossWeight: weight.optional(),
+  lessWeight: weight.optional(),
+  meltWeight: weight.optional(),
+  sampleWeight: weight.optional(),
+  sampleId: id.optional(),
 });
+
+/** G5 given metal: what the customer hands over in this exchange (fine = (gross − less) × touch / 100). */
+export const exchangeGivenInput = z.object({ gross: weight.positive(), less: weight.default(0), touch: z.coerce.number().min(0).max(100) })
+  .refine((g) => g.less < g.gross, { message: 'Less must be below gross', path: ['less'] });
 
 export const exchangeBody = z
   .object({
@@ -74,8 +84,14 @@ export const exchangeBody = z
     metal: z.enum(METALS),
     txnDate: z.coerce.date().optional(),
     lines: z.array(exchangeLineInput).min(1).max(50),
-    /** signed ± fine adjustment */
+    /** legacy signed ± fine adjustment; read only when no diff % / g field is sent (then it counts as grams) */
     diffFine: z.coerce.number().finite().default(0),
+    /** G5 difference: % of the exchange.defaults base (WEIGHT | FINE) plus grams, each side; the server computes diffFine = plus − minus */
+    diffPctPlus: z.coerce.number().min(0).max(100).optional(),
+    diffGmPlus: weight.optional(),
+    diffPctMinus: z.coerce.number().min(0).max(100).optional(),
+    diffGmMinus: weight.optional(),
+    given: exchangeGivenInput.optional(),
     /** settings units; 0 → settled as a metal credit/debit on the party (no money) */
     rate: decimalInput.default(0),
     charges: decimalInput.default(0),
@@ -108,6 +124,12 @@ export interface ExchangeLineDto {
   touch: string;
   fine: string;
   serialNo: string | null;
+  /** G5 weighing block (null = not entered) */
+  grossWeight?: string | null;
+  lessWeight?: string | null;
+  meltWeight?: string | null;
+  sampleWeight?: string | null;
+  sampleId?: number | null;
 }
 
 export interface ExchangeDto {
@@ -119,11 +141,19 @@ export interface ExchangeDto {
   metal: 'GOLD' | 'SILVER';
   txnDate: string;
   totalFine: string;
+  /** G5: Σ line fine, never rounded (null = saved before G5) */
+  exactFine?: string | null;
   diffFine: string;
+  /** G5 difference inputs and the base each side used (exchange.defaults snapshot) */
+  diff?: { pctPlus: string; gmPlus: string; pctMinus: string; gmMinus: string; plusBy: 'WEIGHT' | 'FINE' | null; minusBy: 'WEIGHT' | 'FINE' | null };
+  /** G5 given metal (null = none) */
+  given?: { gross: string; net: string; touch: string; fine: string } | null;
   afterFine: string;
   rate: string;
   charges: string;
   discount: string;
+  /** G5: money round-off included in finalAmount (exchange.defaults) */
+  roundOff?: string;
   finalAmount: string;
   cash: string;
   online: string;

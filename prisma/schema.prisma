@@ -1741,8 +1741,12 @@ model Exchange {
   /// 'WEIGHT' | 'FINE' snapshot of exchange.defaults at save time
   diffPlusBy    String?
   diffMinusBy   String?
-  /// TASK-99: fine bullion moved the other way in the same exchange (BUY: shop gives, SELL: party gives)
+  /// G5 (owner 2026-10-30): metal the customer hands over in this exchange — KACHA IN by its fine, counter-entry on the party
   givenFine     Decimal        @default(0) @db.Decimal(14, 3)
+  /// G5: measurements of the given metal (fine = (gross − less) × touch / 100); null when none was given
+  givenGross    Decimal?       @db.Decimal(14, 3)
+  givenNet      Decimal?       @db.Decimal(14, 3)
+  givenTouch    Decimal?       @db.Decimal(6, 3)
   /// TASK-99: inline udhar jama/udhar + bhav cut posted with this exchange (shape: trade.ts inlineUdharInput / tradeBhavCutInput)
   inlineUdhar   Json?
   bhavCut       Json?
@@ -1752,6 +1756,8 @@ model Exchange {
   rate          Decimal        @default(0) @db.Decimal(14, 2)
   charges       Decimal        @default(0) @db.Decimal(14, 2)
   discount      Decimal        @default(0) @db.Decimal(14, 2)
+  /// G5: money round-off applied to finalAmount (exchange.defaults; weight / fine are never rounded)
+  roundOff      Decimal        @default(0) @db.Decimal(14, 2)
   /// metal value + charges − discount (0 when rate = 0)
   finalAmount   Decimal        @default(0) @db.Decimal(14, 2)
   cash          Decimal        @default(0) @db.Decimal(14, 2)

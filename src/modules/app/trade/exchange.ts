@@ -7,7 +7,8 @@ import { logActivity } from '../../../lib/activity';
 import { poolGuard } from '../../../lib/kacha';
 import { HttpError } from '../../../middleware/error';
 import type { z } from 'zod';
-import { exchangeBody, exchangeListQuery, fineWeight, metalToMoney } from '../../../shared';
+import { exchangeBody, exchangeListQuery, fineWeight, metalToMoney, roundMoney } from '../../../shared';
+import { getSettings } from '../service';
 import type { ExchangeDto, Paged, TradeHistoryDto } from '../../../shared';
 import type { TenantContext } from '../../../middleware/context';
 import { D, activeBranch, dateOnly, dateRange, docHistory, lctxOf, loadPayments, loadRefs, lockDoc, metalRow, money, nextNo, payPlan, payRows, savePayments, settingsUnit, snap, wt } from './common';
@@ -20,30 +21,61 @@ async function prepare(ctx: TenantContext, body: ExchangeBody) {
   if (!party) throw new HttpError(404, 'NOT_FOUND', 'Party not found');
   const plan = await payPlan(ctx, body);
   const unit = await settingsUnit(ctx, body.metal);
+  const defaults = (await getSettings(ctx))['exchange.defaults'];
+  // G5 weighing block: a linked sample must be this business's; its custody is untouched (issue / return own that)
+  const sampleIds = [...new Set(body.lines.map((l) => l.sampleId).filter((x): x is number => x != null))];
+  if (sampleIds.length && (await scopedDb(ctx).sample.count({ where: { id: { in: sampleIds } } })) !== sampleIds.length) throw new HttpError(404, 'NOT_FOUND', 'Sample not found');
 
   const lines = body.lines.map((l) => ({ ...l, fine: D(fineWeight(l.weight, l.touch)) }));
-  const totalFine = lines.reduce((a, l) => a.plus(l.fine), D(0));
+  const totalFine = lines.reduce((a, l) => a.plus(l.fine), D(0)); // exact fine: never rounded
   const totalWeight = lines.reduce((a, l) => a.plus(l.weight), D(0));
-  const afterFine = totalFine.plus(body.diffFine);
+  // G5 difference, computed here from its parts (% of the WEIGHT | FINE base + grams, each side); a body with only the
+  // legacy signed diffFine counts it as grams on its side
+  const legacy = body.diffPctPlus === undefined && body.diffGmPlus === undefined && body.diffPctMinus === undefined && body.diffGmMinus === undefined;
+  const diff = {
+    pctPlus: D(body.diffPctPlus ?? 0), gmPlus: D(legacy ? Math.max(body.diffFine, 0) : (body.diffGmPlus ?? 0)),
+    pctMinus: D(body.diffPctMinus ?? 0), gmMinus: D(legacy ? Math.max(-body.diffFine, 0) : (body.diffGmMinus ?? 0)),
+    by: legacy ? null : defaults.diffBy,
+  };
+  const base = defaults.diffBy === 'WEIGHT' ? totalWeight : totalFine;
+  // 3 dp = the stored precision of every fine column
+  const diffFine = base.times(diff.pctPlus).div(100).plus(diff.gmPlus).minus(base.times(diff.pctMinus).div(100)).minus(diff.gmMinus).toDecimalPlaces(3);
+  const afterFine = totalFine.plus(diffFine);
   if (afterFine.lte(0)) throw new HttpError(400, 'VALIDATION', 'After-difference fine must be positive');
-  const finalAmount = body.rate > 0 ? D(metalToMoney(afterFine, body.rate, unit)).plus(body.charges).minus(body.discount) : D(0);
-  return { party, plan, lines, totalFine, totalWeight, afterFine, finalAmount };
+  // G5 given metal: the customer's metal comes in as kacha by its fine and is settled with the party — a SELL takes that
+  // much less from the shop, a BUY is owed that much more
+  const given = body.given ? { gross: D(body.given.gross), net: D(body.given.gross).minus(body.given.less), touch: D(body.given.touch) } : null;
+  const givenFine = given ? D(fineWeight(given.net, given.touch)) : D(0);
+  const settleFine = body.side === 'SELL' ? afterFine.minus(givenFine) : afterFine.plus(givenFine);
+  if (settleFine.lt(0)) throw new HttpError(400, 'VALIDATION', 'The given metal is more than the party takes; record it as a BUY exchange');
+  const exact = body.rate > 0 ? D(metalToMoney(settleFine, body.rate, unit)).plus(body.charges).minus(body.discount) : D(0);
+  const rounded = body.rate > 0 ? roundMoney(exact, defaults.roundOff, defaults.roundStep) : { final: '0', round: '0' };
+  return { party, plan, lines, totalFine, totalWeight, diff, diffFine, afterFine, given, givenFine, settleFine, finalAmount: D(rounded.final), roundOff: D(rounded.round) };
 }
 type Prepared = Awaited<ReturnType<typeof prepare>>;
 
 const docData = (body: ExchangeBody, p: Prepared) => ({
   side: body.side, partyId: body.partyId, metal: body.metal,
-  totalFine: p.totalFine, diffFine: body.diffFine, afterFine: p.afterFine, rate: body.rate, charges: body.charges, discount: body.discount, finalAmount: p.finalAmount,
+  totalFine: p.totalFine, exactFine: p.totalFine, diffFine: p.diffFine, afterFine: p.afterFine,
+  diffPctPlus: p.diff.pctPlus, diffGmPlus: p.diff.gmPlus, diffPctMinus: p.diff.pctMinus, diffGmMinus: p.diff.gmMinus, diffPlusBy: p.diff.by, diffMinusBy: p.diff.by,
+  givenFine: p.givenFine, givenGross: p.given?.gross ?? null, givenNet: p.given?.net ?? null, givenTouch: p.given?.touch ?? null,
+  rate: body.rate, charges: body.charges, discount: body.discount, finalAmount: p.finalAmount, roundOff: p.roundOff,
   cash: p.plan.cash, online: p.plan.online, bankAccountId: p.plan.bankAccountId, remark: body.remark ?? null,
-  lines: { create: p.lines.map((l) => ({ weight: l.weight, touch: l.touch, fine: l.fine, serialNo: l.serialNo ?? null })) },
+  lines: {
+    create: p.lines.map((l) => ({
+      weight: l.weight, touch: l.touch, fine: l.fine, serialNo: l.serialNo ?? null,
+      grossWeight: l.grossWeight ?? null, lessWeight: l.lessWeight ?? null, meltWeight: l.meltWeight ?? null, sampleWeight: l.sampleWeight ?? null, sampleId: l.sampleId ?? null,
+    })),
+  },
 });
 
-/** Ledger + udhar postings of an exchange (create and the re-post half of an edit). */
+/** Ledger + udhar postings of an exchange (create and the re-post half of an edit); all under one sourceId, so delete / edit reverse exactly. */
 async function post(tx: Prisma.TransactionClient, ctx: TenantContext, doc: { id: number; exchangeNo: number; branchId: number; txnDate: Date }, body: ExchangeBody, p: Prepared) {
   const lctx = lctxOf(ctx);
   const sid = String(doc.id);
   const sellOut = body.side === 'SELL';
   const rows = [metalRow('EXCHANGE', doc.branchId, doc.txnDate, sellOut ? 'OUT' : 'IN', body.metal, 'KACHA', p.totalWeight, p.afterFine, sid, body.partyId, `Exchange #${doc.exchangeNo}`)];
+  if (p.given) rows.push(metalRow('EXCHANGE', doc.branchId, doc.txnDate, 'IN', body.metal, 'KACHA', p.given.net, p.givenFine, sid, body.partyId, `Exchange #${doc.exchangeNo} given metal`));
   rows.push(...payRows(p.plan, 'EXCHANGE', doc.branchId, doc.txnDate, sellOut ? 'IN' : 'OUT', sid, body.partyId, `Exchange #${doc.exchangeNo}`));
   await ledger.post(tx, lctx, rows);
 
@@ -51,7 +83,7 @@ async function post(tx: Prisma.TransactionClient, ctx: TenantContext, doc: { id:
     const remaining = p.finalAmount.minus(p.plan.cash).minus(p.plan.online); // >0 = unsettled money value of the trade
     if (!remaining.isZero()) await udhar.post(tx, lctx, [{ branchId: doc.branchId, partyId: body.partyId, txnDate: doc.txnDate, amount: sellOut ? remaining : remaining.negated(), source: 'EXCHANGE', sourceId: sid, narration: `Exchange #${doc.exchangeNo}` }]);
   } else {
-    const m = sellOut ? p.afterFine : p.afterFine.negated(); // BUY: shop owes the metal (party credit); SELL: party owes it
+    const m = sellOut ? p.settleFine : p.settleFine.negated(); // BUY: shop owes the metal (party credit); SELL: party owes it (given metal included)
     await udhar.post(tx, lctx, [{ branchId: doc.branchId, partyId: body.partyId, txnDate: doc.txnDate, gold: body.metal === 'GOLD' ? m : 0, silver: body.metal === 'SILVER' ? m : 0, source: 'EXCHANGE', sourceId: sid, narration: `Exchange #${doc.exchangeNo}` }]);
   }
 }
@@ -132,15 +164,22 @@ export async function deleteExchange(ctx: TenantContext, id: number): Promise<vo
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 async function toDto(ctx: TenantContext, ex: any): Promise<ExchangeDto> {
-  const [refs, payments, procs] = await Promise.all([loadRefs(ctx, ex), loadPayments(ctx, 'EXCHANGE', ex.id), scopedDb(ctx).kachaProcess.count({ where: { exchangeId: ex.id, reverted: false } })]);
+  const [refs, payments, procs] = await Promise.all([loadRefs(ctx, ex), loadPayments(ctx, 'EXCHANGE', ex.id), scopedDb(ctx).kachaProcess.count({ where: { reverted: false, OR: [{ exchangeId: ex.id }, { exchangeIds: { has: ex.id } }] } })]);
   const bal = D(ex.finalAmount).minus(ex.cash).minus(ex.online);
   return {
     id: ex.id, exchangeNo: ex.exchangeNo, side: ex.side, party: refs.party, branch: refs.branch, metal: ex.metal, txnDate: dateOnly(ex.txnDate),
-    totalFine: wt(ex.totalFine), diffFine: wt(ex.diffFine), afterFine: wt(ex.afterFine), rate: money(ex.rate), charges: money(ex.charges), discount: money(ex.discount),
-    finalAmount: money(ex.finalAmount), cash: money(ex.cash), online: money(ex.online), bankAccount: refs.bankAccount,
+    totalFine: wt(ex.totalFine), exactFine: ex.exactFine != null ? wt(ex.exactFine) : null, diffFine: wt(ex.diffFine),
+    diff: { pctPlus: String(ex.diffPctPlus), gmPlus: wt(ex.diffGmPlus), pctMinus: String(ex.diffPctMinus), gmMinus: wt(ex.diffGmMinus), plusBy: ex.diffPlusBy, minusBy: ex.diffMinusBy },
+    given: ex.givenGross != null ? { gross: wt(ex.givenGross), net: wt(ex.givenNet), touch: String(ex.givenTouch), fine: wt(ex.givenFine) } : null,
+    afterFine: wt(ex.afterFine), rate: money(ex.rate), charges: money(ex.charges), discount: money(ex.discount),
+    roundOff: money(ex.roundOff), finalAmount: money(ex.finalAmount), cash: money(ex.cash), online: money(ex.online), bankAccount: refs.bankAccount,
     balance: money(ex.side === 'BUY' ? bal.negated() : bal), remark: ex.remark,
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    lines: ex.lines.map((l: any) => ({ id: l.id, weight: wt(l.weight), touch: String(l.touch), fine: wt(l.fine), serialNo: l.serialNo })),
+    lines: ex.lines.map((l: any) => ({
+      id: l.id, weight: wt(l.weight), touch: String(l.touch), fine: wt(l.fine), serialNo: l.serialNo,
+      grossWeight: l.grossWeight != null ? wt(l.grossWeight) : null, lessWeight: l.lessWeight != null ? wt(l.lessWeight) : null,
+      meltWeight: l.meltWeight != null ? wt(l.meltWeight) : null, sampleWeight: l.sampleWeight != null ? wt(l.sampleWeight) : null, sampleId: l.sampleId,
+    })),
     processed: procs > 0, createdBy: refs.createdBy, createdAt: ex.createdAt.toISOString(), payments,
   };
 }

@@ -134,3 +134,20 @@ describe('girviDue (owner-approved extras: per-item rate, first-month interest, 
     expect(girviDue({ ...base, penaltyRatePercent: 1, to: '2026-07-01' }).penalty).toBe('0.00');
   });
 });
+
+describe('roundMoney (G5 exchange round-off: money only)', () => {
+  it('NONE keeps the paisa; NEAREST is half-up to the step; UP / DOWN move the absolute amount; round = final − exact', async () => {
+    const { roundMoney } = await import('./index');
+    expect(roundMoney(1234.56, 'NONE')).toEqual({ final: '1234.56', round: '0.00' });
+    expect(roundMoney(1234.5, 'NEAREST')).toEqual({ final: '1235.00', round: '0.50' });
+    expect(roundMoney(1234.49, 'NEAREST')).toEqual({ final: '1234.00', round: '-0.49' });
+    expect(roundMoney(1234.01, 'UP')).toEqual({ final: '1235.00', round: '0.99' });
+    expect(roundMoney(1234.99, 'DOWN')).toEqual({ final: '1234.00', round: '-0.99' });
+    expect(roundMoney(1234, 'UP')).toEqual({ final: '1234.00', round: '0.00' });
+    expect(roundMoney(-1234.4, 'UP')).toEqual({ final: '-1235.00', round: '-0.60' }); // absolute goes up
+    expect(roundMoney(-1234.6, 'DOWN')).toEqual({ final: '-1234.00', round: '0.60' });
+    expect(roundMoney(1234.56, 'NEAREST', 10)).toEqual({ final: '1230.00', round: '-4.56' });
+    expect(roundMoney(1235, 'NEAREST', 10)).toEqual({ final: '1240.00', round: '5.00' });
+    expect(roundMoney(1234.56, 'UP', 0)).toEqual({ final: '1234.56', round: '0.00' }); // no step → exact
+  });
+});

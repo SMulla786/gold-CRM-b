@@ -147,6 +147,23 @@ export function stoneTotal(amounts: readonly Num[]): string {
   return M(amounts.reduce<Decimal>((a, x) => a.plus(D(x)), D(0)));
 }
 
+/** G5 exchange round-off modes (owner 2026-10-30); money only — weight / fine are never rounded. */
+export type RoundMode = 'NONE' | 'NEAREST' | 'UP' | 'DOWN';
+
+/**
+ * Round a final money amount to a multiple of `step` (default ₹1): NEAREST = half-up, UP / DOWN = the absolute payable
+ * goes up / down, NONE = exact (paisa). `round` = final − exact, recorded as its own adjustment.
+ */
+export function roundMoney(amount: Num, mode: RoundMode = 'NONE', step: Num = 1): { final: string; round: string } {
+  const exact = D(amount).toDecimalPlaces(2, Decimal.ROUND_HALF_UP);
+  const st = D(step);
+  if (mode === 'NONE' || st.lte(0)) return { final: M(exact), round: '0.00' };
+  // decimal.js ROUND_UP / ROUND_DOWN go away from / toward zero, i.e. they move the absolute amount
+  const how = mode === 'NEAREST' ? Decimal.ROUND_HALF_UP : mode === 'UP' ? Decimal.ROUND_UP : Decimal.ROUND_DOWN;
+  const final = exact.div(st).toDecimalPlaces(0, how).times(st);
+  return { final: M(final), round: M(final.minus(exact)) };
+}
+
 export function moneyToMetal(amount: Num, rate: Num, rateUnitGrams: Num = 1): string {
   const r = D(rate);
   return r.isZero() ? '0.000' : W(D(amount).times(D(rateUnitGrams)).div(r));
