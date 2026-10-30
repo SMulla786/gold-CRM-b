@@ -151,8 +151,12 @@ export async function addOrderAdvance(ctx: TenantContext, id: number, payments: 
   if (!order) throw new HttpError(404, 'NOT_FOUND', 'Order not found');
   if (order.status === 'DELIVERED' || order.status === 'CANCELLED') throw new HttpError(409, 'CONFLICT', `Cannot add an advance to a ${order.status.toLowerCase()} order`);
   await prisma.$transaction(async (tx) => {
+    // claim first: the status-guarded row update locks the order, so a concurrent advance / cancel / deliver waits;
+    // the advance is incremented by what was actually posted (never read-then-write, which lost one of two advances)
+    const claim = await tx.order.updateMany({ where: { id, status: { notIn: ['DELIVERED', 'CANCELLED'] } }, data: { advance: { increment: 0 } } });
+    if (claim.count !== 1) throw new HttpError(409, 'CONFLICT', 'Order is no longer open for an advance');
     const added = await postAdvances(tx, ctx, id, order.branchId, ledger.businessDate(), payments);
-    await tx.order.update({ where: { id }, data: { advance: D(order.advance).plus(added) } });
+    await tx.order.update({ where: { id }, data: { advance: { increment: added } } });
     await logActivity(tx, ctx, { module: 'ORDER', action: 'EDITED', entity: 'Order', entityId: String(id), summary: `Advance added to order #${order.orderNo}` });
   });
   return getOrder(ctx, id);
