@@ -3,6 +3,7 @@ import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { db, truncateAll } from '../../../test/helpers/db';
 import { createBranch, createBusiness } from '../../../test/helpers/factory';
 import { billBody, exchangeBody, LEDGER_ASSETS } from '../../shared';
+import { businessDate } from '../../lib/ledger';
 import * as acc from './accounts';
 import * as billing from './billing/service';
 import * as exchange from './trade/exchange';
@@ -103,7 +104,7 @@ describe('day-book all-in-one (ACC-04)', () => {
     expect(ofEx(today.id)[0]!.assets.MONEY).toEqual({ in: '36000', out: '36000' });
     expect(ofEx(old.id).map((r) => [r.txnDate, r.assets.SILVER])).toEqual([
       [rows[0]!.txnDate, { in: '0', out: '450' }], // reversal, today (newest first)
-      [past.toISOString().slice(0, 10), { in: '450', out: '0' }],
+      [businessDate(past).toISOString().slice(0, 10), { in: '450', out: '0' }], // the IST business day, as booked (UTC differs 00:00–05:30 IST)
     ]);
     expect(rowTotals(rows)).toEqual(await ledgerTotals(s.business.id));
   });
