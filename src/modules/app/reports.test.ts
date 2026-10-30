@@ -52,6 +52,19 @@ describe('reports dashboard', () => {
     expect(d.parties.customers).toBe(1);
   });
 
+  it('DASH-02 monthly series (the dashboard earnings bar = sales − purchases): this month is the last row, per bill kind', async () => {
+    const { business, root } = await createBusiness({ name: 'A' });
+    const p = await party(business.id);
+    await sellBill(business.id, root.id, p.id, { final: 10300 });
+    await db.bill.create({ data: { businessId: business.id, branchId: root.id, kind: 'PURCHASE', billType: 'ROUGH', billNo: 'PUR-1', seq: 1, partyId: p.id, billDate: businessDate(), sub: 4000, taxable: 4000, total: 4000, final: 4000.5, paid: 0 } });
+    const d = await dashboard(ctxFor(business.id, [root.id], root.id));
+    const cur = d.monthly.at(-1)!;
+    expect(cur.month).toBe(businessDate().toISOString().slice(0, 7));
+    expect([cur.sales, cur.purchases]).toEqual(['10300.00', '4000.50']);
+    expect(Number(cur.sales) - Number(cur.purchases)).toBe(6299.5);
+    expect(d.monthly.slice(0, -1).every((m) => m.sales === '0.00' && m.purchases === '0.00')).toBe(true);
+  });
+
   it('udhari receivable counts only positive party balances; cash from MONEY ledger', async () => {
     const { business, root } = await createBusiness({ name: 'A' });
     const owed = await party(business.id, 'Owes');
