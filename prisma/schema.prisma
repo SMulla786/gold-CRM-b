@@ -96,6 +96,8 @@ model Plan {
   /// module keys from @ju/shared MODULES (core modules are always on)
   modules       String[]
   isActive      Boolean               @default(true)
+  /// Phase 5: an explicit ad-supported (free) plan — copied onto each term at creation; price never decides ads
+  adSupported   Boolean               @default(false)
   createdAt     DateTime              @default(now())
   updatedAt     DateTime              @updatedAt
   subscriptions Subscription[]
@@ -150,6 +152,8 @@ model Subscription {
   maxUsers    Int
   modules     String[]
   notes       String?
+  /// Phase 5: snapshot of Plan.adSupported when this term was created — ads show only while THIS term is the current one
+  adSupported Boolean               @default(false)
   createdById Int?
   createdAt   DateTime              @default(now())
   business    Business              @relation(fields: [businessId], references: [id])

@@ -32,15 +32,17 @@ export const otpStubEnabled = (nodeEnv: string, flag: string | undefined): boole
 /** Subtree test on the materialised path, e.g. inSubtree('/1/4/9/', '/1/4/') === true. */
 export const inSubtree = (branchPath: string, rootPath: string): boolean => branchPath.startsWith(rootPath);
 
-/** Modules + subscription summary for MeDto. active=false (expired/suspended/none) ⇒ read-only, core modules only. */
+/** Modules + subscription summary for MeDto. active=false (expired/suspended/none) ⇒ read-only, core modules only, no ads.
+ *  adSupported = the current term's own snapshot (lib/access). */
 export function resolveAccess(
   active: boolean,
   displaySub: { planName: string; endsAt: Date; modules: string[] } | null,
+  adSupported = false,
 ): { modules: string[]; subscription: MeDto['subscription'] } {
   const readOnly = !active;
   const modules = Array.from(new Set([...CORE_MODULES, ...(active && displaySub ? displaySub.modules : [])]));
   return {
     modules,
-    subscription: displaySub ? { planName: displaySub.planName, endsAt: displaySub.endsAt.toISOString(), readOnly } : null,
+    subscription: displaySub ? { planName: displaySub.planName, endsAt: displaySub.endsAt.toISOString(), readOnly, adEligible: active && adSupported } : null,
   };
 }

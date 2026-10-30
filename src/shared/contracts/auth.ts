@@ -45,7 +45,9 @@ export interface MeDto {
   permissions: PermissionMap;
   /** Module keys enabled by the current subscription. */
   modules: string[];
-  subscription: { planName: string; endsAt: string; readOnly: boolean } | null;
+  /** adEligible: the business's CURRENT term is ad-supported (a snapshot of the plan when the term was made) and the
+   *  business is active. Never derived from price; paid / trial / expired / suspended / queued terms → false. */
+  subscription: { planName: string; endsAt: string; readOnly: boolean; adEligible: boolean } | null;
   hasMpin: boolean;
   impersonatedBy: { id: number; name: string } | null;
 }

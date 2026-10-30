@@ -126,7 +126,8 @@ export async function buildMe(userId: number, impersonatorId: number | null = nu
   if (user.level !== 'SUPER_ADMIN' && user.business) {
     const access = await loadAccess(user.business.id, user.business.status);
     modules = access.modules;
-    subscription = access.subscription;
+    // Phase 5: never ads while a Super Admin is impersonating (the client also blocks them; this keeps it server-true)
+    subscription = access.subscription && impersonatorId ? { ...access.subscription, adEligible: false } : access.subscription;
   }
 
   const impersonatedBy = impersonatorId ? await prisma.user.findUnique({ where: { id: impersonatorId }, select: { id: true, name: true } }) : null;

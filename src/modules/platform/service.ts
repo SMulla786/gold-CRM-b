@@ -59,6 +59,7 @@ const planDto = (p: any): PlanDto => ({
   maxUsers: p.maxUsers,
   modules: p.modules,
   isActive: p.isActive,
+  adSupported: p.adSupported,
   activeSubscriptions: p._count?.subscriptions ?? 0,
 });
 const subDto = (s: any): SubscriptionDto => ({
@@ -330,7 +331,7 @@ export async function assignSubscription(superAdminId: number, businessId: numbe
 }
 
 /** A new subscription term on `plan`; shared by assign and payment confirmation. */
-async function createTerm(client: Prisma.TransactionClient, superAdminId: number, businessId: number, plan: { id: number; durationDays: number; maxBranches: number; maxUsers: number; modules: string[] }, body: Partial<AssignSubscriptionInput>) {
+async function createTerm(client: Prisma.TransactionClient, superAdminId: number, businessId: number, plan: { id: number; durationDays: number; maxBranches: number; maxUsers: number; modules: string[]; adSupported: boolean }, body: Partial<AssignSubscriptionInput>) {
   const latest = await client.subscription.findFirst({ where: { businessId }, orderBy: { endsAt: 'desc' } });
   const now = new Date();
   // New term starts at the given date, or at the current end if still active, else now.
@@ -346,6 +347,7 @@ async function createTerm(client: Prisma.TransactionClient, superAdminId: number
       maxUsers: body.maxUsers ?? plan.maxUsers,
       modules: body.modules ?? plan.modules,
       notes: body.notes ?? null,
+      adSupported: plan.adSupported, // snapshot: a later plan edit never changes this term
       createdById: superAdminId,
     },
     include: { plan: true },
@@ -463,6 +465,7 @@ interface PlanInput {
   maxUsers: number;
   modules: string[];
   isActive: boolean;
+  adSupported: boolean;
 }
 interface AssignSubscriptionInput {
   planId: number;
@@ -533,7 +536,7 @@ async function provisionBusiness(
   });
   const now = new Date();
   await tx.subscription.create({
-    data: { businessId: business.id, planId: plan.id, startsAt: now, endsAt: new Date(now.getTime() + plan.durationDays * DAY), maxBranches: plan.maxBranches, maxUsers: plan.maxUsers, modules: plan.modules, createdById: data.createdById },
+    data: { businessId: business.id, planId: plan.id, startsAt: now, endsAt: new Date(now.getTime() + plan.durationDays * DAY), maxBranches: plan.maxBranches, maxUsers: plan.maxUsers, modules: plan.modules, adSupported: plan.adSupported, createdById: data.createdById },
   });
   // Creation hook (docs/api-phase1.md): seed default karat mappings + rate limits.
   await ensureBusinessDefaults(tx, business.id);
