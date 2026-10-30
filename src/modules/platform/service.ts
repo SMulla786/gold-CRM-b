@@ -325,12 +325,17 @@ export async function updatePlan(planId: number, body: Partial<PlanInput>): Prom
 export async function assignSubscription(superAdminId: number, businessId: number, body: AssignSubscriptionInput): Promise<SubscriptionDto> {
   const plan = await prisma.plan.findUnique({ where: { id: body.planId } });
   if (!plan) throw new HttpError(404, 'NOT_FOUND', 'Plan not found');
-  const latest = await prisma.subscription.findFirst({ where: { businessId }, orderBy: { endsAt: 'desc' } });
+  return subDto(await createTerm(prisma, superAdminId, businessId, plan, body));
+}
+
+/** A new subscription term on `plan`; shared by assign and payment confirmation. */
+async function createTerm(client: Prisma.TransactionClient, superAdminId: number, businessId: number, plan: { id: number; durationDays: number; maxBranches: number; maxUsers: number; modules: string[] }, body: Partial<AssignSubscriptionInput>) {
+  const latest = await client.subscription.findFirst({ where: { businessId }, orderBy: { endsAt: 'desc' } });
   const now = new Date();
   // New term starts at the given date, or at the current end if still active, else now.
   const startsAt = body.startsAt ?? (latest && latest.endsAt > now ? latest.endsAt : now);
   const durationDays = body.durationDays ?? plan.durationDays;
-  const sub = await prisma.subscription.create({
+  return client.subscription.create({
     data: {
       businessId,
       planId: plan.id,
@@ -344,7 +349,6 @@ export async function assignSubscription(superAdminId: number, businessId: numbe
     },
     include: { plan: true },
   });
-  return subDto(sub);
 }
 
 export async function updateSubscription(subscriptionId: number, body: UpdateSubscriptionInput): Promise<SubscriptionDto> {
@@ -370,16 +374,30 @@ export async function recordPayment(businessId: number, body: RecordPaymentInput
   return paymentDto(p);
 }
 
-/** TASK-95: confirm or reject a PENDING payment exactly once (guarded update — a second decision is a 409). */
-export async function reviewPayment(paymentId: number, status: 'CONFIRMED' | 'REJECTED'): Promise<PaymentDto> {
-  const { count } = await prisma.subscriptionPayment.updateMany({
-    where: { id: paymentId, status: 'PENDING' },
-    data: { status, ...(status === 'CONFIRMED' ? { paidAt: new Date() } : {}) },
+/**
+ * TASK-95: confirm or reject a PENDING payment exactly once (guarded update — a second decision is a 409).
+ * G2b: confirming a payment on which the business asked for a plan (planId) renews once, in the same transaction: a new
+ * term on that plan, and the payment then points at it. Legacy / platform-recorded payments (no planId) renew nothing.
+ */
+export async function reviewPayment(superAdminId: number, paymentId: number, status: 'CONFIRMED' | 'REJECTED'): Promise<PaymentDto> {
+  await prisma.$transaction(async (tx) => {
+    const { count } = await tx.subscriptionPayment.updateMany({
+      where: { id: paymentId, status: 'PENDING' },
+      data: { status, ...(status === 'CONFIRMED' ? { paidAt: new Date() } : {}) },
+    });
+    if (count === 0) {
+      const exists = await tx.subscriptionPayment.findUnique({ where: { id: paymentId }, select: { id: true } });
+      throw exists ? new HttpError(409, 'CONFLICT', 'Payment already reviewed') : new HttpError(404, 'NOT_FOUND', 'Payment not found');
+    }
+    if (status !== 'CONFIRMED') return;
+    const p = await tx.subscriptionPayment.findUniqueOrThrow({ where: { id: paymentId } });
+    if (p.planId == null) return;
+    // one renewal at a time per business, so two confirmations stack their terms instead of both starting at the same end
+    await tx.$executeRaw`SELECT 1 FROM "Business" WHERE id = ${p.businessId} FOR UPDATE`;
+    const plan = await tx.plan.findUniqueOrThrow({ where: { id: p.planId } });
+    const sub = await createTerm(tx, superAdminId, p.businessId, plan, { notes: `Renewed on payment #${p.id}` });
+    await tx.subscriptionPayment.update({ where: { id: paymentId }, data: { subscriptionId: sub.id } });
   });
-  if (count === 0) {
-    const exists = await prisma.subscriptionPayment.findUnique({ where: { id: paymentId }, select: { id: true } });
-    throw exists ? new HttpError(409, 'CONFLICT', 'Payment already reviewed') : new HttpError(404, 'NOT_FOUND', 'Payment not found');
-  }
   return paymentDto(await prisma.subscriptionPayment.findUniqueOrThrow({ where: { id: paymentId }, include: PAYMENT_INCLUDE }));
 }
 

@@ -63,7 +63,7 @@ platformRouter.patch('/subscriptions/:id', async (req, res) => res.json(await sv
 
 // Payments
 platformRouter.get('/payments', async (req, res) => res.json(await svc.listPayments(pageQuery.parse(req.query))));
-platformRouter.patch('/payments/:id', async (req, res) => res.json(await svc.reviewPayment(idSchema.parse(req.params.id), reviewPaymentBody.parse(req.body).status)));
+platformRouter.patch('/payments/:id', async (req, res) => res.json(await svc.reviewPayment(uid(req), idSchema.parse(req.params.id), reviewPaymentBody.parse(req.body).status)));
 platformRouter.get('/payments/:id/proof', async (req, res) => {
   const abs = await platformPaymentProofPath(idSchema.parse(req.params.id));
   res.type({ '.jpg': 'image/jpeg', '.png': 'image/png', '.webp': 'image/webp' }[path.extname(abs)] ?? 'application/octet-stream').sendFile(abs);
