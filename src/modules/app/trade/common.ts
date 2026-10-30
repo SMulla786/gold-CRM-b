@@ -33,6 +33,15 @@ export const assertBank = async (ctx: TenantContext, online: number, bankAccount
 };
 
 /** Atomic per-(branch, key) document number: seq = next − 1 (same as billing/girvi). */
+/**
+ * Lock order step 1 (lib/kacha.ts): lock the document row FOR UPDATE before anything else, so a concurrent edit / delete /
+ * process of the same document waits instead of reversing the same rows twice. 404 when it no longer exists (or is another business's).
+ */
+export async function lockDoc(tx: Prisma.TransactionClient, table: 'Exchange' | 'BuySell', id: number, businessId: number): Promise<void> {
+  const rows = await tx.$queryRaw<{ id: number }[]>(Prisma.sql`SELECT id FROM ${Prisma.raw(`"${table}"`)} WHERE id = ${id} AND "businessId" = ${businessId} FOR UPDATE`);
+  if (rows.length !== 1) throw new HttpError(404, 'NOT_FOUND', `${table === 'Exchange' ? 'Exchange' : 'Buy-sell'} not found`);
+}
+
 export async function nextNo(tx: Prisma.TransactionClient, businessId: number, branchId: number, key: string): Promise<number> {
   const rows = await tx.$queryRaw<{ next: number }[]>`
     INSERT INTO "DocSequence" ("businessId","branchId","key","next") VALUES (${businessId}, ${branchId}, ${key}, 2)

@@ -9,7 +9,8 @@ import type { z } from 'zod';
 import { buySellBody, buySellListQuery, metalToMoney } from '../../../shared';
 import type { BuySellDto, Paged, TradeHistoryDto } from '../../../shared';
 import type { TenantContext } from '../../../middleware/context';
-import { D, activeBranch, dateOnly, dateRange, docHistory, lctxOf, loadPayments, loadRefs, metalRow, money, nextNo, payPlan, payRows, savePayments, settingsUnit, snap, wt } from './common';
+import { D, activeBranch, dateOnly, dateRange, docHistory, lctxOf, loadPayments, loadRefs, lockDoc, metalRow, money, nextNo, payPlan, payRows, savePayments, settingsUnit, snap, wt } from './common';
+import { poolGuard } from '../../../lib/kacha';
 
 type BuySellBody = z.infer<typeof buySellBody>;
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -86,8 +87,10 @@ export async function createBuySell(ctx: TenantContext, body: BuySellBody): Prom
         lines: { create: p.lines.map((l) => ({ weight: l.weight, rate: l.rate, amount: l.amount })) },
       },
     });
+    const pools = await poolGuard(tx, branchId, [{ metal: body.metal, form: 'BULLION' }]); // G5: a SELL can't sell bullion the branch doesn't hold
     if (p.plan.rows) await savePayments(tx, ctx, 'BUY_SELL', bs.id, p.plan);
     await post(tx, ctx, { id: bs.id, buySellNo, branchId, txnDate }, body, p);
+    await pools();
     await logActivity(tx, ctx, { module: 'BUY_SELL', action: 'CREATED', entity: 'BUY_SELL', entityId: String(bs.id), summary: `Buy-sell #${buySellNo} ${body.side} ${wt(p.totalWeight)}g`, partyName: p.party.name });
     return bs.id;
   });
@@ -107,10 +110,14 @@ export async function updateBuySell(ctx: TenantContext, id: number, body: BuySel
     throw new HttpError(409, 'CONFLICT', 'The linked bhav booking was cancelled; this trade can no longer be edited');
   }
   const p = await prepare(ctx, body);
-  const txnDate = ledger.businessDate(body.txnDate ?? old.txnDate);
-  const before = snap({ ...old, payments: await loadPayments(ctx, 'BUY_SELL', id) });
 
   await prisma.$transaction(async (tx) => {
+    // G5 lock order: the trade row first (a concurrent edit / delete waits; its rows are reversed once), then the pools
+    await lockDoc(tx, 'BuySell', id, ctx.businessId!);
+    const old = await tx.buySell.findUniqueOrThrow({ where: { id }, include: { lines: { orderBy: { id: 'asc' } } } });
+    const txnDate = ledger.businessDate(body.txnDate ?? old.txnDate);
+    const before = snap({ ...old, payments: await loadPayments(ctx, 'BUY_SELL', id) });
+    const pools = await poolGuard(tx, old.branchId, [{ metal: old.metal, form: 'BULLION' }, { metal: body.metal, form: 'BULLION' }]);
     await unpost(tx, ctx, old);
     if (body.bhavBookingId != null) await takeFromBooking(tx, body.bhavBookingId, p.totalWeight);
     await tx.buySellLine.deleteMany({ where: { buySellId: id } });
@@ -125,6 +132,7 @@ export async function updateBuySell(ctx: TenantContext, id: number, body: BuySel
     });
     await savePayments(tx, ctx, 'BUY_SELL', id, p.plan);
     await post(tx, ctx, { id, buySellNo: old.buySellNo, branchId: old.branchId, txnDate }, body, p);
+    await pools();
     await logActivity(tx, ctx, { module: 'BUY_SELL', action: 'EDITED', entity: 'BUY_SELL', entityId: String(id), summary: `Edited buy-sell #${old.buySellNo}`, partyName: p.party.name, meta: { before, after: snap({ ...after, payments: p.plan.rows ?? [] }) } });
   });
   return getBuySell(ctx, id);
@@ -132,10 +140,13 @@ export async function updateBuySell(ctx: TenantContext, id: number, body: BuySel
 
 export async function deleteBuySell(ctx: TenantContext, id: number): Promise<void> {
   const sdb = scopedDb(ctx);
-  const bs = await sdb.buySell.findFirst({ where: { id } });
-  if (!bs) throw new HttpError(404, 'NOT_FOUND', 'Buy-sell not found');
+  if (!(await sdb.buySell.findFirst({ where: { id }, select: { id: true } }))) throw new HttpError(404, 'NOT_FOUND', 'Buy-sell not found');
   await prisma.$transaction(async (tx) => {
+    await lockDoc(tx, 'BuySell', id, ctx.businessId!);
+    const bs = await tx.buySell.findUniqueOrThrow({ where: { id } });
+    const pools = await poolGuard(tx, bs.branchId, [{ metal: bs.metal, form: 'BULLION' }]); // deleting a BUY takes its bullion back
     await unpost(tx, ctx, bs);
+    await pools();
     await tx.buySell.delete({ where: { id } }); // cascades lines
     await savePayments(tx, ctx, 'BUY_SELL', id, null);
     await logActivity(tx, ctx, { module: 'BUY_SELL', action: 'DELETED', entity: 'BUY_SELL', entityId: String(id), summary: `Deleted buy-sell #${bs.buySellNo}` });

@@ -4,13 +4,13 @@ import { scopedDb } from '../../../lib/db';
 import * as ledger from '../../../lib/ledger';
 import * as udhar from '../../../lib/udhar';
 import { logActivity } from '../../../lib/activity';
-import { assertKachaAvailable } from '../../../lib/kacha';
+import { poolGuard } from '../../../lib/kacha';
 import { HttpError } from '../../../middleware/error';
 import type { z } from 'zod';
 import { exchangeBody, exchangeListQuery, fineWeight, metalToMoney } from '../../../shared';
 import type { ExchangeDto, Paged, TradeHistoryDto } from '../../../shared';
 import type { TenantContext } from '../../../middleware/context';
-import { D, activeBranch, dateOnly, dateRange, docHistory, lctxOf, loadPayments, loadRefs, metalRow, money, nextNo, payPlan, payRows, savePayments, settingsUnit, snap, wt } from './common';
+import { D, activeBranch, dateOnly, dateRange, docHistory, lctxOf, loadPayments, loadRefs, lockDoc, metalRow, money, nextNo, payPlan, payRows, savePayments, settingsUnit, snap, wt } from './common';
 
 type ExchangeBody = z.infer<typeof exchangeBody>;
 
@@ -64,9 +64,10 @@ export async function createExchange(ctx: TenantContext, body: ExchangeBody): Pr
   const id = await prisma.$transaction(async (tx) => {
     const exchangeNo = await nextNo(tx, ctx.businessId!, branchId, 'EXCHANGE');
     const ex = await tx.exchange.create({ data: { businessId: ctx.businessId!, branchId, exchangeNo, txnDate, createdById: ctx.userId, ...docData(body, p) } });
-    if (body.side === 'SELL') await assertKachaAvailable(tx, branchId, body.metal, p.afterFine); // can't sell more kacha than the pool holds
+    const pools = await poolGuard(tx, branchId, [{ metal: body.metal, form: 'KACHA' }]); // a SELL can't sell more kacha than the pool holds
     if (p.plan.rows) await savePayments(tx, ctx, 'EXCHANGE', ex.id, p.plan);
     await post(tx, ctx, { id: ex.id, exchangeNo, branchId, txnDate }, body, p);
+    await pools();
     await logActivity(tx, ctx, { module: 'EXCHANGE', action: 'CREATED', entity: 'EXCHANGE', entityId: String(ex.id), summary: `Exchange #${exchangeNo} ${body.side} ${wt(p.afterFine)}g`, partyName: p.party.name });
     return ex.id;
   });
@@ -79,40 +80,48 @@ export async function createExchange(ctx: TenantContext, body: ExchangeBody): Pr
  * The kacha pool of every touched metal must stay ≥ 0 afterwards (same guard create SELL / delete BUY apply).
  */
 export async function updateExchange(ctx: TenantContext, id: number, body: ExchangeBody): Promise<ExchangeDto> {
-  const sdb = scopedDb(ctx);
-  const old = await sdb.exchange.findFirst({ where: { id }, include: { lines: { orderBy: { id: 'asc' } } } });
-  if (!old) throw new HttpError(404, 'NOT_FOUND', 'Exchange not found');
-  if ((await sdb.kachaProcess.count({ where: { exchangeId: id, reverted: false } })) > 0) throw new HttpError(409, 'CONFLICT', 'This exchange was sent to melt / refine; revert that processing before editing');
+  if (!(await scopedDb(ctx).exchange.findFirst({ where: { id }, select: { id: true } }))) throw new HttpError(404, 'NOT_FOUND', 'Exchange not found');
   const p = await prepare(ctx, body);
-  const txnDate = ledger.businessDate(body.txnDate ?? old.txnDate);
   const lctx = lctxOf(ctx);
-  const before = snap({ ...old, payments: await loadPayments(ctx, 'EXCHANGE', id) });
 
   await prisma.$transaction(async (tx) => {
+    // G5 lock order: the exchange row first — a concurrent edit / delete / melt of it waits, so its rows are reversed once
+    await lockDoc(tx, 'Exchange', id, ctx.businessId!);
+    const old = await tx.exchange.findUniqueOrThrow({ where: { id }, include: { lines: { orderBy: { id: 'asc' } } } });
+    await assertNotProcessed(tx, ctx, id, 'This exchange was sent to melt / refine; revert that processing before editing');
+    const txnDate = ledger.businessDate(body.txnDate ?? old.txnDate);
+    const before = snap({ ...old, payments: await loadPayments(ctx, 'EXCHANGE', id) });
+    const pools = await poolGuard(tx, old.branchId, [{ metal: old.metal, form: 'KACHA' }, { metal: body.metal, form: 'KACHA' }]);
     await ledger.reverse(tx, lctx, { source: 'EXCHANGE', sourceId: String(id) });
     await udhar.reverse(tx, lctx, { source: 'EXCHANGE', sourceId: String(id) });
     await tx.exchangeLine.deleteMany({ where: { exchangeId: id } });
     const after = await tx.exchange.update({ where: { id }, data: { txnDate, ...docData(body, p) }, include: { lines: { orderBy: { id: 'asc' } } } });
     await savePayments(tx, ctx, 'EXCHANGE', id, p.plan);
     await post(tx, ctx, { id, exchangeNo: old.exchangeNo, branchId: old.branchId, txnDate }, body, p);
-    for (const m of new Set([old.metal, body.metal])) await assertKachaAvailable(tx, old.branchId, m, 0);
+    await pools();
     await logActivity(tx, ctx, { module: 'EXCHANGE', action: 'EDITED', entity: 'EXCHANGE', entityId: String(id), summary: `Edited exchange #${old.exchangeNo}`, partyName: p.party.name, meta: { before, after: snap({ ...after, payments: p.plan.rows ?? [] }) } });
   });
   return getExchange(ctx, id);
 }
 
+/** 409 while any non-reverted kacha process links this exchange (checked inside the tx, after the exchange row lock). */
+async function assertNotProcessed(tx: Prisma.TransactionClient, ctx: TenantContext, id: number, message: string): Promise<void> {
+  const n = await tx.kachaProcess.count({ where: { businessId: ctx.businessId!, reverted: false, OR: [{ exchangeId: id }, { exchangeIds: { has: id } }] } });
+  if (n > 0) throw new HttpError(409, 'CONFLICT', message);
+}
+
 export async function deleteExchange(ctx: TenantContext, id: number): Promise<void> {
-  const sdb = scopedDb(ctx);
-  const ex = await sdb.exchange.findFirst({ where: { id } });
-  if (!ex) throw new HttpError(404, 'NOT_FOUND', 'Exchange not found');
-  const linked = await sdb.kachaProcess.count({ where: { exchangeId: id, reverted: false } });
-  if (linked > 0) throw new HttpError(409, 'CONFLICT', 'Revert the linked kacha processing first');
+  if (!(await scopedDb(ctx).exchange.findFirst({ where: { id }, select: { id: true } }))) throw new HttpError(404, 'NOT_FOUND', 'Exchange not found');
   const lctx = lctxOf(ctx);
   await prisma.$transaction(async (tx) => {
+    await lockDoc(tx, 'Exchange', id, ctx.businessId!);
+    const ex = await tx.exchange.findUniqueOrThrow({ where: { id } });
+    await assertNotProcessed(tx, ctx, id, 'Revert the linked kacha processing first');
     // A BUY added kacha to the pool; reversing removes it — 409 if that metal has since been melted away.
-    if (ex.side === 'BUY') await assertKachaAvailable(tx, ex.branchId, ex.metal, ex.afterFine);
+    const pools = await poolGuard(tx, ex.branchId, [{ metal: ex.metal, form: 'KACHA' }]);
     await ledger.reverse(tx, lctx, { source: 'EXCHANGE', sourceId: String(id) });
     await udhar.reverse(tx, lctx, { source: 'EXCHANGE', sourceId: String(id) });
+    await pools();
     await tx.exchange.delete({ where: { id } }); // cascades lines
     await savePayments(tx, ctx, 'EXCHANGE', id, null);
     await logActivity(tx, ctx, { module: 'EXCHANGE', action: 'DELETED', entity: 'EXCHANGE', entityId: String(id), summary: `Deleted exchange #${ex.exchangeNo}` });

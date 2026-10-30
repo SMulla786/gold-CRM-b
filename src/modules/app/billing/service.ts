@@ -4,10 +4,10 @@ import { scopedDb } from '../../../lib/db';
 import * as ledger from '../../../lib/ledger';
 import * as udhar from '../../../lib/udhar';
 import { logActivity } from '../../../lib/activity';
-import { kachaBalance, lockedKacha } from '../../../lib/kacha';
+import { poolGuard, poolsOf, type Pool, type PoolUse } from '../../../lib/kacha';
 import { HttpError } from '../../../middleware/error';
 import { computeBill, computeLine, fineWeight, metalToMoney, moneyToMetal, netWeight, PAN_CASH_LIMIT, RATE_UNIT_GRAMS, stoneTotal } from '../../../shared';
-import type { BillBody, BillDto, BillKind, BillLineDto, BillListItemDto, BillPayInput, BillPaymentDto, BillType, LedgerSource, Metal, Paged, PartyRefDto, StockClass } from '../../../shared';
+import type { BillBody, BillDto, BillKind, BillLineDto, BillListItemDto, BillPayInput, BillPaymentDto, BillType, LedgerSource, Paged, PartyRefDto, StockClass } from '../../../shared';
 import type { TenantContext } from '../../../middleware/context';
 import { getSettings } from '../service';
 import { nextTagNo, stoneDto } from '../inventory';
@@ -81,45 +81,25 @@ function paymentLedgerRow(pc: PayCalc, paymentId: number, billId: number, kind: 
   return { ...base, asset: 'MONEY', bankAccountId: pc.bankAccountId ?? null, amount: pc.amount, narration: 'Bill payment' };
 }
 
-// ───────────── ACC-05 kacha pool guard ─────────────
-
-/** Metals whose KACHA pool these payments touch, gold first (one lock order). */
-const kachaMetals = (...pays: { metal?: string | null; metalForm?: string | null }[][]): Metal[] =>
-  (['GOLD', 'SILVER'] as const).filter((m) => pays.flat().some((p) => p.metalForm === 'KACHA' && p.metal === m));
+// ───────────── ACC-05 / G5 pool guard (lib/kacha poolGuard) ─────────────
 
 /**
- * ACC-05: a bill write may not take a kacha pool below zero (a pool that is already negative may not get worse).
- * Call BEFORE the writes, in the same transaction: locks each pool (concurrent draws — melt, exchange, other bills —
- * serialize) and notes its balance; the returned check runs AFTER the writes and refuses with a 409. For a write that
- * reverses this bill's own kacha IN (delete / edit of a sell bill), the 409 names the later activity that used it.
+ * ACC-05 / G5: a bill write may not take a KACHA or BULLION pool below zero (lib/kacha poolGuard: locks before the
+ * writes, checks after, same transaction). For a write that reverses this bill's own metal IN (delete / edit of a sell
+ * bill), the 409 names the later activity that drew that metal.
  */
-async function kachaGuard(tx: Prisma.TransactionClient, branchId: number, metals: Metal[], own?: { kind: BillKind; billId: number }): Promise<() => Promise<void>> {
-  const before = new Map<Metal, Prisma.Decimal>();
-  for (const m of metals) before.set(m, await lockedKacha(tx, branchId, m));
-  return async () => {
-    for (const m of metals) {
-      const was = before.get(m)!;
-      const now = D((await kachaBalance(tx, branchId, m)).kacha);
-      if (now.gte(0) || now.gte(was)) continue;
-      const metal = m.toLowerCase();
-      const usedBy = own ? await laterKachaDraws(tx, branchId, m, own) : [];
-      const why = usedBy.length
-        ? `; it was used since by ${usedBy.map((u) => `${u.source} ${u.sourceId} (${u.txnDate}, ${u.fine} g)`).join(', ')} — revert those first`
-        : '';
-      throw new HttpError(409, 'CONFLICT', `Not enough kacha ${metal}: the pool holds ${was.toFixed(3)} g and this change takes ${was.minus(now).toFixed(3)} g${why}`, { code: 'KACHA_SHORT', metal: m, available: was.toFixed(3), needed: was.minus(now).toFixed(3), usedBy });
-    }
-  };
-}
+const billPools = (tx: Prisma.TransactionClient, branchId: number, pays: { metal?: string | null; metalForm?: string | null }[][], own?: { kind: BillKind; billId: number }) =>
+  poolGuard(tx, branchId, poolsOf(...pays), own ? (pool) => laterDraws(tx, branchId, pool, own) : undefined);
 
-/** Kacha drawn from the pool after this bill's own kacha came in (still standing: not a reversal, not reversed). */
-async function laterKachaDraws(tx: Prisma.TransactionClient, branchId: number, metal: Metal, own: { kind: BillKind; billId: number }) {
+/** Metal of this pool drawn after this bill's own metal came in (still standing: not a reversal, not reversed). */
+async function laterDraws(tx: Prisma.TransactionClient, branchId: number, pool: Pool, own: { kind: BillKind; billId: number }): Promise<PoolUse[]> {
   const first = await tx.ledgerEntry.findFirst({
-    where: { branchId, asset: metal, metalForm: 'KACHA', direction: 'IN', source: billSource(own.kind), sourceId: { startsWith: `${own.billId}-P` }, reversalOfId: null },
+    where: { branchId, asset: pool.metal, metalForm: pool.form, direction: 'IN', source: billSource(own.kind), sourceId: { startsWith: `${own.billId}-P` }, reversalOfId: null },
     orderBy: { createdAt: 'asc' }, select: { createdAt: true },
   });
   if (!first) return [];
   const draws = await tx.ledgerEntry.findMany({
-    where: { branchId, asset: metal, metalForm: 'KACHA', direction: 'OUT', reversalOfId: null, createdAt: { gt: first.createdAt } },
+    where: { branchId, asset: pool.metal, metalForm: pool.form, direction: 'OUT', reversalOfId: null, createdAt: { gt: first.createdAt } },
     orderBy: { createdAt: 'asc' }, select: { id: true, source: true, sourceId: true, txnDate: true, fine: true },
   });
   const reversed = new Set((await tx.ledgerEntry.findMany({ where: { reversalOfId: { in: draws.map((d) => d.id) } }, select: { reversalOfId: true } })).map((r) => r.reversalOfId));
@@ -483,7 +463,7 @@ export async function createBill(ctx: TenantContext, body: BillBody): Promise<Bi
         ...gstMeta(body),
       },
     });
-    const kacha = await kachaGuard(tx, branchId, kachaMetals(prep.payCalcs)); // ACC-05: a purchase paid in kacha draws the pool
+    const kacha = await billPools(tx, branchId, [prep.payCalcs]); // ACC-05: a purchase paid in kacha / bullion draws the pool
     await writeBillContents(tx, ctx, bill, body, prep, lctx, reservedIds);
     await kacha();
     if (body.draftId != null) {
@@ -527,7 +507,7 @@ export async function editBill(ctx: TenantContext, id: number, body: BillBody): 
     const locked = await tx.bill.updateMany({ where: { id, status: 'ACTIVE' }, data: { status: 'ACTIVE' } });
     if (locked.count !== 1) throw new HttpError(409, 'CONFLICT', 'Bill is not active');
     // ACC-05: checked on the projected post-edit balance (old kacha payments undone, new ones posted)
-    const kacha = await kachaGuard(tx, bill.branchId, kachaMetals(bill.payments, prep.payCalcs), { kind: bill.kind, billId: id });
+    const kacha = await billPools(tx, bill.branchId, [bill.payments, prep.payCalcs], { kind: bill.kind, billId: id });
     await undoBill(tx, ctx, bill, lctx, true); // undo old effects (always returns stock) before re-applying
     await tx.billItem.deleteMany({ where: { billId: id } });
     await tx.bill.update({
@@ -571,7 +551,7 @@ export async function addBillPayments(ctx: TenantContext, id: number, body: { pa
   await prisma.$transaction(async (tx) => {
     const fresh = await tx.bill.findUnique({ where: { id }, select: { status: true } });
     if (!fresh || fresh.status !== 'ACTIVE') throw new HttpError(409, 'CONFLICT', 'Bill is not active');
-    const kacha = await kachaGuard(tx, bill.branchId, kachaMetals(payCalcs)); // ACC-05
+    const kacha = await billPools(tx, bill.branchId, [payCalcs]); // ACC-05
     await postNoCashPays(tx, ctx, bill, payCalcs, txnDate, lctx);
     for (const pc of payCalcs) {
       const pay = await tx.billPayment.create({ data: { billId: id, mode: pc.input.mode, bankAccountId: pc.bankAccountId ?? null, metal: pc.metal ?? null, metalForm: pc.metalForm ?? null, gross: pc.gross ?? null, net: pc.net ?? null, tunch: pc.tunch ?? null, fine: pc.fine ?? null, rate: pc.rate ?? null, amount: pc.amount, remark: pc.input.remark ?? null, schemeEnrollmentId: pc.enrollment?.id ?? null, jewelleryTypeId: pc.input.mode === 'METAL' ? pc.input.jewelleryTypeId ?? null : null, txnDate, isActive: true, createdById: ctx.userId } });
@@ -602,7 +582,7 @@ export async function deleteBill(ctx: TenantContext, id: number, returnStock: bo
     const flipped = await tx.bill.updateMany({ where: { id, status: 'ACTIVE' }, data: { status: 'DELETED', deletedAt: new Date(), deletedWithStock: returnStock } });
     if (flipped.count !== 1) throw new HttpError(409, 'CONFLICT', 'Bill is not active');
     // ACC-05: checked on the projected post-reversal balance, before the purchase early return below
-    const kacha = await kachaGuard(tx, bill.branchId, kachaMetals(bill.payments), { kind: bill.kind, billId: id });
+    const kacha = await billPools(tx, bill.branchId, [bill.payments], { kind: bill.kind, billId: id });
     await reopenSchemes(tx, ctx, bill);
     await tx.billPayment.updateMany({ where: { billId: id }, data: { isActive: false } });
     for (const p of bill.payments) await ledger.reverse(tx, lctx, { source: billSource(bill.kind), sourceId: `${id}-P${p.id}` });
