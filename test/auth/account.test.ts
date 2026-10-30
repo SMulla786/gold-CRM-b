@@ -14,6 +14,7 @@ async function setup() {
 }
 const NEXT = 'N3w-Passw0rd';
 const refresh = (cookie: string[]) => api.post('/api/auth/refresh').set('Cookie', cookie);
+const cookieOf = (res: { headers: Record<string, unknown> }) => (res.headers['set-cookie'] ?? []) as string[];
 
 beforeEach(truncateAll);
 
@@ -41,16 +42,52 @@ describe('change password (ADM-07)', () => {
     expect(await argon2.verify((await db.user.findUniqueOrThrow({ where: { id: u.user.id } })).passwordHash, NEXT)).toBe(true);
   });
 
-  // Known gap (sent to the lead): a password change revokes the other sessions with the same revokedAt that token rotation
-  // uses, so the other device's next auto-refresh looks like a replayed token and refresh() revokes EVERY session —
-  // including the one that just changed the password. it.fails pins it; flip with the fix.
-  it.fails('the other device refreshing after a password change does not sign out the session that changed it', async () => {
+  // G2b B: a password change ends the other sessions with revokeReason PASSWORD_CHANGED, so their next refresh is a plain
+  // 401 — not a replayed-token theft cascade that would also sign out the session that changed it.
+  it('the other device refreshing after a password change does not sign out the session that changed it; the revoked row is kept', async () => {
     const u = await setup();
     const here = await loginAs(u.username);
     const phone = await loginAs(u.username);
     await api.post('/api/auth/password').set('Authorization', bearer(here.token!)).send({ current: TEST_PASSWORD, next: NEXT });
+    const b = await refresh(phone.cookie);
+    expect([b.status, b.body.error.message]).toEqual([401, 'Session ended']);
+    const a1 = await refresh(here.cookie);
+    expect(a1.status).toBe(200);
+    expect((await refresh(cookieOf(a1))).status).toBe(200); // keeps rotating normally afterwards
+    const ended = await db.session.findMany({ where: { userId: u.user.id, revokeReason: 'PASSWORD_CHANGED' } });
+    expect(ended).toHaveLength(1); // the phone's row is kept for audit, not deleted
+    expect(await db.session.count({ where: { userId: u.user.id, revokedAt: null } })).toBe(1);
+  });
+
+  it('a replayed ROTATED token is still treated as theft: every live session of the user is revoked', async () => {
+    const u = await setup();
+    const a = await loginAs(u.username);
+    const other = await loginAs(u.username);
+    expect((await refresh(a.cookie)).status).toBe(200); // rotates a
+    const replay = await refresh(a.cookie);
+    expect([replay.status, replay.body.error.message]).toEqual([401, 'Refresh token reused']);
+    expect((await refresh(other.cookie)).status).toBe(401);
+    expect(await db.session.count({ where: { userId: u.user.id, revokedAt: null } })).toBe(0);
+  });
+
+  it('OTP reset and admin reset end old sessions without the cascade: the login made afterwards survives the old device refreshing', async () => {
+    const u = await setup();
+    const old = await loginAs(u.username);
+    await db.otpCode.create({ data: { userId: u.user.id, purpose: 'PASSWORD_RESET', codeHash: await argon2.hash('123456'), expiresAt: new Date(Date.now() + 60_000) } });
+    expect((await api.post('/api/auth/reset-password').send({ login: u.username, otp: '123456', next: NEXT })).status).toBe(204);
+    const fresh = await loginAs(u.username, NEXT);
+    expect((await refresh(old.cookie)).status).toBe(401);
+    expect((await refresh(fresh.cookie)).status).toBe(200);
+    expect(await db.session.count({ where: { userId: u.user.id, revokeReason: 'PASSWORD_RESET' } })).toBe(1);
+
+    const staff = await createUser({ businessId: u.user.businessId, branchId: u.user.branchId, level: 'BRANCH_USER' });
+    const phone = await loginAs(staff.username);
+    const ownerAuth = bearer((await loginAs(u.username, NEXT)).token!);
+    expect((await api.post(`/api/admin/users/${staff.user.id}/reset-password`).set('Authorization', ownerAuth).send({ password: NEXT })).status).toBe(204);
+    const again = await loginAs(staff.username, NEXT);
     expect((await refresh(phone.cookie)).status).toBe(401);
-    expect((await refresh(here.cookie)).status).toBe(200); // today: 401 (reuse detection fired)
+    expect((await refresh(again.cookie)).status).toBe(200);
+    expect(await db.session.count({ where: { userId: staff.user.id, revokeReason: 'ADMIN_RESET' } })).toBe(1);
   });
 
   it('without a token → 401', async () => {
@@ -86,3 +123,30 @@ describe('set / change MPIN (ADM-07)', () => {
     expect((await api.post('/api/auth/mpin/verify').set('Authorization', auth).send({ mpin: '1111' })).status).toBe(204);
   });
 });
+
+describe("impersonating Super Admin cannot change the owner's credentials (G2b B)", () => {
+  it("403 on /auth/password, /auth/mpin and the owner's reset-password / reset-mpin; staff resets still work; nothing changes", async () => {
+    const u = await setup();
+    const staff = await createUser({ businessId: u.user.businessId, branchId: u.user.branchId, level: 'BRANCH_USER' });
+    const sa = await createUser({ level: 'SUPER_ADMIN' });
+    const saAuth = bearer((await loginAs(sa.username)).token!);
+    const imp = await api.post(`/api/platform/businesses/${u.user.businessId}/impersonate`).set('Authorization', saAuth).send({ reason: 'support ticket' });
+    expect(imp.status).toBe(201);
+    const as = bearer(imp.body.accessToken);
+    const blocked = [
+      await api.post('/api/auth/password').set('Authorization', as).send({ current: TEST_PASSWORD, next: NEXT }),
+      await api.post('/api/auth/mpin').set('Authorization', as).send({ password: TEST_PASSWORD, mpin: '9999' }),
+      await api.post(`/api/admin/users/${u.user.id}/reset-password`).set('Authorization', as).send({ password: NEXT }),
+      await api.post(`/api/admin/users/${u.user.id}/reset-mpin`).set('Authorization', as).send({ mpin: '9999' }),
+    ];
+    expect(blocked.map((r) => [r.status, r.body.error?.code])).toEqual(Array(4).fill([403, 'FORBIDDEN']));
+    const owner = await db.user.findUniqueOrThrow({ where: { id: u.user.id } });
+    expect([await argon2.verify(owner.passwordHash, TEST_PASSWORD), await argon2.verify(owner.mpinHash!, TEST_MPIN)]).toEqual([true, true]);
+
+    expect((await api.post(`/api/admin/users/${staff.user.id}/reset-mpin`).set('Authorization', as).send({ mpin: '4321' })).status).toBe(204);
+    // the real owner (not impersonated) still can
+    const ownerAuth = bearer((await loginAs(u.username)).token!);
+    expect((await api.post('/api/auth/mpin').set('Authorization', ownerAuth).send({ password: TEST_PASSWORD, mpin: '9999' })).status).toBe(204);
+  });
+});
+

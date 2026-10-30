@@ -343,15 +343,21 @@ export async function setUserStatus(ctx: TenantContext, userId: number, status: 
   if (target.isOwner && !ctx.isOwner) throw new HttpError(403, 'FORBIDDEN', 'Only the owner can block the owner');
   if (status !== 'ACTIVE' && target.id === ctx.userId) throw new HttpError(403, 'FORBIDDEN', 'You cannot block or delete yourself');
   await scopedDb(ctx).user.update({ where: { id: userId }, data: { status } });
-  if (status !== 'ACTIVE') await prisma.session.updateMany({ where: { userId, revokedAt: null }, data: { revokedAt: new Date() } });
+  if (status !== 'ACTIVE') await prisma.session.updateMany({ where: { userId, revokedAt: null }, data: { revokedAt: new Date(), revokeReason: status } });
+}
+
+/** An impersonating Super Admin acts as the owner, but must never reset the owner's own password or MPIN. */
+function assertNotImpersonatingOwner(ctx: TenantContext, target: { isOwner: boolean }): void {
+  if (ctx.impersonatorId != null && target.isOwner) throw new HttpError(403, 'FORBIDDEN', "Not allowed while impersonating: the owner's credentials");
 }
 
 export async function resetUserPassword(ctx: TenantContext, userId: number, password: string): Promise<void> {
   const target = await scopedDb(ctx).user.findUnique({ where: { id: userId } });
   if (!target) throw new HttpError(404, 'NOT_FOUND', 'User not found');
   if (target.isOwner && !ctx.isOwner) throw new HttpError(403, 'FORBIDDEN', 'Only the owner can reset the owner');
+  assertNotImpersonatingOwner(ctx, target);
   await scopedDb(ctx).user.update({ where: { id: userId }, data: { passwordHash: await argon2.hash(password) } });
-  await prisma.session.updateMany({ where: { userId, revokedAt: null }, data: { revokedAt: new Date() } });
+  await prisma.session.updateMany({ where: { userId, revokedAt: null }, data: { revokedAt: new Date(), revokeReason: 'ADMIN_RESET' } });
 }
 
 /** Admin sets/resets a user's MPIN (staff otherwise can't pass MPIN-gated actions until they set one themselves). */
@@ -359,6 +365,7 @@ export async function resetUserMpin(ctx: TenantContext, userId: number, mpin: st
   const target = await scopedDb(ctx).user.findUnique({ where: { id: userId } });
   if (!target) throw new HttpError(404, 'NOT_FOUND', 'User not found');
   if (target.isOwner && !ctx.isOwner) throw new HttpError(403, 'FORBIDDEN', 'Only the owner can reset the owner');
+  assertNotImpersonatingOwner(ctx, target);
   await scopedDb(ctx).user.update({ where: { id: userId }, data: { mpinHash: await argon2.hash(mpin) } });
 }
 

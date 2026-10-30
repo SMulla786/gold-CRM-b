@@ -2,6 +2,7 @@ import { Router } from 'express';
 import type { Request } from 'express';
 import { env } from '../../config/env';
 import { requireAuth } from '../../middleware/auth';
+import { HttpError } from '../../middleware/error';
 import { authRateLimit } from '../../middleware/rateLimit';
 import {
   REFRESH_COOKIE,
@@ -44,12 +45,19 @@ authRouter.get('/me', requireAuth, async (req, res) => {
   res.json(await svc.buildMe(req.auth!.userId, req.auth!.impersonatorId));
 });
 
+// An impersonating Super Admin acts as the owner but must never change the owner's own credentials.
+const notImpersonating = (req: Request): void => {
+  if (req.auth!.impersonatorId != null) throw new HttpError(403, 'FORBIDDEN', 'Not allowed while impersonating');
+};
+
 authRouter.post('/password', requireAuth, async (req, res) => {
+  notImpersonating(req);
   await svc.changePassword(req.auth!.userId, req.auth!.sessionId, changePasswordBody.parse(req.body));
   res.status(204).end();
 });
 
 authRouter.post('/mpin', requireAuth, async (req, res) => {
+  notImpersonating(req);
   await svc.setMpin(req.auth!.userId, setMpinBody.parse(req.body));
   res.status(204).end();
 });

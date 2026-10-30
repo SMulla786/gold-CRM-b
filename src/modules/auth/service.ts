@@ -65,6 +65,8 @@ export async function refresh(rawToken: string | undefined, meta: SessionMeta): 
   const session = await prisma.session.findUnique({ where: { refreshTokenHash: hashToken(rawToken) } });
   if (!session) throw new HttpError(401, 'UNAUTHENTICATED', 'Invalid refresh token');
   if (session.revokedAt) {
+    // A session ended on purpose (password change/reset, block…) is just over — its other device must not sign out the rest.
+    if (session.revokeReason) throw new HttpError(401, 'UNAUTHENTICATED', 'Session ended');
     // Reuse of an already-rotated token ⇒ treat as theft: revoke every live session for the user.
     await prisma.session.updateMany({ where: { userId: session.userId, revokedAt: null }, data: { revokedAt: new Date() } });
     throw new HttpError(401, 'UNAUTHENTICATED', 'Refresh token reused');
@@ -152,7 +154,7 @@ export async function changePassword(userId: number, currentSessionId: string, i
   const passwordHash = await argon2.hash(input.next);
   await prisma.$transaction([
     prisma.user.update({ where: { id: userId }, data: { passwordHash } }),
-    prisma.session.updateMany({ where: { userId, revokedAt: null, NOT: { id: currentSessionId } }, data: { revokedAt: new Date() } }),
+    prisma.session.updateMany({ where: { userId, revokedAt: null, NOT: { id: currentSessionId } }, data: { revokedAt: new Date(), revokeReason: 'PASSWORD_CHANGED' } }),
   ]);
 }
 
@@ -195,6 +197,6 @@ export async function resetPassword(input: { login: string; otp: string; next: s
   await prisma.$transaction([
     prisma.otpCode.update({ where: { id: otp.id }, data: { consumedAt: new Date() } }),
     prisma.user.update({ where: { id: user.id }, data: { passwordHash: nextHash } }),
-    prisma.session.updateMany({ where: { userId: user.id, revokedAt: null }, data: { revokedAt: new Date() } }),
+    prisma.session.updateMany({ where: { userId: user.id, revokedAt: null }, data: { revokedAt: new Date(), revokeReason: 'PASSWORD_RESET' } }),
   ]);
 }
