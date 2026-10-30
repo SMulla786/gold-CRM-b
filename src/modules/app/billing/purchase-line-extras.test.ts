@@ -117,3 +117,64 @@ describe('INV-12 purchase stones per item', () => {
     expect(await db.stockItemStone.count()).toBe(0);
   });
 });
+
+describe('INV-12 stone charge = Σ stone amounts (owner 2026-10-30)', () => {
+  const st = (name: string, amount: number) => ({ name, amount });
+  const line = async (b: { items: { stockItemId: number | null; stoneCharge: string }[] }) => {
+    const item = await db.stockItem.findUniqueOrThrow({ where: { id: b.items[0]!.stockItemId! } });
+    return { bill: Number(b.items[0]!.stoneCharge), stock: Number(item.stoneCharge) };
+  };
+  const partyMoney = async (partyId: number) => (await db.udharEntry.findMany({ where: { partyId } })).reduce((a, r) => a + Number(r.amount), 0);
+  const stockValue = async () => (await db.ledgerEntry.findMany({ where: { source: 'PURCHASE_BILL' } })).reduce((a, r) => a + (r.direction === 'IN' ? 1 : -1) * Number(r.amount), 0);
+
+  it('several stones: charge = their total rounded half-up to the paisa, counted once in the bill total', async () => {
+    const s = await setup();
+    const bill = await billing.createBill(s.ctx, purchase(s, { stoneCharge: 9999, stones: [st('Ruby', 100.125), st('Emerald', 200.13), st('CZ', 0)] }));
+    expect(await line(bill)).toEqual({ bill: 300.26, stock: 300.26 }); // 300.255 → 300.26; the typed 9999 is replaced
+    const plain = await billing.createBill(s.ctx, purchase(s, { stoneCharge: 300.26 }));
+    expect(bill.final).toBe(plain.final);
+    expect(Number(bill.items[0]!.total)).toBe(Number(plain.items[0]!.total));
+  });
+
+  it('stones of zero amount give a zero charge; no stones keeps the typed charge', async () => {
+    const s = await setup();
+    expect((await line(await billing.createBill(s.ctx, purchase(s, { stoneCharge: 500, stones: [st('CZ', 0)] })))).bill).toBe(0);
+    expect((await line(await billing.createBill(s.ctx, purchase(s, { stoneCharge: 500 })))).bill).toBe(500);
+    expect((await line(await billing.createBill(s.ctx, purchase(s, { stoneCharge: 500, stones: [] })))).bill).toBe(500);
+  });
+
+  it('edit re-syncs the charge (more stones, then none → typed charge); stock value and party balance follow', async () => {
+    const s = await setup();
+    const bill = await billing.createBill(s.ctx, purchase(s, { stones: [st('Ruby', 2000)] }));
+    const base = Number(bill.final) - 2000;
+    const more = await billing.editBill(s.ctx, bill.id, purchase(s, { stones: [st('Ruby', 2000), st('Pearl', 1000.5)] }));
+    expect(await line(more)).toEqual({ bill: 3000.5, stock: 3000.5 });
+    expect(Number(more.final)).toBe(Math.round(base + 3000.5)); // final rounds to the rupee
+    expect(await stockValue()).toBe(Number(more.items[0]!.total));
+    expect(await partyMoney(s.supplier.id)).toBe(-Number(more.final)); // shop owes the supplier the new total once
+    const none = await billing.editBill(s.ctx, bill.id, purchase(s, { stoneCharge: 700 }));
+    expect(await line(none)).toEqual({ bill: 700, stock: 700 });
+    expect(none.items[0]!.stones).toEqual([]);
+  });
+
+  it('delete reverses stock value and the supplier balance to zero; stones stay with the deleted stock item', async () => {
+    const s = await setup();
+    const bill = await billing.createBill(s.ctx, purchase(s, { stones: [st('Ruby', 2000), st('Pearl', 500)] }));
+    expect(await partyMoney(s.supplier.id)).toBe(-Number(bill.final));
+    await billing.deleteBill(s.ctx, bill.id, true); // purchase: delete the created stock too
+    expect(await partyMoney(s.supplier.id)).toBe(0);
+    expect(await stockValue()).toBe(0);
+    expect((await db.stockItem.findUniqueOrThrow({ where: { id: bill.items[0]!.stockItemId! } })).status).toBe('DELETED');
+    expect(await db.stockItemStone.count({ where: { stockItemId: bill.items[0]!.stockItemId! } })).toBe(2);
+  });
+
+  it('tenant scope: stone rows carry the business; another business cannot read the bill or its stock', async () => {
+    const s = await setup();
+    const bill = await billing.createBill(s.ctx, purchase(s, { stones: [st('Ruby', 2000)] }));
+    expect(await db.stockItemStone.findMany({ select: { businessId: true } })).toEqual([{ businessId: s.ctx.businessId }]);
+    const other = await createBusiness({ name: 'B' });
+    const octx = { ...s.ctx, businessId: other.business.id, scopeBranchId: other.root.id, branchIds: [other.root.id], activeBranchId: other.root.id };
+    await expect(billing.getBill(octx, bill.id)).rejects.toMatchObject({ status: 404 });
+    await expect(inv.getStock(octx, bill.items[0]!.stockItemId!)).rejects.toMatchObject({ status: 404 });
+  });
+});

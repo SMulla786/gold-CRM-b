@@ -142,6 +142,11 @@ export function computeBill(b: BillInput): BillResult {
 }
 
 /** Converts a money balance to metal weight at a rate per `rateUnitGrams` (keep balance as gold/silver, bhav cut). */
+/** INV-12: a purchase line's stone charge = Σ its stone amounts, rounded once to the paisa (half-up). */
+export function stoneTotal(amounts: readonly Num[]): string {
+  return M(amounts.reduce<Decimal>((a, x) => a.plus(D(x)), D(0)));
+}
+
 export function moneyToMetal(amount: Num, rate: Num, rateUnitGrams: Num = 1): string {
   const r = D(rate);
   return r.isZero() ? '0.000' : W(D(amount).times(D(rateUnitGrams)).div(r));

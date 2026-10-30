@@ -5,7 +5,7 @@ import * as ledger from '../../../lib/ledger';
 import * as udhar from '../../../lib/udhar';
 import { logActivity } from '../../../lib/activity';
 import { HttpError } from '../../../middleware/error';
-import { computeBill, computeLine, fineWeight, metalToMoney, moneyToMetal, netWeight, PAN_CASH_LIMIT, RATE_UNIT_GRAMS } from '../../../shared';
+import { computeBill, computeLine, fineWeight, metalToMoney, moneyToMetal, netWeight, PAN_CASH_LIMIT, RATE_UNIT_GRAMS, stoneTotal } from '../../../shared';
 import type { BillBody, BillDto, BillKind, BillLineDto, BillListItemDto, BillPayInput, BillPaymentDto, BillType, LedgerSource, Paged, PartyRefDto, StockClass } from '../../../shared';
 import type { TenantContext } from '../../../middleware/context';
 import { getSettings } from '../service';
@@ -308,7 +308,7 @@ async function writeBillContents(tx: Prisma.TransactionClient, ctx: TenantContex
           pcs: r.pcs, gross: r.gross, less: r.less, net: r.calc.net, tunch: r.tunch, wastage: r.wastage, fine: r.calc.fine, stoneCharge: r.input.stoneCharge, labour: r.input.saleLabour ?? r.input.labour,
           labourUnit: r.input.saleLabourUnit ?? r.input.labourUnit, other: r.input.other, rate: r.input.saleRate ?? (r.input.rate || null), purchaseCost: r.calc.total, status: 'AVAILABLE', source: 'PURCHASE_BILL', sourceId: String(billId), createdById: ctx.userId,
           remarks: r.input.remarks ?? null, ...(r.input.epcCode ? { codeType: 'RFID' as const, epcCode: r.input.epcCode } : {}),
-          // INV-12: descriptive stone elements (stoneCharge above stays the line's stone money)
+          // INV-12: stone elements; with rows, stoneCharge above is already their total (withStoneCharges)
           ...(r.input.stones?.length ? { stones: { create: r.input.stones.map((st) => ({ businessId: ctx.businessId!, ...st })) } } : {}),
         },
       });
@@ -386,7 +386,12 @@ const gstMeta = (b: BillBody) => ({
   reverseCharge: b.reverseCharge,
 });
 
+/** INV-12: on a purchase line with stone rows the stone charge is their total (it then counts once, in computeLine); without rows the typed charge stands. */
+const withStoneCharges = (body: BillBody): BillBody =>
+  body.kind !== 'PURCHASE' ? body : { ...body, items: body.items.map((l) => (l.stones?.length ? { ...l, stoneCharge: Number(stoneTotal(l.stones.map((st) => st.amount))) } : l)) };
+
 export async function createBill(ctx: TenantContext, body: BillBody): Promise<BillDto> {
+  body = withStoneCharges(body);
   const branchId = activeBranch(ctx);
   const s = await getSettings(ctx);
   const numbering = s[body.kind === 'SELL' ? 'invoice.sale' : 'invoice.purchase'];
@@ -447,6 +452,7 @@ export async function createBill(ctx: TenantContext, body: BillBody): Promise<Bi
 
 /** Edit a saved bill (today only): undo it like delete-with-return but keep the row, then re-apply the body onto the same id/billNo/seq. */
 export async function editBill(ctx: TenantContext, id: number, body: BillBody): Promise<BillDto> {
+  body = withStoneCharges(body);
   const sdb = scopedDb(ctx);
   const bill = await sdb.bill.findFirst({ where: { id }, include: { items: true, payments: true } });
   if (!bill) throw new HttpError(404, 'NOT_FOUND', 'Bill not found');
