@@ -2,6 +2,7 @@ import { Router } from 'express';
 import type { Request } from 'express';
 import { env } from '../../config/env';
 import { requireAuth } from '../../middleware/auth';
+import { loadContext } from '../../middleware/context';
 import { HttpError } from '../../middleware/error';
 import { authRateLimit } from '../../middleware/rateLimit';
 import {
@@ -41,7 +42,7 @@ authRouter.post('/logout', async (req, res) => {
   res.clearCookie(REFRESH_COOKIE, { path: '/api/auth' }).status(204).end();
 });
 
-authRouter.get('/me', requireAuth, async (req, res) => {
+authRouter.get('/me', requireAuth, loadContext, async (req, res) => {
   res.json(await svc.buildMe(req.auth!.userId, req.auth!.impersonatorId));
 });
 
@@ -50,19 +51,19 @@ const notImpersonating = (req: Request): void => {
   if (req.auth!.impersonatorId != null) throw new HttpError(403, 'FORBIDDEN', 'Not allowed while impersonating');
 };
 
-authRouter.post('/password', requireAuth, async (req, res) => {
+authRouter.post('/password', requireAuth, loadContext, async (req, res) => {
   notImpersonating(req);
   await svc.changePassword(req.auth!.userId, req.auth!.sessionId, changePasswordBody.parse(req.body));
   res.status(204).end();
 });
 
-authRouter.post('/mpin', requireAuth, async (req, res) => {
+authRouter.post('/mpin', requireAuth, loadContext, async (req, res) => {
   notImpersonating(req);
   await svc.setMpin(req.auth!.userId, setMpinBody.parse(req.body));
   res.status(204).end();
 });
 
-authRouter.post('/mpin/verify', requireAuth, async (req, res) => {
+authRouter.post('/mpin/verify', requireAuth, loadContext, async (req, res) => {
   await svc.verifyMpin(req.auth!.userId, verifyMpinBody.parse(req.body).mpin);
   res.status(204).end();
 });
