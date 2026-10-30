@@ -500,8 +500,8 @@ export async function getDayBookAllInOne(ctx: TenantContext, q: { page: number; 
     sdb.ledgerEntry.findMany({ where: scoped, select: { source: true, sourceId: true, txnDate: true, partyId: true, narration: true }, distinct: ['source', 'sourceId', 'txnDate'] }),
     // opening before `from` — same rule (scope + source filter) as getDayBook
     sdb.ledgerEntry.groupBy({ by: ['asset', 'direction'], where: { ...scope, asset: { in: [...RUN] }, txnDate: { lt: from } }, ...sum }),
-    // per-document sums from `from` up to the page's oldest date (covers every document at or below the page)
-    sdb.ledgerEntry.groupBy({ by: ['source', 'sourceId', 'txnDate', 'asset', 'direction'], where: { ...where, asset: { in: [...RUN] }, txnDate: { gte: from, lte: page.at(-1)!.txnDate } }, ...sum }),
+    // per-document sums from `from` up to the page's newest date (covers every document on and below the page)
+    sdb.ledgerEntry.groupBy({ by: ['source', 'sourceId', 'txnDate', 'asset', 'direction'], where: { ...where, asset: { in: [...RUN] }, txnDate: { gte: from, lte: page[0]!.txnDate } }, ...sum }),
   ]);
 
   // running balance: rows are newest first, so walk from the oldest document up to the page's first row
