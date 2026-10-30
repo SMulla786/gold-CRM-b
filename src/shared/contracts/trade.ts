@@ -8,7 +8,18 @@ import { z } from 'zod';
 import { id, pageQuery } from './common';
 import { decimalInput, METALS, PARTY_TYPES } from './masters';
 import type { PartyRefDto } from './masters';
+import { inlineUdharInput } from './udhari';
 import type { ActivityAction } from '../enums';
+
+/** TRD-02: the inline udhar entry a trade posted (a linked, numbered udhar entry; edited / deleted only via the trade) */
+export interface TradeUdharDto {
+  txnId: number;
+  txnNo: number;
+  cashOut: string; onlineOut: string; cashIn: string; onlineIn: string;
+  goldOut: string; goldIn: string; silverOut: string; silverIn: string;
+  bhav: { direction: 'MONEY_TO_METAL' | 'METAL_TO_MONEY'; metal: 'GOLD' | 'SILVER'; amount: string; rate: string; unitGrams: number; weight: string } | null;
+  remark: string | null;
+}
 
 const weight = z.coerce.number().finite().min(0).max(1_000_000);
 const money = { cash: decimalInput.default(0), online: decimalInput.default(0), bankAccountId: id.optional() };
@@ -92,6 +103,8 @@ export const exchangeBody = z
     diffPctMinus: z.coerce.number().min(0).max(100).optional(),
     diffGmMinus: weight.optional(),
     given: exchangeGivenInput.optional(),
+    /** TRD-02: udhar jama / udhar + bhav cut posted with this exchange (same fields as New Udhar) */
+    udhar: inlineUdharInput.optional(),
     /** settings units; 0 → settled as a metal credit/debit on the party (no money) */
     rate: decimalInput.default(0),
     charges: decimalInput.default(0),
@@ -148,6 +161,8 @@ export interface ExchangeDto {
   diff?: { pctPlus: string; gmPlus: string; pctMinus: string; gmMinus: string; plusBy: 'WEIGHT' | 'FINE' | null; minusBy: 'WEIGHT' | 'FINE' | null };
   /** G5 given metal (null = none) */
   given?: { gross: string; net: string; touch: string; fine: string } | null;
+  /** TRD-02 inline udhar (null = none) */
+  udhar?: TradeUdharDto | null;
   afterFine: string;
   rate: string;
   charges: string;
@@ -269,14 +284,21 @@ export const buySellBody = z
     txnDate: z.coerce.date().optional(),
     lines: z.array(buySellLineInput).min(1).max(50),
     discount: decimalInput.default(0),
-    /** deliver against this booking: same party/metal/side, every line at the booking rate */
+    /** deliver against this booking: same party/metal/side, every line at the booking rate (= deliveries [{ bookingId, weight: total }]) */
     bhavBookingId: id.optional(),
+    /** TRD-03: deliver against several bookings (same party / metal / side / branch). Per rate, the lines' weight must equal
+     *  the weight taken from bookings at that rate, and the deliveries cover the whole trade weight. */
+    deliveries: z.array(z.object({ bookingId: id, weight: weight.positive() })).min(1).max(20).optional(),
+    /** TRD-02: udhar jama / udhar + bhav cut posted with this trade (same fields as New Udhar) */
+    udhar: inlineUdharInput.optional(),
     narration: z.string().trim().max(300).optional(),
     ...money,
     ...split,
   })
   .refine(bankRule, { message: 'Select a bank account', path: ['bankAccountId'] })
-  .refine(splitRule, splitMsg);
+  .refine(splitRule, splitMsg)
+  .refine((b) => b.bhavBookingId == null || b.deliveries == null, { message: 'Send either bhavBookingId or deliveries', path: ['deliveries'] })
+  .refine((b) => !b.deliveries || new Set(b.deliveries.map((d) => d.bookingId)).size === b.deliveries.length, { message: 'A booking is listed twice', path: ['deliveries'] });
 
 export const buySellListQuery = pageQuery.extend({ side: z.enum(TRADE_SIDES).optional(), metal: z.enum(METALS).optional(), partyId: id.optional(), ...range });
 
@@ -296,6 +318,10 @@ export interface BuySellDto {
   bankAccount: { id: number; name: string } | null;
   balance: string;
   bhavBooking: { id: number; bookingNo: number } | null;
+  /** TRD-03: every booking this trade delivered against (a pre-TRD-03 single link shows as one row) */
+  deliveries?: Array<{ bookingId: number; bookingNo: number; rate: string; weight: string }>;
+  /** TRD-02 inline udhar (null = none) */
+  udhar?: TradeUdharDto | null;
   narration: string | null;
   lines: Array<{ id: number; weight: string; rate: string; amount: string }>;
   createdBy: string | null;

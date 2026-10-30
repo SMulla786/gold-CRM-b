@@ -9,6 +9,7 @@ import { HttpError } from '../../../middleware/error';
 import type { z } from 'zod';
 import { exchangeBody, exchangeListQuery, fineWeight, metalToMoney, roundMoney } from '../../../shared';
 import { getSettings } from '../service';
+import { checkInlineUdhar, inlineUdharDto, syncInlineUdhar } from '../udhar';
 import type { ExchangeDto, Paged, TradeHistoryDto } from '../../../shared';
 import type { TenantContext } from '../../../middleware/context';
 import { D, activeBranch, dateOnly, dateRange, docHistory, lctxOf, loadPayments, loadRefs, lockDoc, metalRow, money, nextNo, payPlan, payRows, savePayments, settingsUnit, snap, wt } from './common';
@@ -50,6 +51,7 @@ async function prepare(ctx: TenantContext, body: ExchangeBody) {
   if (settleFine.lt(0)) throw new HttpError(400, 'VALIDATION', 'The given metal is more than the party takes; record it as a BUY exchange');
   const exact = body.rate > 0 ? D(metalToMoney(settleFine, body.rate, unit)).plus(body.charges).minus(body.discount) : D(0);
   const rounded = body.rate > 0 ? roundMoney(exact, defaults.roundOff, defaults.roundStep) : { final: '0', round: '0' };
+  if (body.udhar) await checkInlineUdhar(ctx, body.partyId, body.udhar); // TRD-02
   return { party, plan, lines, totalFine, totalWeight, diff, diffFine, afterFine, given, givenFine, settleFine, finalAmount: D(rounded.final), roundOff: D(rounded.round) };
 }
 type Prepared = Awaited<ReturnType<typeof prepare>>;
@@ -95,7 +97,8 @@ export async function createExchange(ctx: TenantContext, body: ExchangeBody): Pr
 
   const id = await prisma.$transaction(async (tx) => {
     const exchangeNo = await nextNo(tx, ctx.businessId!, branchId, 'EXCHANGE');
-    const ex = await tx.exchange.create({ data: { businessId: ctx.businessId!, branchId, exchangeNo, txnDate, createdById: ctx.userId, ...docData(body, p) } });
+    const inline = await syncInlineUdhar(tx, ctx, null, body.udhar, { branchId, partyId: body.partyId, txnDate }, `Exchange #${exchangeNo}`); // TRD-02
+    const ex = await tx.exchange.create({ data: { businessId: ctx.businessId!, branchId, exchangeNo, txnDate, createdById: ctx.userId, ...docData(body, p), ...inline } });
     const pools = await poolGuard(tx, branchId, [{ metal: body.metal, form: 'KACHA' }]); // a SELL can't sell more kacha than the pool holds
     if (p.plan.rows) await savePayments(tx, ctx, 'EXCHANGE', ex.id, p.plan);
     await post(tx, ctx, { id: ex.id, exchangeNo, branchId, txnDate }, body, p);
@@ -126,8 +129,9 @@ export async function updateExchange(ctx: TenantContext, id: number, body: Excha
     const pools = await poolGuard(tx, old.branchId, [{ metal: old.metal, form: 'KACHA' }, { metal: body.metal, form: 'KACHA' }]);
     await ledger.reverse(tx, lctx, { source: 'EXCHANGE', sourceId: String(id) });
     await udhar.reverse(tx, lctx, { source: 'EXCHANGE', sourceId: String(id) });
+    const inline = await syncInlineUdhar(tx, ctx, old.inlineUdhar, body.udhar, { branchId: old.branchId, partyId: body.partyId, txnDate }, `Exchange #${old.exchangeNo}`); // TRD-02
     await tx.exchangeLine.deleteMany({ where: { exchangeId: id } });
-    const after = await tx.exchange.update({ where: { id }, data: { txnDate, ...docData(body, p) }, include: { lines: { orderBy: { id: 'asc' } } } });
+    const after = await tx.exchange.update({ where: { id }, data: { txnDate, ...docData(body, p), ...inline }, include: { lines: { orderBy: { id: 'asc' } } } });
     await savePayments(tx, ctx, 'EXCHANGE', id, p.plan);
     await post(tx, ctx, { id, exchangeNo: old.exchangeNo, branchId: old.branchId, txnDate }, body, p);
     await pools();
@@ -153,6 +157,7 @@ export async function deleteExchange(ctx: TenantContext, id: number): Promise<vo
     const pools = await poolGuard(tx, ex.branchId, [{ metal: ex.metal, form: 'KACHA' }]);
     await ledger.reverse(tx, lctx, { source: 'EXCHANGE', sourceId: String(id) });
     await udhar.reverse(tx, lctx, { source: 'EXCHANGE', sourceId: String(id) });
+    await syncInlineUdhar(tx, ctx, ex.inlineUdhar, undefined, { branchId: ex.branchId, partyId: ex.partyId, txnDate: ex.txnDate }, ''); // TRD-02
     await pools();
     await tx.exchange.delete({ where: { id } }); // cascades lines
     await savePayments(tx, ctx, 'EXCHANGE', id, null);
@@ -164,13 +169,14 @@ export async function deleteExchange(ctx: TenantContext, id: number): Promise<vo
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 async function toDto(ctx: TenantContext, ex: any): Promise<ExchangeDto> {
-  const [refs, payments, procs] = await Promise.all([loadRefs(ctx, ex), loadPayments(ctx, 'EXCHANGE', ex.id), scopedDb(ctx).kachaProcess.count({ where: { reverted: false, OR: [{ exchangeId: ex.id }, { exchangeIds: { has: ex.id } }] } })]);
+  const [refs, payments, procs, udharDto] = await Promise.all([loadRefs(ctx, ex), loadPayments(ctx, 'EXCHANGE', ex.id), scopedDb(ctx).kachaProcess.count({ where: { reverted: false, OR: [{ exchangeId: ex.id }, { exchangeIds: { has: ex.id } }] } }), inlineUdharDto(ctx, ex.inlineUdhar)]);
   const bal = D(ex.finalAmount).minus(ex.cash).minus(ex.online);
   return {
     id: ex.id, exchangeNo: ex.exchangeNo, side: ex.side, party: refs.party, branch: refs.branch, metal: ex.metal, txnDate: dateOnly(ex.txnDate),
     totalFine: wt(ex.totalFine), exactFine: ex.exactFine != null ? wt(ex.exactFine) : null, diffFine: wt(ex.diffFine),
     diff: { pctPlus: String(ex.diffPctPlus), gmPlus: wt(ex.diffGmPlus), pctMinus: String(ex.diffPctMinus), gmMinus: wt(ex.diffGmMinus), plusBy: ex.diffPlusBy, minusBy: ex.diffMinusBy },
     given: ex.givenGross != null ? { gross: wt(ex.givenGross), net: wt(ex.givenNet), touch: String(ex.givenTouch), fine: wt(ex.givenFine) } : null,
+    udhar: udharDto,
     afterFine: wt(ex.afterFine), rate: money(ex.rate), charges: money(ex.charges), discount: money(ex.discount),
     roundOff: money(ex.roundOff), finalAmount: money(ex.finalAmount), cash: money(ex.cash), online: money(ex.online), bankAccount: refs.bankAccount,
     balance: money(ex.side === 'BUY' ? bal.negated() : bal), remark: ex.remark,

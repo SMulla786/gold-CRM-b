@@ -10,10 +10,8 @@ import type { PartyRefDto } from './masters';
 
 const weight = z.coerce.number().finite().min(0).max(1_000_000);
 
-export const udharBody = z
-  .object({
-    partyId: id,
-    txnDate: z.coerce.date().optional(),
+/** The money / metal / bhav-cut movement of an udhar entry (shared by New Udhar and the inline udhar of a trade). */
+const udharMovement = {
     /** given to the party (party owes more) */
     cashOut: decimalInput.default(0),
     onlineOut: decimalInput.default(0),
@@ -36,15 +34,34 @@ export const udharBody = z
         unitGrams: z.union([z.literal(1), z.literal(10), z.literal(1000)]),
       })
       .optional(),
+    remark: z.string().trim().max(300).optional(),
+};
+type Movement = { onlineOut: number; outBankId?: number; onlineIn: number; inBankId?: number; cashOut: number; cashIn: number; goldOut: number; goldIn: number; silverOut: number; silverIn: number; bhav?: unknown };
+const outBank = (b: Movement) => b.onlineOut === 0 || b.outBankId != null;
+const inBank = (b: Movement) => b.onlineIn === 0 || b.inBankId != null;
+const nonEmpty = (b: Movement) => b.cashOut + b.onlineOut + b.cashIn + b.onlineIn + b.goldOut + b.goldIn + b.silverOut + b.silverIn > 0 || b.bhav != null;
+const BANK = { message: 'Select a bank account' };
+const EMPTY = { message: 'Enter an amount, a metal weight or a bhav cut' };
+
+/** TASK-99 inline udhar on a buy-sell / exchange: the same movement as New Udhar, posted as a linked udhar entry of the trade's party and date. */
+export const inlineUdharInput = z
+  .object(udharMovement)
+  .refine(outBank, { ...BANK, path: ['outBankId'] })
+  .refine(inBank, { ...BANK, path: ['inBankId'] })
+  .refine(nonEmpty, EMPTY);
+export type InlineUdharInput = z.infer<typeof inlineUdharInput>;
+
+export const udharBody = z
+  .object({
+    partyId: id,
+    txnDate: z.coerce.date().optional(),
+    ...udharMovement,
     /** apply (cashIn + onlineIn) to this pending SELL bill, or (cashOut + onlineOut) to this pending PURCHASE bill, of the same party (adds BillPayments) */
     settleBillId: id.optional(),
-    remark: z.string().trim().max(300).optional(),
   })
-  .refine((b) => b.onlineOut === 0 || b.outBankId != null, { message: 'Select a bank account', path: ['outBankId'] })
-  .refine((b) => b.onlineIn === 0 || b.inBankId != null, { message: 'Select a bank account', path: ['inBankId'] })
-  .refine((b) => b.cashOut + b.onlineOut + b.cashIn + b.onlineIn + b.goldOut + b.goldIn + b.silverOut + b.silverIn > 0 || b.bhav != null, {
-    message: 'Enter an amount, a metal weight or a bhav cut',
-  })
+  .refine(outBank, { ...BANK, path: ['outBankId'] })
+  .refine(inBank, { ...BANK, path: ['inBankId'] })
+  .refine(nonEmpty, EMPTY)
   .refine((b) => b.settleBillId == null || b.cashIn + b.onlineIn + b.cashOut + b.onlineOut > 0, { message: 'Enter the amount received or paid to settle the bill', path: ['settleBillId'] });
 export type UdharBody = z.infer<typeof udharBody>;
 

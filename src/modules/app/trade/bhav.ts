@@ -124,7 +124,8 @@ export async function undeliverBhav(ctx: TenantContext, id: number): Promise<Bha
   const bk = await sdb.bhavBooking.findFirst({ where: { id } });
   if (!bk) throw new HttpError(404, 'NOT_FOUND', 'Booking not found');
   await prisma.$transaction(async (tx) => {
-    const linked = await tx.buySell.count({ where: { businessId: ctx.businessId!, bhavBookingId: id } });
+    // a buy-sell holds this booking as its first (bhavBookingId) or as any of its multi-booking deliveries (TRD-03)
+    const linked = await tx.buySell.count({ where: { businessId: ctx.businessId!, OR: [{ bhavBookingId: id }, { deliveries: { some: { bookingId: id } } }] } });
     if (linked > 0) throw new HttpError(409, 'CONFLICT', `Booking #${bk.bookingNo} has ${linked} buy-sell ${linked === 1 ? 'entry' : 'entries'} delivered against it. Delete ${linked === 1 ? 'it' : 'them'} first.`);
     const upd = await tx.bhavBooking.updateMany({ where: { id, status: { in: ['DELIVERED', 'PARTIAL'] } }, data: { status: 'PENDING', pendingWeight: bk.weight } });
     if (upd.count !== 1) throw new HttpError(409, 'CONFLICT', 'Only a delivered or part-delivered booking can be marked undelivered');

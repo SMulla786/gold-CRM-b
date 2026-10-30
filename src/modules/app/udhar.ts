@@ -16,6 +16,8 @@ import type {
   PartyType,
   Paged,
   StatementDto,
+  InlineUdharInput,
+  TradeUdharDto,
   UdharBody,
   UdharEntryRowDto,
   UdharTxnDto,
@@ -170,6 +172,17 @@ async function unpostTxn(tx: Prisma.TransactionClient, ctx: TenantContext, t: { 
   }
 }
 
+/** Numbered header row (UDHAR sequence of the branch) — New Udhar and a trade's inline udhar. */
+async function insertTxn(tx: Prisma.TransactionClient, ctx: TenantContext, branchId: number, body: UdharBody, txnDate: Date, bhavWeight: string | null) {
+  const seq = await tx.docSequence.upsert({
+    where: { businessId_branchId_key: { businessId: ctx.businessId!, branchId, key: 'UDHAR' } },
+    create: { businessId: ctx.businessId!, branchId, key: 'UDHAR', next: 2 },
+    update: { next: { increment: 1 } },
+    select: { next: true },
+  });
+  return tx.udharTxn.create({ data: { businessId: ctx.businessId!, branchId, txnNo: seq.next - 1, ...txnFields(body, txnDate, bhavWeight), createdById: ctx.userId } });
+}
+
 export async function createUdharTxn(ctx: TenantContext, body: UdharBody): Promise<UdharTxnDto> {
   const branchId = ctx.activeBranchId ?? ctx.scopeBranchId;
   if (branchId == null || !ctx.branchIds.includes(branchId)) throw new HttpError(404, 'NOT_FOUND', 'Branch not found');
@@ -179,28 +192,110 @@ export async function createUdharTxn(ctx: TenantContext, body: UdharBody): Promi
   const bhavWeight = body.bhav ? moneyToMetal(body.bhav.amount, body.bhav.rate, body.bhav.unitGrams) : null;
 
   const header = await prisma.$transaction(async (tx) => {
-    const seq = await tx.docSequence.upsert({
-      where: { businessId_branchId_key: { businessId: ctx.businessId!, branchId, key: 'UDHAR' } },
-      create: { businessId: ctx.businessId!, branchId, key: 'UDHAR', next: 2 },
-      update: { next: { increment: 1 } },
-      select: { next: true },
-    });
-    const txnNo = seq.next - 1;
-
-    const h = await tx.udharTxn.create({ data: { businessId: ctx.businessId!, branchId, txnNo, ...txnFields(body, txnDate, bhavWeight), createdById: ctx.userId } });
+    const h = await insertTxn(tx, ctx, branchId, body, txnDate, bhavWeight);
     await postTxn(tx, ctx, h, body, bhavWeight);
-    await logActivity(tx, ctx, { module: 'UDHAR', action: 'CREATED', entity: 'UdharTxn', entityId: String(h.id), summary: `Udhar #${txnNo}`, partyName: party.name });
+    await logActivity(tx, ctx, { module: 'UDHAR', action: 'CREATED', entity: 'UdharTxn', entityId: String(h.id), summary: `Udhar #${h.txnNo}`, partyName: party.name });
     return h;
   });
 
   return getUdharTxn(ctx, header.id);
 }
 
+// ───────────── Inline udhar of a trade (TASK-99, TRD-02) ─────────────
+// A buy-sell / exchange may carry an udhar jama / udhar + bhav cut. It is a real, numbered UdharTxn of the trade's
+// party, branch and date, posted by the same postTxn as New Udhar (so ledger, party balance, bhav-cut rows and reports
+// are identical) and reversed by the same unpostTxn. The trade owns it: edit / delete go through the trade (whose row
+// is locked first), never directly (see linkedTrade). No bill settlement from a trade.
+
+const inlineBody = (partyId: number, txnDate: Date, u: InlineUdharInput, label: string): UdharBody => ({ ...u, partyId, txnDate, remark: u.remark ?? label });
+const bhavWeightOf = (u: InlineUdharInput) => (u.bhav ? moneyToMetal(u.bhav.amount, u.bhav.rate, u.bhav.unitGrams) : null);
+
+/** Validation outside the trade's transaction (bank accounts of this business). */
+export async function checkInlineUdhar(ctx: TenantContext, partyId: number, u: InlineUdharInput): Promise<void> {
+  await checkRefs(scopedDb(ctx), inlineBody(partyId, new Date(), u, ''));
+}
+
+export async function postInlineUdhar(tx: Prisma.TransactionClient, ctx: TenantContext, at: { branchId: number; partyId: number; txnDate: Date }, u: InlineUdharInput, label: string): Promise<{ id: number; txnNo: number }> {
+  const body = inlineBody(at.partyId, at.txnDate, u, label);
+  const bhavWeight = bhavWeightOf(u);
+  const h = await insertTxn(tx, ctx, at.branchId, body, at.txnDate, bhavWeight);
+  await postTxn(tx, ctx, h, body, bhavWeight);
+  await logActivity(tx, ctx, { module: 'UDHAR', action: 'CREATED', entity: 'UdharTxn', entityId: String(h.id), summary: `Udhar #${h.txnNo} (${label})` });
+  return { id: h.id, txnNo: h.txnNo };
+}
+
+/** Edit of the owning trade: reverse and re-post under the same udhar no. */
+export async function repostInlineUdhar(tx: Prisma.TransactionClient, ctx: TenantContext, id: number, at: { partyId: number; txnDate: Date }, u: InlineUdharInput, label: string): Promise<void> {
+  const t = await tx.udharTxn.findUniqueOrThrow({ where: { id } });
+  if (t.isDeleted) throw new HttpError(409, 'CONFLICT', 'The linked udhar entry was deleted');
+  await unpostTxn(tx, ctx, t);
+  const body = inlineBody(at.partyId, at.txnDate, u, label);
+  const bhavWeight = bhavWeightOf(u);
+  const h = await tx.udharTxn.update({ where: { id }, data: txnFields(body, at.txnDate, bhavWeight) });
+  await postTxn(tx, ctx, h, body, bhavWeight);
+}
+
+/** Delete of the owning trade (or an edit that drops the inline udhar): mark deleted and reverse, once. */
+export async function removeInlineUdhar(tx: Prisma.TransactionClient, ctx: TenantContext, id: number): Promise<void> {
+  const flip = await tx.udharTxn.updateMany({ where: { id, isDeleted: false }, data: { isDeleted: true } });
+  if (flip.count !== 1) return; // already reversed
+  await unpostTxn(tx, ctx, await tx.udharTxn.findUniqueOrThrow({ where: { id } }));
+}
+
+/**
+ * Bring a trade's inline udhar in line with its body, inside the trade's transaction (row already locked):
+ * none → none; none → new entry; entry → re-posted under the same udhar no.; entry → removed (also on trade delete,
+ * with `next` undefined). Returns the trade's inlineUdhar / bhavCut columns.
+ */
+export async function syncInlineUdhar(tx: Prisma.TransactionClient, ctx: TenantContext, current: unknown, next: InlineUdharInput | undefined, at: { branchId: number; partyId: number; txnDate: Date }, label: string) {
+  const id = (current as { udharTxnId?: number } | null)?.udharTxnId ?? null;
+  if (!next) {
+    if (id != null) await removeInlineUdhar(tx, ctx, id);
+    return { inlineUdhar: Prisma.DbNull, bhavCut: Prisma.DbNull };
+  }
+  let txnId = id;
+  if (txnId != null) await repostInlineUdhar(tx, ctx, txnId, at, next, label);
+  else txnId = (await postInlineUdhar(tx, ctx, at, next, label)).id;
+  return {
+    inlineUdhar: { udharTxnId: txnId, ...next } as Prisma.InputJsonValue,
+    bhavCut: next.bhav ? ({ ...next.bhav, weight: bhavWeightOf(next) } as Prisma.InputJsonValue) : Prisma.DbNull,
+  };
+}
+
+/** The trade's view of its inline udhar (`link` = the trade's inlineUdhar JSON). */
+export async function inlineUdharDto(ctx: TenantContext, link: unknown): Promise<TradeUdharDto | null> {
+  const id = (link as { udharTxnId?: number } | null)?.udharTxnId;
+  if (id == null) return null;
+  const t = await scopedDb(ctx).udharTxn.findUnique({ where: { id } });
+  if (!t) return null;
+  return {
+    txnId: t.id, txnNo: t.txnNo,
+    cashOut: money(D(t.cashOut)), onlineOut: money(D(t.onlineOut)), cashIn: money(D(t.cashIn)), onlineIn: money(D(t.onlineIn)),
+    goldOut: wt(D(t.goldOut)), goldIn: wt(D(t.goldIn)), silverOut: wt(D(t.silverOut)), silverIn: wt(D(t.silverIn)),
+    bhav: t.bhavDirection ? { direction: t.bhavDirection, metal: t.bhavMetal!, amount: money(D(t.bhavAmount)), rate: money(D(t.bhavRate)), unitGrams: Number(t.bhavUnitGrams), weight: wt(D(t.bhavWeight)) } : null,
+    remark: t.remark,
+  };
+}
+
+/** The trade that owns this udhar entry, if any ("buy-sell #12" / "exchange #7"). */
+async function linkedTrade(ctx: TenantContext, id: number): Promise<string | null> {
+  const where = { businessId: ctx.businessId!, inlineUdhar: { path: ['udharTxnId'], equals: id } };
+  const bs = await prisma.buySell.findFirst({ where, select: { buySellNo: true } });
+  if (bs) return `buy-sell #${bs.buySellNo}`;
+  const ex = await prisma.exchange.findFirst({ where, select: { exchangeNo: true } });
+  return ex ? `exchange #${ex.exchangeNo}` : null;
+}
+const assertNotLinked = async (ctx: TenantContext, id: number) => {
+  const link = await linkedTrade(ctx, id);
+  if (link) throw new HttpError(409, 'CONFLICT', `This udhar entry belongs to ${link}; edit or delete it there`);
+};
+
 /** Edit: reverse the old postings (like delete) and re-post the new body under the same txn no + branch. */
 export async function updateUdharTxn(ctx: TenantContext, id: number, body: UdharBody): Promise<UdharTxnDto> {
   const sdb = scopedDb(ctx);
   const t = await sdb.udharTxn.findUnique({ where: { id } });
   if (!t || t.isDeleted) throw new HttpError(404, 'NOT_FOUND', 'Udhar transaction not found');
+  await assertNotLinked(ctx, id);
   const party = await checkRefs(sdb, body);
   const txnDate = ledger.businessDate(body.txnDate ?? t.txnDate);
   const bhavWeight = body.bhav ? moneyToMetal(body.bhav.amount, body.bhav.rate, body.bhav.unitGrams) : null;
@@ -275,6 +370,7 @@ export async function deleteUdharTxn(ctx: TenantContext, id: number): Promise<vo
   const sdb = scopedDb(ctx);
   const t = await sdb.udharTxn.findUnique({ where: { id } });
   if (!t || t.isDeleted) throw new HttpError(404, 'NOT_FOUND', 'Udhar transaction not found');
+  await assertNotLinked(ctx, id);
   await prisma.$transaction(async (tx) => {
     await tx.udharTxn.update({ where: { id }, data: { isDeleted: true } });
     await unpostTxn(tx, ctx, t);
