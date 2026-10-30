@@ -400,6 +400,13 @@ export async function reviewPayment(superAdminId: number, paymentId: number, sta
     const plan = await tx.plan.findUniqueOrThrow({ where: { id: p.planId } });
     const sub = await createTerm(tx, superAdminId, p.businessId, plan, { notes: `Renewed on payment #${p.id}${renew ? ' (explicit decision)' : ''}` });
     await tx.subscriptionPayment.update({ where: { id: paymentId }, data: { subscriptionId: sub.id } });
+    await tx.activityLog.create({
+      data: {
+        businessId: p.businessId, userId: superAdminId, module: 'PLATFORM', action: 'CREATED', entity: 'Subscription', entityId: String(sub.id),
+        summary: `Subscription renewed on payment #${p.id}${renew ? ' (explicit Super Admin decision)' : ''}`,
+        meta: { paymentId: p.id, planId: plan.id, explicit: renew === true, startsAt: sub.startsAt.toISOString(), endsAt: sub.endsAt.toISOString() },
+      },
+    });
   });
   return paymentDto(await prisma.subscriptionPayment.findUniqueOrThrow({ where: { id: paymentId }, include: PAYMENT_INCLUDE }));
 }

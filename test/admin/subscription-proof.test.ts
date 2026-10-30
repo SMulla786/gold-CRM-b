@@ -165,6 +165,10 @@ describe('renewal (ADM-08)', () => {
     const all = await terms(s);
     expect(all).toHaveLength(2);
     expect(all[1]!.notes).toBe(`Renewed on payment #${decided} (explicit decision)`);
+    const audit = await db.activityLog.findMany({ where: { businessId: s.business.id, entity: 'Subscription' } });
+    expect(audit).toHaveLength(1); // the legacy confirm without renew wrote none
+    expect(audit[0]).toMatchObject({ entityId: String(all[1]!.id), meta: { paymentId: decided, explicit: true } });
+    expect(audit[0]!.userId).not.toBeNull();
     expect((await db.subscriptionPayment.findUniqueOrThrow({ where: { id: decided } })).subscriptionId).toBe(all[1]!.id);
 
     expect((await reviewWith(id, { status: 'CONFIRMED', renew: false })).status).toBe(200); // a new payment may also be confirmed without renewing
