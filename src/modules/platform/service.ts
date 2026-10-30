@@ -90,6 +90,7 @@ const paymentDto = (p: any): PaymentDto => ({
   hasProof: p.screenshotUrl != null,
   // the plan the business asked for, else the linked subscription's plan
   planName: p.plan?.name ?? p.subscription?.plan?.name ?? null,
+  renewOnConfirm: p.renewOnConfirm,
 });
 const signupDto = (s: any, stateName: string, districtName: string | null): SignupRequestDto => ({
   id: s.id,
@@ -376,10 +377,11 @@ export async function recordPayment(businessId: number, body: RecordPaymentInput
 
 /**
  * TASK-95: confirm or reject a PENDING payment exactly once (guarded update — a second decision is a 409).
- * G2b: confirming a payment on which the business asked for a plan (planId) renews once, in the same transaction: a new
- * term on that plan, and the payment then points at it. Legacy / platform-recorded payments (no planId) renew nothing.
+ * G2b: confirming renews once, in the same transaction (a new term on the payment's plan; the payment then points at it)
+ * when the payment says so (renewOnConfirm: submitted by the business after the flag existed) or the Super Admin decides
+ * it explicitly (`renew`). Older payments never renew on their own — their term may already have been assigned by hand.
  */
-export async function reviewPayment(superAdminId: number, paymentId: number, status: 'CONFIRMED' | 'REJECTED'): Promise<PaymentDto> {
+export async function reviewPayment(superAdminId: number, paymentId: number, status: 'CONFIRMED' | 'REJECTED', renew?: boolean): Promise<PaymentDto> {
   await prisma.$transaction(async (tx) => {
     const { count } = await tx.subscriptionPayment.updateMany({
       where: { id: paymentId, status: 'PENDING' },
@@ -391,11 +393,12 @@ export async function reviewPayment(superAdminId: number, paymentId: number, sta
     }
     if (status !== 'CONFIRMED') return;
     const p = await tx.subscriptionPayment.findUniqueOrThrow({ where: { id: paymentId } });
-    if (p.planId == null) return;
+    if (!(renew ?? p.renewOnConfirm)) return;
+    if (p.planId == null) throw new HttpError(400, 'VALIDATION', 'This payment names no plan to renew — assign one by hand');
     // one renewal at a time per business, so two confirmations stack their terms instead of both starting at the same end
     await tx.$executeRaw`SELECT 1 FROM "Business" WHERE id = ${p.businessId} FOR UPDATE`;
     const plan = await tx.plan.findUniqueOrThrow({ where: { id: p.planId } });
-    const sub = await createTerm(tx, superAdminId, p.businessId, plan, { notes: `Renewed on payment #${p.id}` });
+    const sub = await createTerm(tx, superAdminId, p.businessId, plan, { notes: `Renewed on payment #${p.id}${renew ? ' (explicit decision)' : ''}` });
     await tx.subscriptionPayment.update({ where: { id: paymentId }, data: { subscriptionId: sub.id } });
   });
   return paymentDto(await prisma.subscriptionPayment.findUniqueOrThrow({ where: { id: paymentId }, include: PAYMENT_INCLUDE }));

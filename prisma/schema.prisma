@@ -173,6 +173,9 @@ model SubscriptionPayment {
   recordedById   Int?
   /// plan the business asked for when submitting (renew / choose plan); null = legacy / platform-recorded
   planId         Int?
+  /// G2b: confirming renews the plan automatically. Set only on payments submitted after this column existed;
+  /// older rows stay false, so their renewal needs an explicit decision (review body `renew: true`)
+  renewOnConfirm Boolean       @default(false)
   createdAt      DateTime      @default(now())
   business       Business      @relation(fields: [businessId], references: [id])
   subscription   Subscription? @relation(fields: [subscriptionId], references: [id])

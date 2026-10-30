@@ -99,7 +99,11 @@ export const recordPaymentBody = z
   });
 
 /** TASK-95: Super Admin decides a business-submitted payment (only while PENDING). */
-export const reviewPaymentBody = z.object({ status: z.enum(['CONFIRMED', 'REJECTED']) });
+export const reviewPaymentBody = z.object({
+  status: z.enum(['CONFIRMED', 'REJECTED']),
+  /** G2b: explicit renewal decision on CONFIRMED; omitted = the payment's own renewOnConfirm (false on payments older than the flag) */
+  renew: z.boolean().optional(),
+});
 
 export const impersonateBody = z.object({ reason: z.string().trim().min(3).max(300) });
 
@@ -179,6 +183,8 @@ export interface PaymentDto {
   hasProof: boolean;
   /** Plan the business asked for when submitting, else the linked subscription's plan. */
   planName?: string | null;
+  /** G2b: confirming renews that plan automatically (false on legacy / platform-recorded payments: renewal is an explicit choice) */
+  renewOnConfirm?: boolean;
 }
 
 /** Row in /platform/businesses. subscriptionState: active | expiring (≤15 days) | expired | none */

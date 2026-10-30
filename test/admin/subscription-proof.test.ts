@@ -143,6 +143,37 @@ describe('renewal (ADM-08)', () => {
     expect(await terms(t)).toHaveLength(1);
   });
 
+  it('G2b safeguard: a pending payment from before the renewOnConfirm flag never renews on its own; renewal needs an explicit decision', async () => {
+    const s = await setup();
+    const sa = await superAuth();
+    const id = await payFor(s, s.plan.id);
+    expect((await db.subscriptionPayment.findUniqueOrThrow({ where: { id } })).renewOnConfirm).toBe(true); // new submissions carry the flag
+    const legacy = async () => {
+      const p = await payFor(s, s.plan.id);
+      await db.subscriptionPayment.update({ where: { id: p }, data: { renewOnConfirm: false } }); // as migrated: older rows default to false
+      return p;
+    };
+    const reviewWith = (pid: number, body: Record<string, unknown>) => api.patch(`/api/platform/payments/${pid}`).set('Authorization', sa).send(body);
+
+    const old = await legacy();
+    const res = await reviewWith(old, { status: 'CONFIRMED' });
+    expect([res.status, res.body.renewOnConfirm]).toEqual([200, false]);
+    expect(await terms(s)).toHaveLength(1); // confirmed, no second term
+
+    const decided = await legacy();
+    expect((await reviewWith(decided, { status: 'CONFIRMED', renew: true })).status).toBe(200);
+    const all = await terms(s);
+    expect(all).toHaveLength(2);
+    expect(all[1]!.notes).toBe(`Renewed on payment #${decided} (explicit decision)`);
+    expect((await db.subscriptionPayment.findUniqueOrThrow({ where: { id: decided } })).subscriptionId).toBe(all[1]!.id);
+
+    expect((await reviewWith(id, { status: 'CONFIRMED', renew: false })).status).toBe(200); // a new payment may also be confirmed without renewing
+    expect(await terms(s)).toHaveLength(2);
+    const noPlan = await pay(s);
+    expect((await reviewWith(noPlan, { status: 'CONFIRMED', renew: true })).status).toBe(400); // nothing to renew: assign by hand
+    expect((await db.subscriptionPayment.findUniqueOrThrow({ where: { id: noPlan } })).status).toBe('PENDING'); // rolled back
+  });
+
   it('a payment without a plan does not extend the term; a new subscription while active starts at the current end', async () => {
     const s = await setup();
     const id = await pay(s);

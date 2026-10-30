@@ -552,6 +552,7 @@ export async function recordSubscriptionPayment(ctx: TenantContext, body: { amou
       paidAt: body.paidAt ?? null,
       recordedById: ctx.userId,
       planId: body.planId ?? null,
+      renewOnConfirm: body.planId != null, // G2b: the business chose a plan → confirming renews it
     },
   });
   return { id: p.id };
