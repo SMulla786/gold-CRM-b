@@ -1,3 +1,4 @@
+import { Prisma } from '@prisma/client';
 import { prisma } from '../../lib/prisma';
 import { scopedDb } from '../../lib/db';
 import { HttpError } from '../../middleware/error';
@@ -6,6 +7,7 @@ import { SETTING_SCHEMAS } from '../../shared';
 import type {
   BankAccountDto,
   CurrentRatesDto,
+  DeletePartyResultDto,
   HsnDto,
   KaratDto,
   Metal,
@@ -156,10 +158,39 @@ export async function updateParty(ctx: TenantContext, partyId: number, body: Rec
   return getParty(ctx, partyId);
 }
 
-export async function deleteParty(ctx: TenantContext, partyId: number): Promise<void> {
-  const target = await scopedDb(ctx).party.findUnique({ where: { id: partyId } });
-  if (!target) throw new HttpError(404, 'NOT_FOUND', 'Party not found');
-  await scopedDb(ctx).party.update({ where: { id: partyId }, data: { isActive: false } });
+/** Every column holding a party id. Only Party.parentId is a real FK, so a hard delete must check these itself (guarded by party-delete.test). */
+export const PARTY_REFS = [
+  ['LedgerEntry', 'partyId'], ['Bill', 'partyId'], ['UdharEntry', 'partyId'], ['UdharTxn', 'partyId'], ['JustBill', 'partyId'],
+  ['SalesDraft', 'partyId'], ['Order', 'partyId'], ['KarigarIssue', 'karigarId'], ['RepairTicket', 'partyId'], ['RepairTicket', 'karigarId'],
+  ['GirviBatch', 'partyId'], ['GirviTransfer', 'lenderPartyId'], ['Exchange', 'partyId'], ['BuySell', 'partyId'], ['BhavBooking', 'partyId'],
+  ['SchemeEnrollment', 'partyId'], ['Sample', 'partyId'], ['Sample', 'karigarId'], ['SampleMovement', 'partyId'], ['SampleMovement', 'karigarId'],
+  ['Party', 'parentId'],
+] as const;
+
+export async function deleteParty(ctx: TenantContext, partyId: number, confirm = false): Promise<DeletePartyResultDto> {
+  const businessId = ctx.businessId!;
+  return prisma.$transaction(async (tx) => {
+    // row lock: concurrent deletes of the same party run one after the other
+    const [party] = await tx.$queryRaw<{ id: number }[]>`SELECT id FROM "Party" WHERE id = ${partyId} AND "businessId" = ${businessId} FOR UPDATE`;
+    if (!party) throw new HttpError(404, 'NOT_FOUND', 'Party not found');
+    // business-wide on purpose (not the caller's branches): dues or bills in another branch still block
+    const due = await tx.udharEntry.aggregate({ where: { businessId, partyId }, _sum: { amount: true, gold: true, silver: true } });
+    if ([due._sum.amount, due._sum.gold, due._sum.silver].some((v) => v != null && !v.isZero())) {
+      throw new HttpError(409, 'PARTY_HAS_DUES', 'This party has outstanding dues (money, gold or silver). Settle them before removing the party.');
+    }
+    // same rule as the Pending Bills list (udhar.pendingBills): an ACTIVE bill with final ≠ paid
+    const [{ pending } = { pending: 0 }] = await tx.$queryRaw<{ pending: number }[]>`SELECT count(*)::int AS pending FROM "Bill" WHERE "businessId" = ${businessId} AND "partyId" = ${partyId} AND status::text = 'ACTIVE' AND final <> paid`;
+    if (pending > 0) throw new HttpError(409, 'PARTY_HAS_PENDING_BILLS', `This party has ${pending} pending bill(s). Settle them before removing the party.`);
+    const used = PARTY_REFS.map(([t, c]) => Prisma.sql`EXISTS (SELECT 1 FROM ${Prisma.raw(`"${t}"`)} WHERE ${Prisma.raw(`"${c}"`)} = ${partyId})`);
+    const [{ hasHistory } = { hasHistory: true }] = await tx.$queryRaw<{ hasHistory: boolean }[]>(Prisma.sql`SELECT (${Prisma.join(used, ' OR ')}) AS "hasHistory"`);
+    if (hasHistory) {
+      await tx.party.update({ where: { id: partyId }, data: { isActive: false } });
+      return { result: 'ARCHIVED' as const };
+    }
+    if (!confirm) throw new HttpError(409, 'CONFIRM_REQUIRED', 'This party has no history and will be permanently deleted. Confirm to continue.');
+    await tx.party.delete({ where: { id: partyId } });
+    return { result: 'DELETED' as const };
+  });
 }
 
 // ───────────── Bank accounts ─────────────

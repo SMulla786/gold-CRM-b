@@ -5,6 +5,7 @@ import { assertMpin, requireMpin, requirePermission } from '../../middleware/gua
 import {
   HEADERS,
   bankAccountBody,
+  deletePartyQuery,
   hsnListQuery,
   hsnToggleBody,
   id as idSchema,
@@ -78,10 +79,8 @@ appRouter.post('/parties', requirePermission(PARTIES, 'edit'), async (req, res) 
   res.status(201).json(dto);
 });
 appRouter.patch('/parties/:id', requirePermission(PARTIES, 'edit'), async (req, res) => res.json(await svc.updateParty(req.ctx!, idSchema.parse(req.params.id), updatePartyBody.parse(req.body))));
-appRouter.delete('/parties/:id', requirePermission(PARTIES, 'delete'), async (req, res) => {
-  await svc.deleteParty(req.ctx!, idSchema.parse(req.params.id));
-  res.status(204).end();
-});
+appRouter.delete('/parties/:id', requirePermission(PARTIES, 'delete'), async (req, res) =>
+  res.json(await svc.deleteParty(req.ctx!, idSchema.parse(req.params.id), deletePartyQuery.parse(req.query).confirm)));
 const FIELD: Record<'photo' | 'shop-logo', PartyImageField> = { photo: 'photoUrl', 'shop-logo': 'shopLogoUrl' };
 const CONTENT_TYPE: Record<string, string> = { '.jpg': 'image/jpeg', '.png': 'image/png', '.webp': 'image/webp' };
 for (const kind of ['photo', 'shop-logo'] as const) {

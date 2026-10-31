@@ -51,6 +51,15 @@ export const partyListQuery = pageQuery.extend({
   type: z.enum(PARTY_TYPES).optional(),
   active: z.enum(['true', 'false']).optional(),
 });
+/** DELETE /parties/:id — a hard delete (only for a party with no history at all) needs ?confirm=true. */
+export const deletePartyQuery = z.object({ confirm: z.enum(['true', 'false']).optional().transform((v) => v === 'true') });
+/**
+ * Dues or a pending bill → 409 PARTY_HAS_DUES / PARTY_HAS_PENDING_BILLS. Any history (bills, udhar, ledger, trade, orders,
+ * family members…) → ARCHIVED (isActive=false, rows untouched). No history → 409 CONFIRM_REQUIRED, or DELETED when confirmed.
+ */
+export interface DeletePartyResultDto {
+  result: 'ARCHIVED' | 'DELETED';
+}
 export const partySearchQuery = z.object({
   q: z.string().trim().min(1),
   type: z.enum(PARTY_TYPES).optional(),
