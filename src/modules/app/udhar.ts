@@ -567,7 +567,7 @@ export async function pendingBills(
   q: { page: number; pageSize: number; q?: string; partyId?: number; type?: PartyType; kind?: 'SELL' | 'PURCHASE'; from?: Date; to?: Date },
 ): Promise<Paged<BillListItemDto> & { summary: PendingBillsSummaryDto }> {
   const sdb = scopedDb(ctx);
-  const noSummary: PendingBillsSummaryDto = { count: 0, saleDue: '0.00', purchaseDue: '0.00', totalDue: '0.00' };
+  const noSummary: PendingBillsSummaryDto = { count: 0, saleDue: '0.00', purchaseDue: '0.00' };
   if (ctx.branchIds.length === 0) return { items: [], total: 0, page: q.page, pageSize: q.pageSize, summary: noSummary };
   // Pending = ACTIVE bill with final ≠ paid (a column-vs-column comparison Prisma can't express through the scoped client),
   // so resolve the matching ids with a scoped raw query (type filters on the party via a join), then page them normally.
@@ -592,10 +592,9 @@ export async function pendingBills(
     Prisma.sql`SELECT b.id, b.kind::text AS kind, (b.final - b.paid)::text AS due FROM "Bill" b ${join} WHERE ${Prisma.join(conds, ' AND ')}`,
   );
   const ids = rows.map((r) => r.id);
-  // UDH-07 cards over every matching bill (not just this page), in rupees (BILL-15 R4); due = final − paid as in the list
-  const dueOf = (kind: string) => rows.filter((r) => r.kind === kind).reduce((a, r) => a.plus(r.due), D(0));
-  const [saleDue, purchaseDue] = [dueOf('SELL'), dueOf('PURCHASE')];
-  const summary: PendingBillsSummaryDto = { count: rows.length, saleDue: money(saleDue), purchaseDue: money(purchaseDue), totalDue: money(saleDue.plus(purchaseDue)) };
+  // UDH-07 cards over the same rows the list pages (so the filters always match), in rupees (BILL-15 R4); due = final − paid
+  const dueOf = (kind: string) => money(rows.filter((r) => r.kind === kind).reduce((a, r) => a.plus(r.due), D(0)));
+  const summary: PendingBillsSummaryDto = { count: rows.length, saleDue: dueOf('SELL'), purchaseDue: dueOf('PURCHASE') };
   if (ids.length === 0) return { items: [], total: 0, page: q.page, pageSize: q.pageSize, summary };
 
   const bills = await sdb.bill.findMany({

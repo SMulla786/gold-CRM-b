@@ -164,11 +164,10 @@ export const pendingBillsQuery = pageQuery.extend({
 
 /**
  * UDH-07 summary cards over EVERY bill matching the filters (not just the page). Rupees only (BILL-15 R4).
- * Each due = final − paid, the list's Due Balance; totalDue = saleDue + purchaseDue (the sum of that column).
+ * Each due = final − paid, the list's Due Balance. No combined total: receivables are never netted against payables (owner rule).
  */
 export interface PendingBillsSummaryDto {
   count: number;
   saleDue: string;
   purchaseDue: string;
-  totalDue: string;
 }
