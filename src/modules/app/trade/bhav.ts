@@ -29,14 +29,20 @@ function figures(body: BhavBody, unit: number) {
   return { weight, rate, amount, lines };
 }
 
-/** Advance → MONEY IN + party credit. ONLY_ENTRY bookings post nothing (so delete/cancel/edit have nothing to reverse). */
-async function postAdvance(tx: Prisma.TransactionClient, ctx: TenantContext, bk: { id: number; bookingNo: number; branchId: number; partyId: number; txnDate: Date }, entryType: BhavBody['entryType'], plan: PayPlan) {
+/**
+ * Advance, posted once, in the direction the money moves: SELL (the party buys from the shop) → RECEIVED = MONEY IN +
+ * party credit; BUY (the shop buys from the party) → GIVEN = MONEY OUT + party debit. The delivering buy-sell posts only
+ * its own bill − payments, so booking + delivery net to zero once the rest is settled on delivery (TRD-04).
+ * ONLY_ENTRY bookings post nothing (so delete/cancel/edit have nothing to reverse).
+ */
+export async function postAdvance(tx: Prisma.TransactionClient, ctx: TenantContext, bk: { id: number; bookingNo: number; side: BhavBody['side']; branchId: number; partyId: number; txnDate: Date }, entryType: BhavBody['entryType'], plan: PayPlan) {
   const advance = D(plan.cash).plus(plan.online);
   if (entryType === 'ONLY_ENTRY' || !advance.gt(0)) return;
   const sid = String(bk.id);
   const lctx = lctxOf(ctx);
-  await ledger.post(tx, lctx, payRows(plan, 'BHAV_BOOKING', bk.branchId, bk.txnDate, 'IN', sid, bk.partyId, `Bhav booking #${bk.bookingNo} advance`));
-  await udhar.post(tx, lctx, [{ branchId: bk.branchId, partyId: bk.partyId, txnDate: bk.txnDate, amount: advance.negated(), source: 'BHAV_BOOKING', sourceId: sid, narration: `Bhav booking #${bk.bookingNo} advance` }]); // party credit until delivered
+  const given = bk.side === 'BUY';
+  await ledger.post(tx, lctx, payRows(plan, 'BHAV_BOOKING', bk.branchId, bk.txnDate, given ? 'OUT' : 'IN', sid, bk.partyId, `Bhav booking #${bk.bookingNo} advance`));
+  await udhar.post(tx, lctx, [{ branchId: bk.branchId, partyId: bk.partyId, txnDate: bk.txnDate, amount: given ? advance : advance.negated(), source: 'BHAV_BOOKING', sourceId: sid, narration: `Bhav booking #${bk.bookingNo} advance` }]); // until delivered
 }
 
 export async function createBhav(ctx: TenantContext, body: BhavBody): Promise<BhavBookingDto> {
@@ -99,7 +105,7 @@ export async function updateBhav(ctx: TenantContext, id: number, body: BhavBody)
     await tx.bhavBookingLine.deleteMany({ where: { bookingId: id } });
     if (f.lines.length) await tx.bhavBookingLine.createMany({ data: f.lines.map((l) => ({ bookingId: id, ...l })) });
     await savePayments(tx, ctx, 'BHAV', id, plan);
-    await postAdvance(tx, ctx, { id, bookingNo: old.bookingNo, branchId: old.branchId, partyId: body.partyId, txnDate }, body.entryType, plan);
+    await postAdvance(tx, ctx, { id, bookingNo: old.bookingNo, side: body.side, branchId: old.branchId, partyId: body.partyId, txnDate }, body.entryType, plan);
     const after = await tx.bhavBooking.findUniqueOrThrow({ where: { id }, include: withLines });
     await logActivity(tx, ctx, { module: 'BHAV_BOOKING', action: 'EDITED', entity: 'BHAV_BOOKING', entityId: String(id), summary: `Edited bhav booking #${old.bookingNo}`, partyName: party.name, meta: { before, after: snap({ ...after, payments: plan.rows ?? [] }) } });
   });
@@ -112,7 +118,7 @@ export async function cancelBhav(ctx: TenantContext, id: number): Promise<BhavBo
   if (!bk) throw new HttpError(404, 'NOT_FOUND', 'Booking not found');
   await prisma.$transaction(async (tx) => {
     const upd = await tx.bhavBooking.updateMany({ where: { id, status: { in: ['PENDING', 'PARTIAL'] } }, data: { status: 'CANCELLED' } });
-    if (upd.count !== 1) throw new HttpError(409, 'CONFLICT', 'Booking is not open'); // advance stays as the party's credit (refund = a normal udhar entry)
+    if (upd.count !== 1) throw new HttpError(409, 'CONFLICT', 'Booking is not open'); // the advance stays on the party's account (refund = a normal udhar entry)
     await logActivity(tx, ctx, { module: 'BHAV_BOOKING', action: 'EDITED', entity: 'BHAV_BOOKING', entityId: String(id), summary: `Cancelled bhav booking #${bk.bookingNo}` });
   });
   return getBhav(ctx, id);
@@ -169,7 +175,38 @@ export async function deleteBhav(ctx: TenantContext, id: number): Promise<void> 
 
 const withLines = { lines: { orderBy: { id: 'asc' as const } } };
 
-async function toDto(ctx: TenantContext, bk: any): Promise<BhavBookingDto> {
+/**
+ * TRD-04: the payments (cash + online, never the bill total) on the buy-sells delivered against each booking. A trade
+ * delivered from several bookings shares its payment by each booking's delivered value (weight × booking rate); the last
+ * booking takes the rounding remainder so the shares add up to the payment exactly. Pre-TRD-03 trades: all to their one link.
+ */
+async function settlements(ctx: TenantContext, ids: number[]): Promise<Map<number, Prisma.Decimal>> {
+  const out = new Map<number, Prisma.Decimal>();
+  if (!ids.length) return out;
+  const sdb = scopedDb(ctx);
+  const trades = await sdb.buySell.findMany({
+    where: { OR: [{ bhavBookingId: { in: ids } }, { deliveries: { some: { bookingId: { in: ids } } } }] },
+    select: { cash: true, online: true, bhavBookingId: true, deliveries: { orderBy: { bookingId: 'asc' }, select: { bookingId: true, weight: true } } },
+  });
+  const rates = new Map((await sdb.bhavBooking.findMany({ where: { id: { in: [...new Set(trades.flatMap((t) => t.deliveries.map((d) => d.bookingId)))] } }, select: { id: true, rate: true } })).map((b) => [b.id, D(b.rate)]));
+  const add = (id: number, v: Prisma.Decimal) => out.set(id, (out.get(id) ?? D(0)).plus(v));
+  for (const t of trades) {
+    const paid = D(t.cash).plus(t.online);
+    if (!t.deliveries.length) { add(t.bhavBookingId!, paid); continue; }
+    const value = t.deliveries.map((d) => D(d.weight).times(rates.get(d.bookingId)!));
+    const total = value.reduce((a, v) => a.plus(v), D(0));
+    let left = paid;
+    t.deliveries.forEach((d, i) => {
+      const share = i === t.deliveries.length - 1 ? left : paid.times(value[i]!).div(total).toDecimalPlaces(2, Prisma.Decimal.ROUND_HALF_UP);
+      left = left.minus(share);
+      add(d.bookingId, share);
+    });
+  }
+  return out;
+}
+
+async function toDto(ctx: TenantContext, bk: any, settled?: Map<number, Prisma.Decimal>): Promise<BhavBookingDto> {
+  settled ??= await settlements(ctx, [bk.id]);
   const [refs, payments, verifiedBy] = await Promise.all([loadRefs(ctx, bk), loadPayments(ctx, 'BHAV', bk.id), userName(ctx, bk.verifiedById ?? null)]);
   return {
     id: bk.id, bookingNo: bk.bookingNo, side: bk.side, party: refs.party, branch: refs.branch, metal: bk.metal, txnDate: dateOnly(bk.txnDate),
@@ -177,6 +214,7 @@ async function toDto(ctx: TenantContext, bk: any): Promise<BhavBookingDto> {
     pendingWeight: wt(bk.pendingWeight), status: bk.status, narration: bk.narration, createdBy: refs.createdBy, createdAt: bk.createdAt.toISOString(),
     cash: money(bk.cash), online: money(bk.online), entryType: bk.entryType, verifiedAt: bk.verifiedAt ? bk.verifiedAt.toISOString() : null, verifiedBy,
     lines: (bk.lines ?? []).map((l: any) => ({ id: l.id, weight: wt(l.weight), rate: money(l.rate), amount: money(l.amount) })), payments,
+    settlement: money(settled.get(bk.id) ?? D(0)),
   };
 }
 
@@ -209,5 +247,6 @@ export async function listBhav(ctx: TenantContext, query: z.infer<typeof bhavLis
     sdb.bhavBooking.findMany({ where, include: withLines, orderBy: { id: 'desc' }, skip: (query.page - 1) * query.pageSize, take: query.pageSize }),
     sdb.bhavBooking.count({ where }),
   ]);
-  return { items: await Promise.all(rows.map((r) => toDto(ctx, r))), total, page: query.page, pageSize: query.pageSize };
+  const settled = await settlements(ctx, rows.map((r) => r.id));
+  return { items: await Promise.all(rows.map((r) => toDto(ctx, r, settled))), total, page: query.page, pageSize: query.pageSize };
 }

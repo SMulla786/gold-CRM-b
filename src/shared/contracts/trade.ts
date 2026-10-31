@@ -396,4 +396,6 @@ export interface BhavBookingDto {
   /** multi-row bookings only (empty for a single weight / rate booking) */
   lines?: Array<{ id: number; weight: string; rate: string; amount: string }>;
   payments?: TradePaymentDto[];
+  /** TRD-04: payments on the buy-sells delivered against this booking (BUY → given, SELL → received); the advance is separate */
+  settlement: string;
 }
