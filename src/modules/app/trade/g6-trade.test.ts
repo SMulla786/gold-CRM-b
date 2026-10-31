@@ -94,6 +94,29 @@ describe('TRD-02 · inline udhar + bhav cut on buy-sell', () => {
     expect(await db.buySell.count()).toBe(0);
     expect(() => bs(s, { udhar: {} })).toThrow();
   });
+
+  it('online jama / udhar: posted to its bank like New Udhar; edit moves it to cash; delete reverses every row', async () => {
+    const s = await setup();
+    await udharSvc.createUdharTxn(s.ctx, udharBody.parse({ partyId: s.party.id, cashOut: 10000 })); // party owes ₹10,000
+    const bankRows = async (txnId: number) => (await db.ledgerEntry.findMany({ where: { source: 'UDHAR', sourceId: String(txnId), asset: 'MONEY' }, orderBy: { id: 'asc' } })).map((r) => [r.direction, r.bankAccountId, Number(r.amount), r.reversalOfId != null]);
+
+    const t = await buysell.createBuySell(s.ctx, bs(s, { udhar: { cashIn: 1000, onlineIn: 3000, inBankId: s.bank.id, onlineOut: 500, outBankId: s.bank.id } }));
+    expect(t.udhar).toMatchObject({ cashIn: '1000.00', onlineIn: '3000.00', inBankId: s.bank.id, onlineOut: '500.00', outBankId: s.bank.id });
+    expect((await bal(s)).amount).toBe('6500.00'); // 10,000 − 1,000 − 3,000 + 500
+    // same rows a New Udhar with these fields posts
+    const plain = await udharSvc.createUdharTxn(s.ctx, udharBody.parse({ partyId: s.party.id, cashIn: 1000, onlineIn: 3000, inBankId: s.bank.id, onlineOut: 500, outBankId: s.bank.id }));
+    expect((await bankRows(t.udhar!.txnId)).sort()).toEqual((await bankRows(plain.id)).sort());
+    await udharSvc.deleteUdharTxn(s.ctx, plain.id);
+
+    const e = await buysell.updateBuySell(s.ctx, t.id, bs(s, { udhar: { cashIn: 4000 } }));
+    expect([e.udhar!.txnNo, e.udhar!.onlineIn, e.udhar!.inBankId]).toEqual([t.udhar!.txnNo, '0.00', null]);
+    expect((await bal(s)).amount).toBe('6000.00');
+
+    await buysell.deleteBuySell(s.ctx, t.id);
+    expect((await bal(s)).amount).toBe('10000.00');
+    const rows = await db.ledgerEntry.findMany({ where: { source: 'UDHAR', sourceId: String(t.udhar!.txnId) } });
+    expect(rows.reduce((a, r) => a + (r.direction === 'IN' ? 1 : -1) * Number(r.amount), 0)).toBe(0); // every posting reversed once
+  });
 });
 
 describe('TRD-02 · inline udhar on exchange', () => {

@@ -16,6 +16,7 @@ export interface TradeUdharDto {
   txnId: number;
   txnNo: number;
   cashOut: string; onlineOut: string; cashIn: string; onlineIn: string;
+  outBankId: number | null; inBankId: number | null;
   goldOut: string; goldIn: string; silverOut: string; silverIn: string;
   bhav: { direction: 'MONEY_TO_METAL' | 'METAL_TO_MONEY'; metal: 'GOLD' | 'SILVER'; amount: string; rate: string; unitGrams: number; weight: string } | null;
   remark: string | null;

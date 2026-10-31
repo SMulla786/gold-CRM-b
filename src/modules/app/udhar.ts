@@ -272,6 +272,7 @@ export async function inlineUdharDto(ctx: TenantContext, link: unknown): Promise
   return {
     txnId: t.id, txnNo: t.txnNo,
     cashOut: money(D(t.cashOut)), onlineOut: money(D(t.onlineOut)), cashIn: money(D(t.cashIn)), onlineIn: money(D(t.onlineIn)),
+    outBankId: t.outBankId, inBankId: t.inBankId,
     goldOut: wt(D(t.goldOut)), goldIn: wt(D(t.goldIn)), silverOut: wt(D(t.silverOut)), silverIn: wt(D(t.silverIn)),
     bhav: t.bhavDirection ? { direction: t.bhavDirection, metal: t.bhavMetal!, amount: money(D(t.bhavAmount)), rate: money(D(t.bhavRate)), unitGrams: Number(t.bhavUnitGrams), weight: wt(D(t.bhavWeight)) } : null,
     remark: t.remark,
