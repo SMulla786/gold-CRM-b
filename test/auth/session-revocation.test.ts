@@ -62,6 +62,41 @@ describe('revoked sessions: access tokens', () => {
     expect((await api.get('/api/auth/me').set('Authorization', bearer(here.token!))).status).toBe(200); // this session stays
   });
 
+  it('logout: that access token is rejected at once (me + business API); the other session keeps working', async () => {
+    const { owner } = await setup();
+    const here = await loginAs(owner.username);
+    const phone = await loginAs(owner.username);
+    expect((await api.post('/api/auth/logout').set('Cookie', phone.cookie)).status).toBe(204);
+    const as = bearer(phone.token!);
+    const rs = [await api.get('/api/auth/me').set('Authorization', as), await users(phone.token!)];
+    expect(rs.map((r) => [r.status, r.body.error?.message])).toEqual(Array(2).fill([401, 'Session expired']));
+    expect((await users(here.token!)).status).toBe(200);
+  });
+
+  // G7-SEC-1: ending an impersonation only closed the log; its session (and token) stayed live.
+  it("ending impersonation revokes every impersonation token at once; the Super Admin's and the owner's own sessions stay", async () => {
+    const { owner } = await setup();
+    const ownerOwn = await loginAs(owner.username);
+    const sa = await createUser({ level: 'SUPER_ADMIN' });
+    const saAuth = bearer((await loginAs(sa.username)).token!);
+    const start = () => api.post(`/api/platform/businesses/${owner.user.businessId}/impersonate`).set('Authorization', saAuth).send({ reason: 'support ticket' });
+    const [first, second] = [await start(), await start()];
+    expect([first.status, second.status]).toEqual([201, 201]);
+    // no refresh cookie: an impersonation session cannot be refreshed, so revoking it ends its access tokens for good
+    expect([first.headers['set-cookie'], second.headers['set-cookie']]).toEqual([undefined, undefined]);
+    const imp = [bearer(first.body.accessToken), bearer(second.body.accessToken)];
+    const me = (as: string) => api.get('/api/auth/me').set('Authorization', as);
+    // a second impersonation does not end the first (both stay live until /impersonation/end)
+    expect((await Promise.all(imp.map(me))).map((r) => r.status)).toEqual([200, 200]);
+
+    expect((await api.post('/api/platform/impersonation/end').set('Authorization', saAuth)).status).toBe(204);
+    for (const as of imp) {
+      const rs = [await me(as), await api.get('/api/admin/users').set('Authorization', as)];
+      expect(rs.map((r) => [r.status, r.body.error?.message])).toEqual(Array(2).fill([401, 'Session expired']));
+    }
+    expect([(await me(saAuth)).status, (await users(ownerOwn.token!)).status]).toEqual([200, 200]);
+  });
+
   it('/api/auth/me rejects a blocked user at once', async () => {
     const { owner, staff } = await setup();
     const phone = await loginAs(staff.username);

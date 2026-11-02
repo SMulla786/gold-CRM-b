@@ -430,7 +430,12 @@ export async function impersonate(superAdminId: number, businessId: number, reas
 }
 
 export async function endImpersonation(superAdminId: number): Promise<void> {
-  await prisma.impersonationLog.updateMany({ where: { superAdminId, endedAt: null }, data: { endedAt: new Date() } });
+  const now = new Date();
+  await prisma.$transaction([
+    prisma.impersonationLog.updateMany({ where: { superAdminId, endedAt: null }, data: { endedAt: now } }),
+    // its tokens die with it (loadContext re-checks the session on every request); the reason keeps a replayed refresh off the theft path
+    prisma.session.updateMany({ where: { impersonatorId: superAdminId, revokedAt: null }, data: { revokedAt: now, revokeReason: 'IMPERSONATION_ENDED' } }),
+  ]);
 }
 
 // ───────────── Shared provisioning ─────────────
