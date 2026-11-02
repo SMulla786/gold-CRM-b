@@ -7,7 +7,7 @@ import { createBusiness } from '../../../../test/helpers/factory';
 import { justBillBody } from '../../../shared';
 import { closeDay } from '../daybook/service';
 import * as schemes from '../schemes/service';
-import { justBillItemPhotoPath, saveJustBillItemPhoto } from '../uploads';
+import { UPLOAD_ROOT, justBillItemPhotoPath, saveJustBillItemPhoto } from '../uploads';
 import * as jb from './service';
 import type { TenantContext } from '../../../middleware/context';
 
@@ -19,7 +19,6 @@ const ctxFor = (businessId: number, branchId: number): TenantContext => ({
   readOnly: false, modules: ['billing', 'settings', 'daybook', 'schemes'], limits: null, permissions: {}, impersonatorId: null,
 });
 
-const UPLOAD_ROOT = path.join(process.cwd(), 'uploads');
 const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3, 4]);
 const businessIds: number[] = [];
 

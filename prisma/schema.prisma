@@ -469,44 +469,64 @@ enum HsnCategory {
 
 /// Customers / suppliers / karigars — shared across all branches of a business.
 model Party {
-  id              Int       @id @default(autoincrement())
-  businessId      Int
-  type            PartyType
+  id                     Int                @id @default(autoincrement())
+  businessId             Int
+  type                   PartyType
   /// family sub-profile under a parent customer
-  parentId        Int?
-  name            String
-  countryCode     String    @default("+91")
-  mobile          String
-  email           String?
-  address         String?
-  birthday        DateTime? @db.Date
-  anniversary     DateTime? @db.Date
-  aadhaar         String?
-  pan             String?
-  gstin           String?
-  licenseNo       String?
-  regNo           String?
-  logoTitle       String?
-  shopName        String?
-  stateId         Int?
-  districtId      Int?
-  area            String?
-  shopAddress     String?
-  pinCode         String?
+  parentId               Int?
+  name                   String
+  countryCode            String             @default("+91")
+  mobile                 String
+  email                  String?
+  address                String?
+  birthday               DateTime?          @db.Date
+  anniversary            DateTime?          @db.Date
+  aadhaar                String?
+  pan                    String?
+  gstin                  String?
+  licenseNo              String?
+  regNo                  String?
+  logoTitle              String?
+  shopName               String?
+  stateId                Int?
+  districtId             Int?
+  area                   String?
+  shopAddress            String?
+  pinCode                String?
   /// karigar specialty
-  specialty       String?
-  photoUrl        String?
-  shopLogoUrl     String?
-  isActive        Boolean   @default(true)
-  createdBranchId Int?
-  createdById     Int?
-  createdAt       DateTime  @default(now())
-  updatedAt       DateTime  @updatedAt
-  business        Business  @relation(fields: [businessId], references: [id])
-  parent          Party?    @relation("PartyFamily", fields: [parentId], references: [id])
-  members         Party[]   @relation("PartyFamily")
-  state           State?    @relation(fields: [stateId], references: [id])
-  district        District? @relation(fields: [districtId], references: [id])
+  specialty              String?
+  photoUrl               String?
+  shopLogoUrl            String?
+  isActive               Boolean            @default(true)
+  createdBranchId        Int?
+  createdById            Int?
+  createdAt              DateTime           @default(now())
+  updatedAt              DateTime           @updatedAt
+  business               Business           @relation(fields: [businessId], references: [id])
+  parent                 Party?             @relation("PartyFamily", fields: [parentId], references: [id], onDelete: SetNull)
+  members                Party[]            @relation("PartyFamily")
+  state                  State?             @relation(fields: [stateId], references: [id])
+  district               District?          @relation(fields: [districtId], references: [id])
+  ledgerEntries          LedgerEntry[]
+  bills                  Bill[]
+  udharEntries           UdharEntry[]
+  udharTxns              UdharTxn[]
+  justBills              JustBill[]
+  salesDrafts            SalesDraft[]
+  orders                 Order[]
+  karigarIssues          KarigarIssue[]
+  repairTickets          RepairTicket[]     @relation("RepairTicketParty")
+  repairJobs             RepairTicket[]     @relation("RepairTicketKarigar")
+  girviBatches           GirviBatch[]
+  girviLoansTaken        GirviTransfer[]
+  exchanges              Exchange[]
+  buySells               BuySell[]
+  bhavBookings           BhavBooking[]
+  schemeEnrollments      SchemeEnrollment[]
+  samples                Sample[]           @relation("SampleParty")
+  karigarSamples         Sample[]           @relation("SampleKarigar")
+  sampleMovements        SampleMovement[]   @relation("SampleMovementParty")
+  karigarSampleMovements SampleMovement[]   @relation("SampleMovementKarigar")
 
   @@index([businessId, type, name])
   @@index([businessId, mobile])
@@ -829,6 +849,8 @@ model LedgerEntry {
   source        String
   sourceId      String
   partyId       Int?
+  /// party FKs are NO ACTION, not RESTRICT: RESTRICT raises 23001, which Prisma 6 does not map to P2003; non-deferrable NO ACTION refuses the same delete with 23503 → P2003 (→ 409)
+  party         Party?      @relation(fields: [partyId], references: [id], onDelete: NoAction, onUpdate: Cascade)
   stockItemId   Int?
   narration     String?
   reversalOfId  BigInt?
@@ -972,6 +994,7 @@ model Bill {
   billNo            String
   seq               Int
   partyId           Int
+  party             Party             @relation(fields: [partyId], references: [id], onDelete: NoAction, onUpdate: Cascade)
   billDate          DateTime          @db.Date
   dueDate           DateTime?         @db.Date
   /// GST computed as IGST (party state differs from branch/business state)
@@ -1097,6 +1120,7 @@ model UdharEntry {
   businessId   Int
   branchId     Int
   partyId      Int
+  party        Party    @relation(fields: [partyId], references: [id], onDelete: NoAction, onUpdate: Cascade)
   txnDate      DateTime @db.Date
   amount       Decimal  @default(0) @db.Decimal(14, 2)
   gold         Decimal  @default(0) @db.Decimal(14, 3)
@@ -1126,6 +1150,7 @@ model UdharTxn {
   branchId      Int
   txnNo         Int
   partyId       Int
+  party         Party          @relation(fields: [partyId], references: [id], onDelete: NoAction, onUpdate: Cascade)
   txnDate       DateTime       @db.Date
   /// given to the party (party owes more)
   cashOut       Decimal        @default(0) @db.Decimal(14, 2)
@@ -1174,6 +1199,7 @@ model JustBill {
   seq            Int
   /// optional link; walk-in customers use customerName/mobile only
   partyId        Int?
+  party          Party?            @relation(fields: [partyId], references: [id], onDelete: NoAction, onUpdate: Cascade)
   customerName   String
   mobile         String?
   billDate       DateTime          @db.Date
@@ -1272,6 +1298,7 @@ model SalesDraft {
   /// salesperson = creator
   createdById           Int
   partyId               Int?
+  party                 Party?           @relation(fields: [partyId], references: [id], onDelete: NoAction, onUpdate: Cascade)
   customerName          String
   mobile                String?
   /// estimate at draft time (current rates), display only — the bill recomputes
@@ -1334,6 +1361,7 @@ model Order {
   branchId     Int
   orderNo      Int
   partyId      Int
+  party        Party          @relation(fields: [partyId], references: [id], onDelete: NoAction, onUpdate: Cascade)
   orderDate    DateTime       @db.Date
   deliveryDate DateTime?      @db.Date
   rateType     OrderRateType  @default(ON_DELIVERY)
@@ -1437,6 +1465,7 @@ model KarigarIssue {
   branchId       Int
   issueNo        Int
   karigarId      Int
+  karigar        Party              @relation(fields: [karigarId], references: [id], onDelete: NoAction, onUpdate: Cascade)
   issueDate      DateTime           @db.Date
   dueDate        DateTime?          @db.Date
   goldFine       Decimal            @default(0) @db.Decimal(14, 3)
@@ -1478,6 +1507,7 @@ model RepairTicket {
   branchId       Int
   ticketNo       Int
   partyId        Int
+  party          Party          @relation("RepairTicketParty", fields: [partyId], references: [id], onDelete: NoAction, onUpdate: Cascade)
   /// GOLD / SILVER / OTHER
   metal          String
   category       String
@@ -1494,6 +1524,7 @@ model RepairTicket {
   priority       RepairPriority @default(NORMAL)
   status         RepairStatus   @default(RECEIVED)
   karigarId      Int?
+  karigar        Party?         @relation("RepairTicketKarigar", fields: [karigarId], references: [id], onDelete: NoAction, onUpdate: Cascade)
   labourCharge   Decimal        @default(0) @db.Decimal(12, 2)
   otherCharge    Decimal        @default(0) @db.Decimal(12, 2)
   advanceCash    Decimal        @default(0) @db.Decimal(14, 2)
@@ -1565,6 +1596,7 @@ model GirviBatch {
   branchId           Int
   girviNo            Int
   partyId            Int
+  party              Party          @relation(fields: [partyId], references: [id], onDelete: NoAction, onUpdate: Cascade)
   issueDate          DateTime       @db.Date
   tenureMonths       Int            @default(12)
   returnDate         DateTime       @db.Date
@@ -1632,6 +1664,7 @@ model GirviTransfer {
   transferNo          Int
   /// the lender (a party, usually a supplier)
   lenderPartyId       Int
+  lenderParty         Party               @relation(fields: [lenderPartyId], references: [id], onDelete: NoAction, onUpdate: Cascade)
   transferDate        DateTime            @db.Date
   tenureMonths        Int                 @default(12)
   returnDate          DateTime            @db.Date
@@ -1729,6 +1762,7 @@ model Exchange {
   exchangeNo    Int
   side          TradeSide
   partyId       Int
+  party         Party          @relation(fields: [partyId], references: [id], onDelete: NoAction, onUpdate: Cascade)
   metal         MetalKind
   txnDate       DateTime       @db.Date
   /// Σ line fine
@@ -1835,6 +1869,7 @@ model BuySell {
   buySellNo     Int
   side          TradeSide
   partyId       Int
+  party         Party                 @relation(fields: [partyId], references: [id], onDelete: NoAction, onUpdate: Cascade)
   metal         MetalKind
   txnDate       DateTime              @db.Date
   /// Σ line weight (bullion fine)
@@ -1893,6 +1928,7 @@ model BhavBooking {
   bookingNo     Int
   side          TradeSide
   partyId       Int
+  party         Party             @relation(fields: [partyId], references: [id], onDelete: NoAction, onUpdate: Cascade)
   metal         MetalKind
   txnDate       DateTime          @db.Date
   weight        Decimal           @db.Decimal(14, 3)
@@ -2005,6 +2041,7 @@ model SchemeEnrollment {
   schemeId           Int
   groupId            Int?
   partyId            Int
+  party              Party                   @relation(fields: [partyId], references: [id], onDelete: NoAction, onUpdate: Cascade)
   assignId           String
   displayName        String
   emiAmount          Decimal                 @db.Decimal(14, 2)
@@ -2204,6 +2241,8 @@ model Sample {
   sampleNo       Int
   partyId        Int?
   karigarId      Int?
+  party          Party?           @relation("SampleParty", fields: [partyId], references: [id], onDelete: NoAction, onUpdate: Cascade)
+  karigar        Party?           @relation("SampleKarigar", fields: [karigarId], references: [id], onDelete: NoAction, onUpdate: Cascade)
   /// KarigarIssue this sample was last issued with (kept after return for history)
   karigarIssueId Int?
   metal          MetalKind
@@ -2229,6 +2268,8 @@ model SampleMovement {
   action    String
   partyId   Int?
   karigarId Int?
+  party     Party?   @relation("SampleMovementParty", fields: [partyId], references: [id], onDelete: NoAction, onUpdate: Cascade)
+  karigar   Party?   @relation("SampleMovementKarigar", fields: [karigarId], references: [id], onDelete: NoAction, onUpdate: Cascade)
   note      String?
   userId    Int?
   createdAt DateTime @default(now())

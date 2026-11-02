@@ -2,8 +2,9 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { db, truncateAll } from '../../../../test/helpers/db';
 import { createBusiness } from '../../../../test/helpers/factory';
-import { addBillPaymentsBody, billBody } from '../../../shared';
+import { addBillPaymentsBody, billBody, justBillBody } from '../../../shared';
 import * as inv from '../inventory';
+import * as justBill from '../justbill/service';
 import * as schemes from '../schemes/service';
 import { closeDay } from '../daybook/service';
 import * as billing from './service';
@@ -81,6 +82,23 @@ describe('UDHAR_ADVANCE pay mode', () => {
     expect(Number(after.balance)).toBe(50000);
     expect(await partyMoney(s.party.id)).toBe(50000); // moving credit onto the bill changes nothing net
     await expect(billing.addBillPayments(s.ctx, bill.id, addBillPaymentsBody.parse({ payments: [{ mode: 'UDHAR_ADVANCE', amount: 1 }] }))).rejects.toMatchObject({ status: 409 });
+  });
+
+  // G7: each tx inserts a party child (FK → FOR KEY SHARE on the party) before locking the party for the credit check;
+  // FOR UPDATE there deadlocked two of them (40P01 → 500). FOR NO KEY UPDATE still serialises the credit use.
+  it('a sell bill and a Just Bill using the same credit at once: one wins, the other 409 OVER_BALANCE, never a deadlock', async () => {
+    const s = await setup();
+    for (let i = 0; i < 6; i++) {
+      const party = await db.party.create({ data: { businessId: s.business.id, type: 'CUSTOMER', name: `Race ${i}`, mobile: '9000000003', countryCode: '+91' } });
+      await giveAdvance({ ...s, party }, 10000);
+      const res = await Promise.allSettled([
+        billing.createBill(s.ctx, sell(party.id, [{ mode: 'UDHAR_ADVANCE', amount: 10000 }, { mode: 'CASH', amount: 50000 }])),
+        justBill.createJustBill(s.ctx, justBillBody.parse({ partyId: party.id, items: [{ name: 'Coin', quantity: 1, unit: 'PCS', rate: 10000 }], payments: [{ mode: 'UDHAR_ADVANCE', amount: 10000 }] })),
+      ]);
+      expect(res.filter((r) => r.status === 'fulfilled')).toHaveLength(1);
+      expect(res.find((r) => r.status === 'rejected')?.reason).toMatchObject({ status: 409, details: { code: 'OVER_BALANCE' } });
+      expect(await partyMoney(party.id)).toBe(0); // the credit was used exactly once
+    }
   });
 
   it('DAY_CLOSED → 403 even though no shop asset moves', async () => {

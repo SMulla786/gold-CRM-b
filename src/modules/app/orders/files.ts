@@ -4,9 +4,9 @@ import path from 'node:path';
 import multer from 'multer';
 import { HttpError } from '../../../middleware/error';
 import type { TenantContext } from '../../../middleware/context';
+import { UPLOAD_ROOT } from '../uploads';
 
 // shortcut: mirrors app/uploads.ts saveImage/imagePath (not exported there) + PDF for order designs; fold into uploads.ts when it is free to edit.
-const UPLOAD_ROOT = path.join(process.cwd(), 'uploads');
 export const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 2 * 1024 * 1024 } });
 export const CONTENT_TYPE: Record<string, string> = { '.jpg': 'image/jpeg', '.png': 'image/png', '.webp': 'image/webp', '.pdf': 'application/pdf' };
 

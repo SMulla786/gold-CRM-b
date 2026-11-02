@@ -35,6 +35,16 @@ export const errorHandler: ErrorRequestHandler = (err, req, res, _next) => {
       res.status(409).json({ error: { code: 'CONFLICT', message: 'Already exists', details: err.meta } });
       return;
     }
+    // FK violation: the referenced row (e.g. a party) was deleted meanwhile, or is still in use
+    if (err.code === 'P2003') {
+      res.status(409).json({ error: { code: 'CONFLICT', message: 'A linked record was changed or removed. Refresh and try again.' } });
+      return;
+    }
+    // write conflict / deadlock (P2034; P2010 = in a raw query): nothing was saved, a retry is safe
+    if (err.code === 'P2034' || (err.code === 'P2010' && (err.meta as { code?: string } | undefined)?.code === '40P01')) {
+      res.status(409).json({ error: { code: 'CONFLICT', message: 'Busy with another change. Please try again.' } });
+      return;
+    }
   }
   // Unexpected: log the full stack server-side (with the request id); never leak it to the client in production.
   const ip = clientIp(req);

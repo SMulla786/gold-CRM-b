@@ -3,10 +3,12 @@ import { mkdir, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { scopedDb } from '../../lib/db';
 import { prisma } from '../../lib/prisma';
+import { env } from '../../config/env';
+import { logger } from '../../config/logger';
 import { HttpError } from '../../middleware/error';
 import type { TenantContext } from '../../middleware/context';
 
-const UPLOAD_ROOT = path.join(process.cwd(), 'uploads');
+export const UPLOAD_ROOT = path.resolve(env.UPLOAD_DIR ?? path.join(process.cwd(), 'uploads'));
 export type PartyImageField = 'photoUrl' | 'shopLogoUrl';
 
 type FindRow = () => Promise<Record<string, unknown> | null>; // scopedDb findUnique — tenant/branch filter already applied
@@ -52,6 +54,16 @@ export const savePartyImage = (ctx: TenantContext, partyId: number, field: Party
   saveImage(ctx, () => scopedDb(ctx).party.findUnique({ where: { id: partyId } }), (rel) => scopedDb(ctx).party.update({ where: { id: partyId }, data: { [field]: rel } }), 'parties', field, buffer, 'Party not found');
 export const partyImagePath = (ctx: TenantContext, partyId: number, field: PartyImageField): Promise<string> =>
   imagePath(() => scopedDb(ctx).party.findUnique({ where: { id: partyId } }), field);
+
+/** After a party hard delete commits: removes its images, but only files savePartyImage wrote for this business and no other party still uses. */
+export async function removePartyImages(businessId: number, stored: (string | null)[]): Promise<void> {
+  const own = path.join(UPLOAD_ROOT, String(businessId), 'parties') + path.sep;
+  for (const rel of new Set(stored)) {
+    if (!rel || !path.resolve(UPLOAD_ROOT, rel).startsWith(own)) continue; // traversal, or not a party upload of this business
+    if (await prisma.party.count({ where: { OR: [{ photoUrl: rel }, { shopLogoUrl: rel }] } })) continue; // shared: never delete
+    await rm(path.resolve(UPLOAD_ROOT, rel), { force: true }).catch((e: unknown) => logger.warn(`party image not removed (orphan file): ${rel}  ${String(e)}`));
+  }
+}
 export const saveStockImage = (ctx: TenantContext, stockId: number, buffer: Buffer): Promise<string> =>
   saveImage(ctx, () => scopedDb(ctx).stockItem.findUnique({ where: { id: stockId } }), (rel) => scopedDb(ctx).stockItem.update({ where: { id: stockId }, data: { photoUrl: rel } }), 'stock', 'photoUrl', buffer, 'Stock item not found');
 export const stockImagePath = (ctx: TenantContext, stockId: number): Promise<string> =>

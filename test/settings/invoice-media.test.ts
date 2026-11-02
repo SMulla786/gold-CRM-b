@@ -4,10 +4,10 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import { api, bearer, loginAs } from '../helpers/app';
 import { db, truncateAll } from '../helpers/db';
 import { TEST_MPIN, createBusiness, createPlan, createSubscription, createUser } from '../helpers/factory';
+import { UPLOAD_ROOT as UPLOADS } from '../../src/modules/app/uploads';
 
 // BILL-11: Remove logo / signature / watermark (InvoiceSettings "Remove") — settings.misc edit + MPIN, clears only that field.
 const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0]);
-const UPLOADS = path.join(process.cwd(), 'uploads');
 
 async function biz() {
   const modules = ['billing'];

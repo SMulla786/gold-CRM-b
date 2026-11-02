@@ -144,7 +144,8 @@ async function postNoCashPays(tx: Prisma.TransactionClient, ctx: TenantContext, 
   await ledger.assertDaysOpen(tx, lctx, [{ branchId: bill.branchId, txnDate }]);
   const advance = special.filter((pc) => pc.input.mode === 'UDHAR_ADVANCE').reduce((a, pc) => a.plus(D(pc.amount)), new Prisma.Decimal(0));
   if (advance.gt(0)) {
-    await tx.$queryRaw`SELECT id FROM "Party" WHERE id = ${bill.partyId} FOR UPDATE`; // serialize concurrent uses of the same credit
+    // NO KEY UPDATE, not UPDATE: this tx already holds FOR KEY SHARE on the party (FK of the bill it inserted), so FOR UPDATE deadlocks
+    await tx.$queryRaw`SELECT id FROM "Party" WHERE id = ${bill.partyId} FOR NO KEY UPDATE`; // serialize concurrent uses of the same credit
     const sum = await tx.udharEntry.aggregate({ where: { businessId: ctx.businessId!, partyId: bill.partyId, NOT: { source: 'SELL_BILL', sourceId: String(bill.id) } }, _sum: { amount: true } });
     const credit = Prisma.Decimal.max(D(sum._sum.amount).negated(), 0);
     if (advance.gt(credit)) throw new HttpError(409, 'CONFLICT', `Udhar advance available is ₹${credit.toFixed(2)}`, { code: 'OVER_BALANCE' });

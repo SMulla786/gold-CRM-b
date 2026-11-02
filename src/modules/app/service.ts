@@ -24,6 +24,8 @@ import type {
   SettingsDto,
 } from '../../shared';
 import { RATE_UNIT_GRAMS, SETTING_KEYS } from '../../shared';
+import { logger } from '../../config/logger';
+import { removePartyImages } from './uploads';
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 const partyRef = (p: any): PartyRefDto => ({ id: p.id, type: p.type, name: p.name, mobile: p.mobile, shopName: p.shopName });
@@ -158,7 +160,7 @@ export async function updateParty(ctx: TenantContext, partyId: number, body: Rec
   return getParty(ctx, partyId);
 }
 
-/** Every column holding a party id. Only Party.parentId is a real FK, so a hard delete must check these itself (guarded by party-delete.test). */
+/** Every column holding a party id. All are real FKs (ON DELETE NO ACTION; parentId SET NULL); the history check reads them (guarded by party-delete.test). */
 export const PARTY_REFS = [
   ['LedgerEntry', 'partyId'], ['Bill', 'partyId'], ['UdharEntry', 'partyId'], ['UdharTxn', 'partyId'], ['JustBill', 'partyId'],
   ['SalesDraft', 'partyId'], ['Order', 'partyId'], ['KarigarIssue', 'karigarId'], ['RepairTicket', 'partyId'], ['RepairTicket', 'karigarId'],
@@ -167,11 +169,13 @@ export const PARTY_REFS = [
   ['Party', 'parentId'],
 ] as const;
 
-export async function deleteParty(ctx: TenantContext, partyId: number, confirm = false): Promise<DeletePartyResultDto> {
+/** `referenced` (internal): the FK refused a hard delete, so this run archives regardless of the history check. */
+export async function deleteParty(ctx: TenantContext, partyId: number, confirm = false, referenced = false): Promise<DeletePartyResultDto> {
   const businessId = ctx.businessId!;
-  return prisma.$transaction(async (tx) => {
+  let images: (string | null)[] = []; // set only once the row is deleted; the files go after the commit
+  const out = await prisma.$transaction(async (tx) => {
     // row lock: concurrent deletes of the same party run one after the other
-    const [party] = await tx.$queryRaw<{ id: number }[]>`SELECT id FROM "Party" WHERE id = ${partyId} AND "businessId" = ${businessId} FOR UPDATE`;
+    const [party] = await tx.$queryRaw<{ id: number; photoUrl: string | null; shopLogoUrl: string | null }[]>`SELECT id, "photoUrl", "shopLogoUrl" FROM "Party" WHERE id = ${partyId} AND "businessId" = ${businessId} FOR UPDATE`;
     if (!party) throw new HttpError(404, 'NOT_FOUND', 'Party not found');
     // business-wide on purpose (not the caller's branches): dues or bills in another branch still block
     const due = await tx.udharEntry.aggregate({ where: { businessId, partyId }, _sum: { amount: true, gold: true, silver: true } });
@@ -183,14 +187,22 @@ export async function deleteParty(ctx: TenantContext, partyId: number, confirm =
     if (pending > 0) throw new HttpError(409, 'PARTY_HAS_PENDING_BILLS', `This party has ${pending} pending bill(s). Settle them before removing the party.`);
     const used = PARTY_REFS.map(([t, c]) => Prisma.sql`EXISTS (SELECT 1 FROM ${Prisma.raw(`"${t}"`)} WHERE ${Prisma.raw(`"${c}"`)} = ${partyId})`);
     const [{ hasHistory } = { hasHistory: true }] = await tx.$queryRaw<{ hasHistory: boolean }[]>(Prisma.sql`SELECT (${Prisma.join(used, ' OR ')}) AS "hasHistory"`);
-    if (hasHistory) {
+    if (hasHistory || referenced) {
       await tx.party.update({ where: { id: partyId }, data: { isActive: false } });
       return { result: 'ARCHIVED' as const };
     }
     if (!confirm) throw new HttpError(409, 'CONFIRM_REQUIRED', 'This party has no history and will be permanently deleted. Confirm to continue.');
     await tx.party.delete({ where: { id: partyId } });
+    images = [party.photoUrl, party.shopLogoUrl];
     return { result: 'DELETED' as const };
+  }).catch((e: unknown) => {
+    // P2003: an FK refused the delete (a reference the history check did not see) → run once more as referenced: dues/bill checks, then archive
+    if (!referenced && e instanceof Prisma.PrismaClientKnownRequestError && e.code === 'P2003') return deleteParty(ctx, partyId, confirm, true);
+    throw e;
   });
+  // best effort: the party is already gone; a leftover file is only logged
+  if (out.result === 'DELETED') await removePartyImages(businessId, images).catch((e: unknown) => logger.warn(`party #${partyId} images not cleaned up: ${String(e)}`));
+  return out;
 }
 
 // ───────────── Bank accounts ─────────────

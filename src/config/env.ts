@@ -11,6 +11,8 @@ const schema = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
   /** '1' prints password-reset OTPs to the terminal (development only; see otpStubEnabled). */
   OTP_STUB: z.string().optional(),
+  /** Where uploaded files live; default <cwd>/uploads (tests point it at a temp dir). */
+  UPLOAD_DIR: z.string().min(1).optional(), // '' would resolve to the cwd
 });
 
 export const env = schema.parse(process.env);
