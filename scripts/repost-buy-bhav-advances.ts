@@ -99,6 +99,7 @@ async function main() {
   const r = await repostBuyBhavAdvances({ apply, userId: arg('--user'), businessId: arg('--business') });
   console.log(`${apply ? 'APPLY' : 'DRY RUN'}: ${r.candidates.length} BUY booking(s) with an advance posted as IN`);
   for (const c of r.candidates) console.log(`  business ${c.businessId}  booking id ${c.bookingId}  no. ${c.bookingNo}  advance ${c.advance}`);
+  console.log(`total advance ${r.candidates.reduce((a, c) => a.plus(c.advance), new Prisma.Decimal(0)).toFixed(2)} (each one is mis-posted by 2× in cash and party balance)`);
   if (apply) console.log(`applied ${r.applied.length}, skipped ${r.skipped.length} (already fixed), failed ${r.failed.length}${r.failed.map((f) => `\n  booking id ${f.bookingId}: ${f.error}`).join('')}`);
   if (r.failed.length) process.exitCode = 1;
 }
