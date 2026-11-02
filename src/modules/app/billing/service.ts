@@ -507,6 +507,10 @@ export async function editBill(ctx: TenantContext, id: number, body: BillBody): 
     // Lock the row + confirm still ACTIVE (TASK-30b-style guard against a concurrent edit/delete).
     const locked = await tx.bill.updateMany({ where: { id, status: 'ACTIVE' }, data: { status: 'ACTIVE' } });
     if (locked.count !== 1) throw new HttpError(409, 'CONFLICT', 'Bill is not active');
+    // G7 D-a: an Udhar settlement's money sits under source UDHAR, which undoBill does not reverse — re-posting it would book it twice
+    if (await tx.billPayment.count({ where: { billId: id, isActive: true, udharTxnId: { not: null } } })) {
+      throw new HttpError(409, 'CONFLICT', 'This bill was settled from Udhar. Delete that Udhar entry first, then edit the bill.');
+    }
     // ACC-05: checked on the projected post-edit balance (old kacha payments undone, new ones posted)
     const kacha = await billPools(tx, bill.branchId, [bill.payments, prep.payCalcs], { kind: bill.kind, billId: id });
     await undoBill(tx, ctx, bill, lctx, true); // undo old effects (always returns stock) before re-applying
