@@ -74,7 +74,10 @@ export async function deleteOpeningBalances(ctx: TenantContext, sourceId: string
       WHERE e."businessId" = ${ctx.businessId!} AND e.source = 'OPENING_BALANCE' AND e."sourceId" = ${sourceId} AND e."reversalOfId" IS NULL
         AND NOT EXISTS (SELECT 1 FROM "LedgerEntry" r WHERE r."reversalOfId" = e.id)
       ORDER BY e.id FOR UPDATE OF e`);
-    const udIds = (await tx.udharEntry.findMany({ where: { businessId: ctx.businessId!, source: 'OPENING_BALANCE', sourceId, reversalOfId: null }, select: { id: true } })).map((u) => u.id);
+    // G7 audit M4: lock the party rows too — a party-only batch has no ledger rows, so without this two deletes both reverse it
+    const udIds = (await tx.$queryRaw<{ id: bigint }[]>(Prisma.sql`
+      SELECT id FROM "UdharEntry" WHERE "businessId" = ${ctx.businessId!} AND source = 'OPENING_BALANCE' AND "sourceId" = ${sourceId} AND "reversalOfId" IS NULL
+      ORDER BY id FOR UPDATE`)).map((u) => u.id);
     const udReversed = await tx.udharEntry.count({ where: { reversalOfId: { in: udIds } } });
     if (rows.length + udIds.length - udReversed === 0) throw new HttpError(404, 'NOT_FOUND', 'Opening balance not found');
     // removing an opening KACHA / BULLION row takes that metal out of the pool: 409 if it has since been melted / sold
