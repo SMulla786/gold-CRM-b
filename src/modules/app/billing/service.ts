@@ -519,6 +519,8 @@ export async function editBill(ctx: TenantContext, id: number, body: BillBody): 
     if (await tx.billPayment.count({ where: { billId: id, isActive: true, udharTxnId: { not: null } } })) {
       throw new HttpError(409, 'CONFLICT', 'This bill was settled from Udhar. Delete that Udhar entry first, then edit the bill.');
     }
+    // G7 audit M3: undo the bill as it is under the lock, not the first read — a payment that committed in between is undone with the rest
+    const bill = await tx.bill.findUniqueOrThrow({ where: { id }, include: { items: true, payments: true } });
     // ACC-05: checked on the projected post-edit balance (old kacha payments undone, new ones posted)
     const kacha = await billPools(tx, bill.branchId, [bill.payments, prep.payCalcs], { kind: bill.kind, billId: id });
     await undoBill(tx, ctx, bill, lctx, true); // undo old effects (always returns stock) before re-applying
@@ -610,6 +612,8 @@ export async function deleteBill(ctx: TenantContext, id: number, returnStock: bo
     // Flip ACTIVE→DELETED atomically FIRST — two concurrent deletes can't both run the return (double stock).
     const flipped = await tx.bill.updateMany({ where: { id, status: 'ACTIVE' }, data: { status: 'DELETED', deletedAt: new Date(), deletedWithStock: returnStock } });
     if (flipped.count !== 1) throw new HttpError(409, 'CONFLICT', 'Bill is not active');
+    // G7 audit M3: undo the bill as it is under the lock, not the first read — a payment that committed in between is undone with the rest
+    const bill = await tx.bill.findUniqueOrThrow({ where: { id }, include: { items: true, payments: true } });
     if (order) {
       await tx.order.update({ where: { id: order.id }, data: { status: 'READY', billId: null } });
       await tx.orderItem.updateMany({ where: { orderId: order.id }, data: { status: 'RECEIVED' } });
