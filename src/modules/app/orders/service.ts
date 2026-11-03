@@ -3,6 +3,7 @@ import { prisma } from '../../../lib/prisma';
 import { scopedDb } from '../../../lib/db';
 import * as ledger from '../../../lib/ledger';
 import * as udhar from '../../../lib/udhar';
+import { poolGuard, type Pool } from '../../../lib/kacha';
 import { logActivity } from '../../../lib/activity';
 import { HttpError } from '../../../middleware/error';
 import type { TenantContext } from '../../../middleware/context';
@@ -278,6 +279,11 @@ export async function createKarigarIssue(ctx: TenantContext, body: KarigarIssueB
     const claim = await tx.orderItem.updateMany({ where: { id: { in: body.orderItemIds }, status: 'PENDING' }, data: { status: 'ASSIGNED', karigarIssueId: issue.id } });
     if (claim.count !== new Set(body.orderItemIds).size) throw new HttpError(409, 'CONFLICT', 'Some items were just assigned to another issue');
     await tx.order.updateMany({ where: { id: { in: [...new Set(items.map((i) => i.orderId))] }, status: 'PENDING' }, data: { status: 'IN_PROCESS' } });
+    // G7 D-i: the fine metal handed over comes out of the branch's BULLION pool — guarded like every draw (ACC-05 / G5 order: document rows, then pools)
+    const pools: Pool[] = [];
+    if (body.goldFine > 0) pools.push({ metal: 'GOLD', form: 'BULLION' });
+    if (body.silverFine > 0) pools.push({ metal: 'SILVER', form: 'BULLION' });
+    const bullion = await poolGuard(tx, branchId, pools);
     // samples go out with the issue atomically — any one no longer IN_HAND/RETURNED → 409 and the whole issue rolls back
     if (samples.length) await issueSamplesToKarigarTx(tx, ctx, samples, { karigarId: body.karigarId, karigarName: karigar.name, karigarIssueId: issue.id, issueNo });
 
@@ -288,6 +294,7 @@ export async function createKarigarIssue(ctx: TenantContext, body: KarigarIssueB
     if (body.cash > 0) ledRows.push({ branchId, txnDate: issueDate, asset: 'MONEY', direction: 'OUT', amount: body.cash, source: 'KARIGAR_ISSUE', sourceId, narration: 'Karigar cash issue' });
     if (body.online > 0) ledRows.push({ branchId, txnDate: issueDate, asset: 'MONEY', direction: 'OUT', bankAccountId: body.bankAccountId ?? null, amount: body.online, source: 'KARIGAR_ISSUE', sourceId, narration: 'Karigar online issue' });
     if (ledRows.length) await ledger.post(tx, lctx, ledRows);
+    await bullion(); // 409 BULLION_SHORT when the pool can't cover the issue
     // karigar now owes the shop the material + money handed over
     const amount = D(body.cash).plus(body.online);
     if (!(amount.isZero() && body.goldFine === 0 && body.silverFine === 0)) {

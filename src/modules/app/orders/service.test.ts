@@ -1,7 +1,9 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { db, truncateAll } from '../../../../test/helpers/db';
 import { createBusiness } from '../../../../test/helpers/factory';
+import { openingBalanceBody } from '../../../shared';
 import * as inv from '../inventory';
+import { createOpeningBalances } from '../opening';
 import * as orders from './service';
 import * as samples from '../samples/service';
 import type { TenantContext } from '../../../middleware/context';
@@ -24,6 +26,8 @@ async function setup() {
   const itemName = await inv.createItemName(ctx, { groupId: group!.id, name: 'Gold Ring', method: 'TAG', tagPrefix: 'GR', tagDigits: 4 });
   const customer = await db.party.create({ data: { businessId: business.id, type: 'CUSTOMER', name: 'Cust', mobile: '9000000001', countryCode: '+91' } });
   const karigar = await db.party.create({ data: { businessId: business.id, type: 'KARIGAR', name: 'Karigar', mobile: '9000000002', countryCode: '+91' } });
+  // karigar issues draw fine gold from the branch's bullion pool (G7 D-i): put some in
+  await createOpeningBalances(ctx, openingBalanceBody.parse({ entries: [{ kind: 'METAL', metal: 'GOLD', metalForm: 'BULLION', fine: 100 }] }));
   return { business, root, ctx, itemName: itemName!, customer, karigar };
 }
 
