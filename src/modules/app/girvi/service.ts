@@ -49,6 +49,12 @@ const paidToward = (b: any, to: Date) =>
     .reduce((a: Prisma.Decimal, t: any) => a.plus(D(t.interest)).plus(D(t.discount)), new Prisma.Decimal(0));
 /** Interest still due: accrued since interestFrom minus partial payments since (G7 D-b). */
 const dueOf = (b: any, to: Date): string => Prisma.Decimal.max(D(dueParts(b, to).interest).minus(paidToward(b, to)), 0).toFixed(2);
+/** G7 D-b2: nothing dated before the loan's settled point (interestFrom, or its latest interest payment if later; needs `b.txns`). An earlier
+ *  date's due ignores the later payments, so they'd be collected twice; a top-up / release there would move interestFrom back and charge those days again. */
+const assertNotBackdated = (b: any, txnDate: Date) => {
+  const settled = (b.txns ?? []).filter((t: any) => t.type === 'INTEREST' && !t.isReversed).reduce((m: number, t: any) => Math.max(m, t.txnDate.getTime()), b.interestFrom.getTime());
+  if (txnDate.getTime() < settled) throw new HttpError(400, 'VALIDATION', 'Date is before the last interest payment or settlement on this girvi');
+};
 
 /** MONEY ledger rows for a girvi cash/online movement (OUT = paid to customer, IN = received). source GIRVI, sourceId = batch id. */
 function girviMoneyRows(branchId: number, txnDate: Date, direction: 'IN' | 'OUT', cash: number, online: number, bankAccountId: number | null, batchId: number, narration: string): ledger.LedgerEntryInput[] {
@@ -116,6 +122,7 @@ export async function payInterest(ctx: TenantContext, id: number, body: { txnDat
     await tx.$queryRaw`SELECT id FROM "GirviBatch" WHERE id = ${id} FOR NO KEY UPDATE`; // one interest / top-up / release at a time per loan
     const fresh = await tx.girviBatch.findUniqueOrThrow({ where: { id }, include: { items: true, txns: true } });
     if (fresh.status !== 'ACTIVE') throw new HttpError(409, 'CONFLICT', 'Girvi is not active');
+    assertNotBackdated(fresh, txnDate);
     const due = dueOf(fresh, txnDate);
     if (D(body.interest).plus(body.discount).gt(due)) throw new HttpError(400, 'VALIDATION', 'Interest paid exceeds the due', { due });
     await tx.girviTxn.create({ data: { batchId: id, type: 'INTEREST', txnDate, interest: body.interest, discount: body.discount, cash: body.cash, online: body.online, bankAccountId: body.online > 0 ? body.bankAccountId! : null, createdById: ctx.userId } });
@@ -140,6 +147,7 @@ export async function topupGirvi(ctx: TenantContext, id: number, body: { txnDate
     await tx.$queryRaw`SELECT id FROM "GirviBatch" WHERE id = ${id} FOR NO KEY UPDATE`; // one interest / top-up / release at a time per loan
     const fresh = await tx.girviBatch.findUniqueOrThrow({ where: { id }, include: { items: true, txns: true } });
     if (fresh.status !== 'ACTIVE') throw new HttpError(409, 'CONFLICT', 'Girvi is not active');
+    assertNotBackdated(fresh, txnDate);
     if (D(dueOf(fresh, txnDate)).gt(0)) throw new HttpError(409, 'CONFLICT', 'Pay interest up to date before a top-up');
     await tx.girviTxn.create({ data: { batchId: id, type: 'TOPUP', txnDate, principal: body.principal, cash: body.cash, online: body.online, bankAccountId: body.online > 0 ? body.bankAccountId! : null, createdById: ctx.userId } });
     await ledger.post(tx, lctx, girviMoneyRows(fresh.branchId, txnDate, 'OUT', body.cash, body.online, body.bankAccountId ?? null, id, `Girvi #${fresh.girviNo} top-up`));
@@ -163,6 +171,7 @@ export async function releaseGirvi(ctx: TenantContext, id: number, body: GirviRe
     await tx.$queryRaw`SELECT id FROM "GirviBatch" WHERE id = ${id} FOR NO KEY UPDATE`; // one interest / top-up / release at a time per loan
     const fresh = await tx.girviBatch.findUniqueOrThrow({ where: { id }, include: { items: true, txns: true } });
     if (fresh.status !== 'ACTIVE') throw new HttpError(409, 'CONFLICT', 'Girvi is not active');
+    assertNotBackdated(fresh, txnDate);
     const due = dueOf(fresh, txnDate);
     if (!D(body.interestPaid).plus(body.discount).equals(due)) throw new HttpError(400, 'VALIDATION', 'Settle the exact interest due to release', { due });
     if (D(body.principalPaid).gt(fresh.principal)) throw new HttpError(400, 'VALIDATION', 'Principal paid exceeds the outstanding loan');
@@ -194,6 +203,7 @@ export async function replaceGirviItem(ctx: TenantContext, batchId: number, item
   const fine = D(body.net).times(body.purity).div(100);
   const valuation = fine.times(body.rate);
   await prisma.$transaction(async (tx) => {
+    await tx.$queryRaw`SELECT id FROM "GirviBatch" WHERE id = ${batchId} FOR NO KEY UPDATE`; // G7 D-b2: the loan row before its items, as release does (else they deadlock)
     await tx.$queryRaw`SELECT id FROM "GirviItem" WHERE id = ${itemId} FOR UPDATE`;
     const fresh = await tx.girviBatch.findUniqueOrThrow({ where: { id: batchId } });
     if (fresh.status !== 'ACTIVE') throw new HttpError(409, 'CONFLICT', 'Girvi is not active');
