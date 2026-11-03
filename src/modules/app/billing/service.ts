@@ -322,8 +322,8 @@ async function writeBillContents(tx: Prisma.TransactionClient, ctx: TenantContex
       if (sold.count !== 1) throw new HttpError(409, 'CONFLICT', `Stock item ${r.stockItem.id} is no longer AVAILABLE`);
       stockItemId = r.stockItem.id;
     } else if (r.action === 'SELL_LOOSE') {
-      const taken = await tx.stockItem.updateMany({ where: { id: r.stockItem.id, status: { in: [...sellable(r.stockItem.id)] }, gross: { gte: r.gross }, less: { gte: r.less }, pcs: { gte: r.pcs } }, data: { gross: { decrement: r.gross }, less: { decrement: r.less }, pcs: { decrement: r.pcs } } });
-      if (taken.count !== 1) throw new HttpError(409, 'CONFLICT', `Stock item ${r.stockItem.id} does not hold that much`);
+      const taken = await tx.stockItem.updateMany({ where: { id: r.stockItem.id, status: { in: [...sellable(r.stockItem.id)] }, branchId, gross: { gte: r.gross }, less: { gte: r.less }, pcs: { gte: r.pcs } }, data: { gross: { decrement: r.gross }, less: { decrement: r.less }, pcs: { decrement: r.pcs } } });
+      if (taken.count !== 1) throw new HttpError(409, 'CONFLICT', `Stock item ${r.stockItem.id} does not hold that much in this branch`);
       const it = await tx.stockItem.findUniqueOrThrow({ where: { id: r.stockItem.id } });
       const net = Prisma.Decimal.max(D(it.gross).minus(it.less), 0);
       const fine = net.times(D(it.tunch)).div(100).times(D(it.wastage).div(100).plus(1));
