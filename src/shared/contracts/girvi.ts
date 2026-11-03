@@ -54,12 +54,14 @@ export const girviBody = z
 /** Pay interest only (up to the as-of date; partial allowed — interestFrom moves forward only when fully paid up). */
 export const girviInterestBody = z
   .object({ txnDate: z.coerce.date().optional(), interest: decimalInput.positive(), discount: decimalInput.default(0), remark: z.string().trim().max(200).optional(), ...money })
-  .refine(bankRule, { message: 'Select a bank account', path: ['bankAccountId'] });
+  .refine(bankRule, { message: 'Select a bank account', path: ['bankAccountId'] })
+  .refine((b) => Math.abs(b.cash + b.online - b.interest) < 0.005, { message: 'Cash + online must equal the interest paid', path: ['cash'] });
 
 /** Extra loan on the same batch. */
 export const girviTopupBody = z
   .object({ txnDate: z.coerce.date().optional(), principal: decimalInput.positive(), remark: z.string().trim().max(200).optional(), ...money })
-  .refine(bankRule, { message: 'Select a bank account', path: ['bankAccountId'] });
+  .refine(bankRule, { message: 'Select a bank account', path: ['bankAccountId'] })
+  .refine((b) => Math.abs(b.cash + b.online - b.principal) < 0.005, { message: 'Cash + online must equal the top-up amount', path: ['cash'] });
 
 /** Release items: settle interest due + repay principal (all items → batch CLOSED, principal must reach 0). */
 export const girviReleaseBody = z
@@ -72,7 +74,8 @@ export const girviReleaseBody = z
     remark: z.string().trim().max(200).optional(),
     ...money,
   })
-  .refine(bankRule, { message: 'Select a bank account', path: ['bankAccountId'] });
+  .refine(bankRule, { message: 'Select a bank account', path: ['bankAccountId'] })
+  .refine((b) => Math.abs(b.cash + b.online - b.principalPaid - b.interestPaid) < 0.005, { message: 'Cash + online must equal principal + interest paid', path: ['cash'] });
 
 /** Replace / revalue (dismantle) one pledged item on an active girvi; the loan must stay within the new valuation. MPIN-gated. */
 export const girviItemReplaceBody = girviItemInput.extend({ remark: z.string().trim().min(2).max(200) });
