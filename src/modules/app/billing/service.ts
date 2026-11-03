@@ -562,8 +562,20 @@ export async function addBillPayments(ctx: TenantContext, id: number, body: { pa
   const lctx = lctxOf(ctx);
 
   await prisma.$transaction(async (tx) => {
-    const fresh = await tx.bill.findUnique({ where: { id }, select: { status: true } });
+    // G7 D-e: the document row first (kacha.ts lock order), so the due cap and the PAN total below read settled numbers
+    await tx.$queryRaw`SELECT id FROM "Bill" WHERE id = ${id} FOR NO KEY UPDATE`;
+    const fresh = await tx.bill.findUnique({ where: { id }, select: { status: true, final: true, paid: true } });
     if (!fresh || fresh.status !== 'ACTIVE') throw new HttpError(409, 'CONFLICT', 'Bill is not active');
+    // Paying a supplier more than the bill's due has no meaning on the bill (as the udhar settle; a sell overpay stays the customer's advance).
+    const due = D(fresh.final).minus(fresh.paid);
+    if (bill.kind === 'PURCHASE' && added.gt(due)) throw new HttpError(409, 'CONFLICT', `Paid amount exceeds the bill due (${due.toFixed(2)})`);
+    // PAN rule as on create, on the bill's total cash so far plus this cash.
+    const cash = payCalcs.filter((p) => p.input.mode === 'CASH').reduce((a, p) => a.plus(D(p.amount)), new Prisma.Decimal(0));
+    if (bill.kind === 'SELL' && cash.gt(0)) {
+      const before = await tx.billPayment.aggregate({ where: { billId: id, isActive: true, mode: 'CASH' }, _sum: { amount: true } });
+      const party = await tx.party.findUnique({ where: { id: bill.partyId }, select: { pan: true } });
+      if (cash.plus(D(before._sum.amount)).gte(PAN_CASH_LIMIT) && !party?.pan) throw new HttpError(400, 'VALIDATION', "PAN required for this cash amount — add the party's PAN first", { code: 'PAN_REQUIRED' });
+    }
     const kacha = await billPools(tx, bill.branchId, [payCalcs]); // ACC-05
     await postNoCashPays(tx, ctx, bill, payCalcs, txnDate, lctx);
     for (const pc of payCalcs) {
