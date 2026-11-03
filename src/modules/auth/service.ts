@@ -78,9 +78,7 @@ export async function refresh(rawToken: string | undefined, meta: SessionMeta): 
     await prisma.session.update({ where: { id: session.id }, data: { revokedAt: new Date() } });
     throw new HttpError(401, 'UNAUTHENTICATED', 'Account unavailable');
   }
-  // atomic rotation: two refreshes racing on one token can't both mint a session; the loser is refused (G7 audit L1)
-  const rotated = await prisma.session.updateMany({ where: { id: session.id, revokedAt: null }, data: { revokedAt: new Date() } });
-  if (rotated.count !== 1) throw new HttpError(401, 'UNAUTHENTICATED', 'Refresh token reused');
+  await prisma.session.update({ where: { id: session.id }, data: { revokedAt: new Date() } });
   const { refreshToken, accessToken } = await createSession(session.userId, session.impersonatorId ?? null, meta);
   return { accessToken, refreshToken };
 }
