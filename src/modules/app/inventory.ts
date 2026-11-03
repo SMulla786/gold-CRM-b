@@ -428,18 +428,20 @@ async function applyStockEdit(tx: Prisma.TransactionClient, lctx: ledger.LedgerC
 }
 
 /** A sold item can't be edited/deleted — but only while its SELL_BILL row is live. A bill deleted with stock return reverses that row, so the item is AVAILABLE again and must stay editable. */
-async function assertNotSold(ctx: TenantContext, ids: number[]): Promise<void> {
-  const sellRows = await prisma.ledgerEntry.findMany({ where: { businessId: ctx.businessId!, stockItemId: { in: ids }, source: 'SELL_BILL', reversalOfId: null }, select: { id: true, stockItemId: true } });
+// G7 D-f: run inside the tx, after the stock rows are locked — a partial LOOSE sale doesn't change the status, so only this sees a sale that committed meanwhile.
+async function assertNotSold(tx: Prisma.TransactionClient, ctx: TenantContext, ids: number[]): Promise<void> {
+  const sellRows = await tx.ledgerEntry.findMany({ where: { businessId: ctx.businessId!, stockItemId: { in: ids }, source: 'SELL_BILL', reversalOfId: null }, select: { id: true, stockItemId: true } });
   if (sellRows.length === 0) return;
-  const reversed = new Set((await prisma.ledgerEntry.findMany({ where: { businessId: ctx.businessId!, reversalOfId: { in: sellRows.map((r) => r.id) } }, select: { reversalOfId: true } })).map((r) => r.reversalOfId));
+  const reversed = new Set((await tx.ledgerEntry.findMany({ where: { businessId: ctx.businessId!, reversalOfId: { in: sellRows.map((r) => r.id) } }, select: { reversalOfId: true } })).map((r) => r.reversalOfId));
   const live = sellRows.find((r) => !reversed.has(r.id));
   if (live) throw new HttpError(409, 'CONFLICT', `Item #${live.stockItemId} is on a sell bill — correct it from the bill`);
 }
 
 /** Lock the ids inside the tx and confirm all are still AVAILABLE (count must equal n), else 409 — closes the edit-vs-transfer/delete race. */
-async function lockAvailable(tx: Prisma.TransactionClient, ids: number[]): Promise<void> {
+async function lockAvailable(tx: Prisma.TransactionClient, ctx: TenantContext, ids: number[]): Promise<void> {
   const locked = await tx.stockItem.updateMany({ where: { id: { in: ids }, status: 'AVAILABLE' }, data: { status: 'AVAILABLE' } });
   if (locked.count !== ids.length) throw new HttpError(409, 'CONFLICT', 'A stock item is not AVAILABLE or changed concurrently');
+  await assertNotSold(tx, ctx, ids);
 }
 
 async function editStock(ctx: TenantContext, uniq: number[], patch: any): Promise<number> {
@@ -447,11 +449,10 @@ async function editStock(ctx: TenantContext, uniq: number[], patch: any): Promis
   const items = await sdb.stockItem.findMany({ where: { id: { in: uniq } }, include: { itemName: true } });
   if (items.length !== uniq.length) throw new HttpError(404, 'NOT_FOUND', 'One or more stock items not found');
   for (const it of items) if (it.status !== 'AVAILABLE') throw new HttpError(409, 'CONFLICT', `Item #${it.id} is not AVAILABLE`);
-  await assertNotSold(ctx, uniq);
   const touchByCode = await touchMap(sdb);
   const lctx = lctxOf(ctx);
   await prisma.$transaction(async (tx) => {
-    await lockAvailable(tx, uniq);
+    await lockAvailable(tx, ctx, uniq);
     for (const item of items) await applyStockEdit(tx, lctx, item, patch, touchByCode);
     await logActivity(tx, ctx, { module: 'STOCK', action: 'EDITED', entity: 'StockItem', entityId: uniq.join(','), summary: `Edited ${items.length} stock item(s)` });
   });
@@ -462,11 +463,11 @@ async function deleteStockItems(ctx: TenantContext, uniq: number[]): Promise<num
   const sdb = scopedDb(ctx);
   const items = await sdb.stockItem.findMany({ where: { id: { in: uniq } } });
   if (items.length !== uniq.length) throw new HttpError(404, 'NOT_FOUND', 'One or more stock items not found');
-  await assertNotSold(ctx, uniq);
   const lctx = lctxOf(ctx);
   await prisma.$transaction(async (tx) => {
     const locked = await tx.stockItem.updateMany({ where: { id: { in: uniq }, status: 'AVAILABLE' }, data: { status: 'DELETED' } });
     if (locked.count !== uniq.length) throw new HttpError(409, 'CONFLICT', 'A stock item is not AVAILABLE or changed concurrently');
+    await assertNotSold(tx, ctx, uniq);
     for (const id of uniq) await ledger.reverseForItem(tx, lctx, id);
     await logActivity(tx, ctx, { module: 'STOCK', action: 'DELETED', entity: 'StockItem', entityId: uniq.join(','), summary: `Deleted ${uniq.length} stock item(s)` });
   });
@@ -533,7 +534,9 @@ export async function createStockTransfer(ctx: TenantContext, body: { fromBranch
     // Move + race-guard in one write: only still-AVAILABLE items in the source branch move (stays AVAILABLE); count must match.
     const moved = await tx.stockItem.updateMany({ where: { id: { in: uniq }, branchId: body.fromBranchId, status: 'AVAILABLE' }, data: { branchId: body.toBranchId } });
     if (moved.count !== uniq.length) throw new HttpError(409, 'CONFLICT', 'A stock item is no longer AVAILABLE in the source branch');
-    for (const it of items) {
+    // G7 D-f: a partly sold LOOSE lot stays put (a bill delete returns the sold part to it in its own branch); weights as of the lock
+    await assertNotSold(tx, ctx, uniq);
+    for (const it of await tx.stockItem.findMany({ where: { id: { in: uniq } } })) {
       const common = { asset: ledger.assetForStockClass(it.stockClass), karatCode: it.karatCode, pcs: it.pcs, gross: it.gross, net: it.net, fine: it.fine, amount: it.purchaseCost, source: 'STOCK_TRANSFER' as const, sourceId: String(h.id), stockItemId: it.id };
       await ledger.post(tx, lctx, [
         { ...common, branchId: body.fromBranchId, direction: 'OUT', txnDate, narration: `Transfer #${transferNo} out` },
