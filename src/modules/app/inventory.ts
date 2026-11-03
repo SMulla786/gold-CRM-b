@@ -453,7 +453,8 @@ async function editStock(ctx: TenantContext, uniq: number[], patch: any): Promis
   const lctx = lctxOf(ctx);
   await prisma.$transaction(async (tx) => {
     await lockAvailable(tx, ctx, uniq);
-    for (const item of items) await applyStockEdit(tx, lctx, item, patch, touchByCode);
+    // G7 G: edit the rows as they are under the lock — a bill deleted with stock return meanwhile has put grams back on a LOOSE lot
+    for (const item of await tx.stockItem.findMany({ where: { id: { in: uniq } }, include: { itemName: true } })) await applyStockEdit(tx, lctx, item, patch, touchByCode);
     await logActivity(tx, ctx, { module: 'STOCK', action: 'EDITED', entity: 'StockItem', entityId: uniq.join(','), summary: `Edited ${items.length} stock item(s)` });
   });
   return items.length;

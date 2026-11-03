@@ -2,6 +2,7 @@ import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { db, truncateAll } from '../../../test/helpers/db';
 import { createBranch, createBusiness } from '../../../test/helpers/factory';
 import { billBody } from '../../shared';
+import * as ledger from '../../lib/ledger';
 import { businessDate } from '../../lib/ledger';
 import * as inv from './inventory';
 import * as billing from './billing/service';
@@ -88,5 +89,27 @@ describe('a partly sold LOOSE lot', () => {
     const s = await setup();
     expect(await duringSale(s, () => inv.updateStock(s.ctx, s.lot, { gross: 18 }))).toMatchObject({ status: 409 });
     expect(Number((await lotRow(s)).gross)).toBe(15);
+  });
+
+  it('race (G7 G): an edit that read the lot while it was sold, and waits while the bill is deleted with its stock, keeps the returned grams', async () => {
+    const s = await setup();
+    const bill = await billing.createBill(s.ctx, billBody.parse({ kind: 'SELL', billType: 'ROUGH', partyId: s.party.id, items: [{ stockItemId: s.lot, gross: 5, pcs: 1, rate: 60000 }] }));
+    expect(Number((await lotRow(s)).gross)).toBe(15);
+    let returning!: () => void;
+    const inFlight = new Promise<void>((r) => (returning = r));
+    // the bill deleted with its stock, mid-flight: the 5 g back on the lot and the bill's stock row reversed — committed once the edit waits on the lot
+    const del = db.$transaction(async (t) => {
+      await t.bill.update({ where: { id: bill.id }, data: { status: 'DELETED', deletedAt: new Date(), deletedWithStock: true } });
+      await t.stockItem.update({ where: { id: s.lot }, data: { gross: { increment: 5 }, net: { increment: 5 }, pcs: { increment: 1 } } });
+      await ledger.reverse(t, { businessId: s.business.id, branchIds: [s.root.id], userId: 1 }, { source: 'SELL_BILL', sourceId: String(bill.id) });
+      returning();
+      await lockWaiter();
+    });
+    await inFlight;
+    const edit = inv.updateStock(s.ctx, s.lot, { remarks: 'checked' });
+    await del;
+    await edit;
+    const after = await lotRow(s);
+    expect([Number(after.gross), after.remarks]).toEqual([20, 'checked']);
   });
 });
