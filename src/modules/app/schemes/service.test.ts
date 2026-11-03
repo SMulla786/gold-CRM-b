@@ -290,6 +290,9 @@ describe('schemes', () => {
     const bParty = await db.party.create({ data: { businessId: other.business.id, type: 'CUSTOMER', name: 'B', mobile: '9111111111', countryCode: '+91' } });
     await expect(schemes.enroll(s.ctx, { schemeId: scheme.id, partyId: bParty.id, assignId: 'X', displayName: 'C', tokenAmount: 0 } as any)).rejects.toMatchObject({ status: 404 });
     await expect(schemes.getScheme(ctxFor(other.business.id, other.root.id), scheme.id)).rejects.toMatchObject({ status: 404 });
+    await schemes.createGroup(s.ctx, { schemeId: scheme.id, name: 'G1' });
+    expect(await schemes.listGroups(ctxFor(other.business.id, other.root.id), { schemeId: scheme.id })).toEqual([]); // G7 audit M1
+    expect((await schemes.listGroups(s.ctx, { schemeId: scheme.id })).map((g) => g.name)).toEqual(['G1']);
   });
 });
 

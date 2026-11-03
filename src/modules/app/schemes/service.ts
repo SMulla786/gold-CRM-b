@@ -127,7 +127,8 @@ export async function createGroup(ctx: TenantContext, body: any): Promise<Scheme
 
 export async function listGroups(ctx: TenantContext, q: any): Promise<SchemeGroupDto[]> {
   const sdb = scopedDb(ctx);
-  const schemeIds = q.schemeId ? [q.schemeId] : (await sdb.scheme.findMany({ select: { id: true } })).map((s) => s.id);
+  // a requested schemeId is resolved through scopedDb too, so another business's groups are never listed (G7 audit M1)
+  const schemeIds = (await sdb.scheme.findMany({ where: q.schemeId ? { id: q.schemeId } : {}, select: { id: true } })).map((s) => s.id);
   if (schemeIds.length === 0) return [];
   const groups = await prisma.schemeGroup.findMany({ where: { schemeId: { in: schemeIds } }, orderBy: { id: 'asc' } });
   const counts = await prisma.schemeEnrollment.groupBy({ by: ['groupId'], where: { groupId: { in: groups.map((g) => g.id) } }, _count: { _all: true } });
