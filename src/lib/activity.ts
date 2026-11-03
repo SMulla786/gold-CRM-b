@@ -17,6 +17,8 @@ export interface ActivityInput {
 }
 
 export async function logActivity(tx: Prisma.TransactionClient, ctx: TenantContext, a: ActivityInput): Promise<void> {
+  // G7 audit M5: a Super Admin acting while impersonating is named in the row, not passed off as the owner's own work
+  const meta = ctx.impersonatorId ? { ...((a.meta ?? {}) as Prisma.InputJsonObject), impersonatorId: ctx.impersonatorId } : a.meta;
   await tx.activityLog.create({
     data: {
       businessId: ctx.businessId,
@@ -28,7 +30,7 @@ export async function logActivity(tx: Prisma.TransactionClient, ctx: TenantConte
       entityId: a.entityId,
       summary: a.summary,
       partyName: a.partyName ?? null,
-      ...(a.meta !== undefined ? { meta: a.meta } : {}),
+      ...(meta !== undefined ? { meta } : {}),
     },
   });
 }
