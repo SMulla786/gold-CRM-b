@@ -6,7 +6,7 @@ import * as udhar from '../../../lib/udhar';
 import { logActivity } from '../../../lib/activity';
 import { HttpError } from '../../../middleware/error';
 import type { TenantContext } from '../../../middleware/context';
-import { moneyToMetal, schemeMaturity, SCHEME_BANK_MEDIUMS } from '../../../shared';
+import { moneyToMetal, RATE_UNIT_GRAMS, schemeMaturity, SCHEME_BANK_MEDIUMS } from '../../../shared';
 import type { SchemeDto, SchemeGroupDto, EnrollmentDto, EnrollmentDetailDto, SchemePaymentDto, SchemeDueRowDto, SchemeDueMonthRowDto, SchemeTxnRowDto, SchemeDayBookDto, SchemeDayBookDayDto } from '../../../shared';
 import { currentRates } from '../service';
 
@@ -15,7 +15,7 @@ import { currentRates } from '../service';
 const D = (v: unknown) => new Prisma.Decimal((v as Prisma.Decimal.Value) ?? 0);
 const money = (v: unknown) => D(v).toFixed(2);
 const wt = (v: unknown) => D(v).toFixed(3);
-const GOLD_UNIT = 10; // gold scheme rates are per 10 g
+const GOLD_UNIT = 10; // gold scheme rates are per 10 g (the UI labels them /10g); today's rate is converted from the shop's rate unit
 const lctxOf = (ctx: TenantContext) => ({ businessId: ctx.businessId!, branchIds: ctx.branchIds, userId: ctx.userId });
 
 function activeBranch(ctx: TenantContext): number {
@@ -59,7 +59,13 @@ const istDayRange = (from?: Date, to?: Date) => ({
 });
 /** Inclusive range on a @db.Date column. */
 const dateColRange = (from?: Date, to?: Date) => ({ ...(from ? { gte: dateOnly(from) } : {}), ...(to ? { lte: dateOnly(to) } : {}) });
-const todayGoldRate = async (ctx: TenantContext) => Number((await currentRates(ctx)).gold.rows[0]?.sellRate ?? 0);
+/** Today's GOLD scheme rate per 10 g (0 = none set). G7 D-h rule: the highest-touch karat's sell rate — the purest rated karat, matching the payments' `fine`. */
+const todayGoldRate = async (ctx: TenantContext) => {
+  const g = (await currentRates(ctx)).gold;
+  const top = [...g.rows].sort((a, b) => Number(b.touch) - Number(a.touch))[0];
+  return top ? (Number(top.sellRate) * GOLD_UNIT) / RATE_UNIT_GRAMS[g.rateUnit] : 0;
+};
+const NO_GOLD_RATE = "Set today's gold rate first";
 const isP2002 = (e: unknown) => e instanceof Prisma.PrismaClientKnownRequestError && e.code === 'P2002';
 
 /** Row-lock the enrollment inside a tx (serializes a concurrent payment against a redeem — BUG-13) and return its live status. */
@@ -207,6 +213,7 @@ async function postPayment(tx: Prisma.TransactionClient, ctx: TenantContext, enr
   const txnDate = input.txnDate ? dateOnly(input.txnDate) : ledger.businessDate();
   const gold = scheme.type === 'GOLD';
   const rate = gold ? (input.rate != null ? Number(input.rate) : goldRate) : null;
+  if (gold && !(rate! > 0)) throw new HttpError(409, 'CONFLICT', NO_GOLD_RATE); // G7 D-h: never credit 0 g for real money
   const fine = gold ? moneyToMetal(input.amount, rate ?? 0, GOLD_UNIT) : null;
   if (SCHEME_BANK_MEDIUMS.includes(medium) && input.bankAccountId != null && !(await scopedDb(ctx).bankAccount.findUnique({ where: { id: input.bankAccountId } }))) throw new HttpError(404, 'NOT_FOUND', 'Bank account not found');
 
@@ -293,6 +300,7 @@ export const redeemRateFor = async (ctx: TenantContext, scheme: { type: string }
 export async function redeemInTx(tx: Prisma.TransactionClient, ctx: TenantContext, e: any, scheme: any, opts: { early: boolean | 'auto'; redeemRate: number; billId?: number; justBillId?: number }): Promise<Prisma.Decimal> {
   const id = e.id;
   const gold = scheme.type === 'GOLD';
+  if (gold && !(opts.redeemRate > 0)) throw new HttpError(409, 'CONFLICT', `${NO_GOLD_RATE}, then redeem`); // G7 D-h: not closed at ₹0
   // lock the row BEFORE reading payments, so a concurrent addPayment is either included here or blocked out (BUG-13)
   const status = await lockEnrollment(tx, id);
   if (status !== 'ACTIVE' && status !== 'WON') throw new HttpError(409, 'CONFLICT', 'Enrollment was just closed');
