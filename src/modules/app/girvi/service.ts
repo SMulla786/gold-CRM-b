@@ -41,7 +41,14 @@ const dueParts = (b: any, to: Date) => {
   });
   return { ...parts, effectiveRate: girviEffectiveRate(b.ratePercent, items) };
 };
-const dueOf = (b: any, to: Date): string => dueParts(b, to).interest;
+/** Interest + discount already received toward the current period: INTEREST txns dated after interestFrom, up to `to` (needs `b.txns`).
+ *  The due on interestFrom itself is always 0, so a payment dated that day belongs to the period it settled. */
+const paidToward = (b: any, to: Date) =>
+  (b.txns ?? [])
+    .filter((t: any) => t.type === 'INTEREST' && !t.isReversed && t.txnDate.getTime() > b.interestFrom.getTime() && t.txnDate.getTime() <= to.getTime())
+    .reduce((a: Prisma.Decimal, t: any) => a.plus(D(t.interest)).plus(D(t.discount)), new Prisma.Decimal(0));
+/** Interest still due: accrued since interestFrom minus partial payments since (G7 D-b). */
+const dueOf = (b: any, to: Date): string => Prisma.Decimal.max(D(dueParts(b, to).interest).minus(paidToward(b, to)), 0).toFixed(2);
 
 /** MONEY ledger rows for a girvi cash/online movement (OUT = paid to customer, IN = received). source GIRVI, sourceId = batch id. */
 function girviMoneyRows(branchId: number, txnDate: Date, direction: 'IN' | 'OUT', cash: number, online: number, bankAccountId: number | null, batchId: number, narration: string): ledger.LedgerEntryInput[] {
@@ -106,7 +113,8 @@ export async function payInterest(ctx: TenantContext, id: number, body: { txnDat
   const lctx = lctxOf(ctx);
 
   await prisma.$transaction(async (tx) => {
-    const fresh = await tx.girviBatch.findUniqueOrThrow({ where: { id }, include: { items: true } });
+    await tx.$queryRaw`SELECT id FROM "GirviBatch" WHERE id = ${id} FOR NO KEY UPDATE`; // one interest / top-up / release at a time per loan
+    const fresh = await tx.girviBatch.findUniqueOrThrow({ where: { id }, include: { items: true, txns: true } });
     if (fresh.status !== 'ACTIVE') throw new HttpError(409, 'CONFLICT', 'Girvi is not active');
     const due = dueOf(fresh, txnDate);
     if (D(body.interest).plus(body.discount).gt(due)) throw new HttpError(400, 'VALIDATION', 'Interest paid exceeds the due', { due });
@@ -129,7 +137,8 @@ export async function topupGirvi(ctx: TenantContext, id: number, body: { txnDate
   const lctx = lctxOf(ctx);
 
   await prisma.$transaction(async (tx) => {
-    const fresh = await tx.girviBatch.findUniqueOrThrow({ where: { id }, include: { items: true } });
+    await tx.$queryRaw`SELECT id FROM "GirviBatch" WHERE id = ${id} FOR NO KEY UPDATE`; // one interest / top-up / release at a time per loan
+    const fresh = await tx.girviBatch.findUniqueOrThrow({ where: { id }, include: { items: true, txns: true } });
     if (fresh.status !== 'ACTIVE') throw new HttpError(409, 'CONFLICT', 'Girvi is not active');
     if (D(dueOf(fresh, txnDate)).gt(0)) throw new HttpError(409, 'CONFLICT', 'Pay interest up to date before a top-up');
     await tx.girviTxn.create({ data: { batchId: id, type: 'TOPUP', txnDate, principal: body.principal, cash: body.cash, online: body.online, bankAccountId: body.online > 0 ? body.bankAccountId! : null, createdById: ctx.userId } });
@@ -151,7 +160,8 @@ export async function releaseGirvi(ctx: TenantContext, id: number, body: GirviRe
   const lctx = lctxOf(ctx);
 
   await prisma.$transaction(async (tx) => {
-    const fresh = await tx.girviBatch.findUniqueOrThrow({ where: { id }, include: { items: true } });
+    await tx.$queryRaw`SELECT id FROM "GirviBatch" WHERE id = ${id} FOR NO KEY UPDATE`; // one interest / top-up / release at a time per loan
+    const fresh = await tx.girviBatch.findUniqueOrThrow({ where: { id }, include: { items: true, txns: true } });
     if (fresh.status !== 'ACTIVE') throw new HttpError(409, 'CONFLICT', 'Girvi is not active');
     const due = dueOf(fresh, txnDate);
     if (!D(body.interestPaid).plus(body.discount).equals(due)) throw new HttpError(400, 'VALIDATION', 'Settle the exact interest due to release', { due });
@@ -248,7 +258,7 @@ export async function getGirvi(ctx: TenantContext, id: number, asOf: Date): Prom
   const uMap = await userNames(ctx, b.txns.map((t) => t.createdById));
   const onDate = ledger.businessDate(asOf);
   const parts = dueParts(b, onDate);
-  const interestDue = parts.interest;
+  const interestDue = dueOf(b, onDate);
   return {
     id: b.id, girviNo: b.girviNo, party: partyRef(party), branch: { id: b.branchId, name: branch?.name ?? '' },
     issueDate: dateOnly(b.issueDate), returnDate: dateOnly(b.returnDate), tenureMonths: b.tenureMonths, ratePercent: String(b.ratePercent), ratePeriod: b.ratePeriod,
@@ -281,7 +291,7 @@ export async function listGirvi(ctx: TenantContext, query: any): Promise<Paged<G
     where.AND = [query.q && Number.isInteger(asNo) && asNo > 0 && asNo <= 2_147_483_647 && !query.partyType ? { OR: [{ girviNo: asNo }, ids] } : ids];
   }
   const [rows, total] = await Promise.all([
-    sdb.girviBatch.findMany({ where, include: { items: { select: { name: true, status: true, valuation: true, ratePercent: true } }, _count: { select: { txns: true } } }, orderBy: { id: 'desc' }, skip: (query.page - 1) * query.pageSize, take: query.pageSize }),
+    sdb.girviBatch.findMany({ where, include: { items: { select: { name: true, status: true, valuation: true, ratePercent: true } }, txns: { where: { type: 'INTEREST' }, select: { type: true, isReversed: true, txnDate: true, interest: true, discount: true } }, _count: { select: { txns: true } } }, orderBy: { id: 'desc' }, skip: (query.page - 1) * query.pageSize, take: query.pageSize }),
     sdb.girviBatch.count({ where }),
   ]);
   const parties = new Map((await sdb.party.findMany({ where: { id: { in: [...new Set(rows.map((b) => b.partyId))] } } })).map((p) => [p.id, p]));
