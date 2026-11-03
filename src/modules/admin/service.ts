@@ -395,7 +395,7 @@ export async function putUserPermissions(ctx: TenantContext, userId: number, gra
 export async function listRoles(ctx: TenantContext): Promise<RoleDto[]> {
   const roles = await prisma.role.findMany({
     where: { OR: [{ businessId: null }, { businessId: ctx.businessId! }] },
-    include: { permissions: { include: { permission: true } }, _count: { select: { users: true } } },
+    include: { permissions: { include: { permission: true } }, _count: { select: { users: { where: { businessId: ctx.businessId! } } } } }, // system roles are shared: count this business's users only (G7 audit L8)
     orderBy: [{ isSystem: 'desc' }, { name: 'asc' }],
   });
   return roles.map((r) => ({
