@@ -421,6 +421,10 @@ const gstMeta = (b: BillBody) => ({
 const withStoneCharges = (body: BillBody): BillBody =>
   body.kind !== 'PURCHASE' ? body : { ...body, items: body.items.map((l) => (l.stones?.length ? { ...l, stoneCharge: Number(stoneTotal(l.stones.map((st) => st.amount))) } : l)) };
 
+/** G7 D-d: an order is billed whole — every finished piece of it is a line on the bill (a left-out piece would stay RESERVED for good). */
+const billsWholeOrder = (order: { items: { stockItemId: number | null }[] }, body: BillBody) =>
+  order.items.every((i) => i.stockItemId == null || body.items.some((l) => l.stockItemId === i.stockItemId));
+
 export async function createBill(ctx: TenantContext, body: BillBody): Promise<BillDto> {
   body = withStoneCharges(body);
   const branchId = activeBranch(ctx);
@@ -434,6 +438,7 @@ export async function createBill(ctx: TenantContext, body: BillBody): Promise<Bi
     if (body.kind !== 'SELL') throw new HttpError(400, 'VALIDATION', 'An order can only be billed as a sell bill');
     const order = await scopedDb(ctx).order.findFirst({ where: { id: body.orderId }, include: { items: { select: { stockItemId: true } } } });
     if (!order || order.partyId !== body.partyId || order.status !== 'READY') throw new HttpError(409, 'CONFLICT', 'Order is not READY for this party');
+    if (!billsWholeOrder(order, body)) throw new HttpError(409, 'CONFLICT', 'Bill every finished piece of the order');
     reservedIds = new Set(order.items.map((i) => i.stockItemId).filter((x): x is number => x != null));
   }
   const prep = await prepareBill(ctx, body, branchId, s, reservedIds);
@@ -492,6 +497,9 @@ export async function editBill(ctx: TenantContext, id: number, body: BillBody): 
   if (bill.status !== 'ACTIVE') throw new HttpError(409, 'CONFLICT', 'Bill is not active');
   if (bill.kind !== body.kind || bill.billType !== body.billType) throw new HttpError(400, 'VALIDATION', 'Cannot change a bill’s kind or type on edit');
   if (bill.billDate.getTime() !== ledger.businessDate().getTime()) throw new HttpError(400, 'VALIDATION', "Only today's bill can be edited — delete and re-create for a past day");
+  // G7 D-d: an order's bill stays with the order — its party and every finished piece (the order stays DELIVERED on this bill)
+  const order = await sdb.order.findFirst({ where: { billId: id }, include: { items: { select: { stockItemId: true } } } });
+  if (order && (order.partyId !== body.partyId || !billsWholeOrder(order, body))) throw new HttpError(409, 'CONFLICT', "An order's bill must keep the order's party and every finished piece");
   const s = await getSettings(ctx);
   // This bill's own stock items are still SOLD/reduced until the in-tx undo; allow them when re-resolving the new lines.
   const ownStockIds = new Set(bill.items.map((i) => i.stockItemId).filter((x): x is number => x != null));
@@ -580,12 +588,20 @@ export async function deleteBill(ctx: TenantContext, id: number, returnStock: bo
   const bill = await sdb.bill.findFirst({ where: { id }, include: { items: true, payments: true } });
   if (!bill) throw new HttpError(404, 'NOT_FOUND', 'Bill not found');
   if (bill.status !== 'ACTIVE') throw new HttpError(409, 'CONFLICT', 'Bill is not active');
+  // G7 D-d: deleting an order's bill re-opens the order (READY, pieces back to RESERVED) so it can be billed again — only with its stock back
+  const order = await sdb.order.findFirst({ where: { billId: id }, include: { items: { select: { stockItemId: true } } } });
+  if (order && !returnStock) throw new HttpError(409, 'CONFLICT', "Return the stock to delete an order's bill — the order is then ready to bill again");
+  const orderPieces = new Set(order?.items.map((i) => i.stockItemId));
   const lctx = lctxOf(ctx);
 
   await prisma.$transaction(async (tx) => {
     // Flip ACTIVE→DELETED atomically FIRST — two concurrent deletes can't both run the return (double stock).
     const flipped = await tx.bill.updateMany({ where: { id, status: 'ACTIVE' }, data: { status: 'DELETED', deletedAt: new Date(), deletedWithStock: returnStock } });
     if (flipped.count !== 1) throw new HttpError(409, 'CONFLICT', 'Bill is not active');
+    if (order) {
+      await tx.order.update({ where: { id: order.id }, data: { status: 'READY', billId: null } });
+      await tx.orderItem.updateMany({ where: { orderId: order.id }, data: { status: 'RECEIVED' } });
+    }
     // ACC-05: checked on the projected post-reversal balance, before the purchase early return below
     const kacha = await billPools(tx, bill.branchId, [bill.payments], { kind: bill.kind, billId: id });
     await reopenSchemes(tx, ctx, bill);
@@ -617,7 +633,7 @@ export async function deleteBill(ctx: TenantContext, id: number, returnStock: bo
           const net = Prisma.Decimal.max(g.minus(l), 0);
           const fine = net.times(D(stock.tunch)).div(100).times(D(stock.wastage).div(100).plus(1));
           await tx.stockItem.update({ where: { id: stock.id }, data: { gross: g, less: l, pcs: stock.pcs + it.pcs, net, fine, status: 'AVAILABLE' } });
-        } else await tx.stockItem.update({ where: { id: stock.id }, data: { status: 'AVAILABLE' } });
+        } else await tx.stockItem.update({ where: { id: stock.id }, data: { status: orderPieces.has(stock.id) ? 'RESERVED' : 'AVAILABLE' } });
       }
     }
     await logActivity(tx, ctx, { module: bill.kind, action: 'DELETED', entity: 'BILL', entityId: String(id), summary: `Deleted ${bill.kind === 'SELL' ? 'sell' : 'purchase'} bill ${bill.billNo}` });
