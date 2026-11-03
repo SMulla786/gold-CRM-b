@@ -3,6 +3,7 @@ import { prisma } from '../../../lib/prisma';
 import { scopedDb } from '../../../lib/db';
 import * as ledger from '../../../lib/ledger';
 import * as udhar from '../../../lib/udhar';
+import { poolGuard, poolsOf } from '../../../lib/kacha';
 import { logActivity } from '../../../lib/activity';
 import { HttpError } from '../../../middleware/error';
 import { computeBill, computeJustLine } from '../../../shared';
@@ -172,12 +173,15 @@ export async function deleteJustBill(ctx: TenantContext, id: number): Promise<vo
   await prisma.$transaction(async (tx) => {
     const flipped = await tx.justBill.updateMany({ where: { id, status: 'ACTIVE' }, data: { status: 'DELETED', deletedAt: new Date() } });
     if (flipped.count !== 1) throw new HttpError(409, 'CONFLICT', 'Just bill is not active');
+    // G7 D-g: taking its kacha / bullion back out may not leave the pool short (ACC-05 pool guard, as a bill delete)
+    const kacha = await poolGuard(tx, jb.branchId, poolsOf(jb.payments));
     // reopen every enrollment this just bill's active SCHEME payments redeemed (mirrors billing reopenSchemes)
     for (const p of jb.payments) if (p.mode === 'SCHEME' && p.isActive && p.schemeEnrollmentId != null) await reopenForJustBill(tx, ctx, p.schemeEnrollmentId, id);
     await tx.justBillPayment.updateMany({ where: { justBillId: id }, data: { isActive: false } });
     for (const p of jb.payments) await ledger.reverse(tx, lctx, { source: 'JUST_BILL', sourceId: `${id}-P${p.id}` });
     await udhar.reverse(tx, lctx, { source: 'JUST_BILL', sourceId: String(id) });
     await udhar.reverse(tx, lctx, { source: 'JUST_BILL', sourceId: `${id}-A` }); // TASK-98 udhar advance / scheme uses
+    await kacha();
     await logActivity(tx, ctx, { module: 'JUST_BILL', action: 'DELETED', entity: 'JUST_BILL', entityId: String(id), summary: `Deleted just bill ${jb.billNo}` });
   });
 }
