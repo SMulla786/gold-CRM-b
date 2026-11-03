@@ -306,7 +306,10 @@ export async function updateUdharTxn(ctx: TenantContext, id: number, body: Udhar
   const bhavWeight = body.bhav ? moneyToMetal(body.bhav.amount, body.bhav.rate, body.bhav.unitGrams) : null;
 
   await prisma.$transaction(async (tx) => {
-    await unpostTxn(tx, ctx, t);
+    // G7 audit M2: lock the row (still not deleted) before reversing anything, then undo what is posted now — a racing edit / delete has committed by then
+    const locked = await tx.udharTxn.updateMany({ where: { id, isDeleted: false }, data: { isDeleted: false } });
+    if (locked.count !== 1) throw new HttpError(404, 'NOT_FOUND', 'Udhar transaction not found');
+    await unpostTxn(tx, ctx, await tx.udharTxn.findUniqueOrThrow({ where: { id } }));
     const h = await tx.udharTxn.update({ where: { id }, data: txnFields(body, txnDate, bhavWeight) });
     await postTxn(tx, ctx, h, body, bhavWeight);
     await logActivity(tx, ctx, { module: 'UDHAR', action: 'EDITED', entity: 'UdharTxn', entityId: String(id), summary: `Edited udhar #${t.txnNo}`, partyName: party.name });
