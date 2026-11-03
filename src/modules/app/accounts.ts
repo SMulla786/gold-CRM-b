@@ -220,7 +220,9 @@ export async function updateIncomeExpense(ctx: TenantContext, id: number, body: 
   const lctx = { businessId: ctx.businessId!, branchIds: ctx.branchIds, userId: ctx.userId };
 
   await prisma.$transaction(async (tx) => {
-    await tx.incomeExpense.update({ where: { id }, data: { type: body.type, reason: body.reason, cash: body.cash, online: body.online, bankAccountId: body.online > 0 ? body.bankAccountId! : null, gold: body.gold, silver: body.silver, remark: body.remark ?? null } });
+    // G7 audit L4: the first write (the row lock) only takes a row that is still not deleted — a delete committed meanwhile makes this a 404
+    const edited = await tx.incomeExpense.updateMany({ where: { id, isDeleted: false }, data: { type: body.type, reason: body.reason, cash: body.cash, online: body.online, bankAccountId: body.online > 0 ? body.bankAccountId! : null, gold: body.gold, silver: body.silver, remark: body.remark ?? null } });
+    if (edited.count !== 1) throw new HttpError(404, 'NOT_FOUND', 'Entry not found');
     await ledger.reverse(tx, lctx, { source: 'INCOME_EXPENSE', sourceId: String(id) });
     await ledger.post(tx, lctx, ieLedgerRows(h.branchId, txnDate, body, String(id)));
     await logActivity(tx, ctx, { module: 'INCOME_EXPENSE', action: 'EDITED', entity: 'IncomeExpense', entityId: String(id), summary: `${body.type}: ${body.reason}` });
