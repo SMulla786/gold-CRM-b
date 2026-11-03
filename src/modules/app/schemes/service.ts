@@ -59,10 +59,10 @@ const istDayRange = (from?: Date, to?: Date) => ({
 });
 /** Inclusive range on a @db.Date column. */
 const dateColRange = (from?: Date, to?: Date) => ({ ...(from ? { gte: dateOnly(from) } : {}), ...(to ? { lte: dateOnly(to) } : {}) });
-/** Today's GOLD scheme rate per 10 g (0 = none set). G7 D-h rule: the highest-touch karat's sell rate — the purest rated karat, matching the payments' `fine`. */
+/** Today's GOLD scheme rate per 10 g (0 = none set). G7 D-h rule: the highest-touch karat with a rate > 0 — the purest rated karat, matching the payments' `fine` (a karat saved at 0, e.g. one the shop doesn't deal in, is skipped). */
 const todayGoldRate = async (ctx: TenantContext) => {
   const g = (await currentRates(ctx)).gold;
-  const top = [...g.rows].sort((a, b) => Number(b.touch) - Number(a.touch))[0];
+  const top = g.rows.filter((r) => Number(r.sellRate) > 0).sort((a, b) => Number(b.touch) - Number(a.touch) || Number(b.sellRate) - Number(a.sellRate))[0];
   return top ? (Number(top.sellRate) * GOLD_UNIT) / RATE_UNIT_GRAMS[g.rateUnit] : 0;
 };
 const NO_GOLD_RATE = "Set today's gold rate first";

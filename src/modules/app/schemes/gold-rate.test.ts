@@ -46,6 +46,12 @@ describe('GOLD scheme rate', () => {
     expect(fineOf(await s.pay((await s.enroll()).id))).toBeCloseTo(1, 3); // 6000 / (60000 / 10 g)
   });
 
+  it('karat: a karat saved at rate 0 (not dealt in) is skipped, not taken as "no rate"', async () => {
+    const s = await setup();
+    await s.rates('GRAM_10', [['22K', 60000], ['24K', 0]]);
+    expect(fineOf(await s.pay((await s.enroll()).id))).toBeCloseTo(1, 3); // the 22K rate, not a 409
+  });
+
   it('no gold rate set: a payment, a joining token or a first payment → 409 and nothing is written', async () => {
     const s = await setup();
     await expect(s.enroll({ tokenAmount: 500 })).rejects.toMatchObject({ status: 409 });
