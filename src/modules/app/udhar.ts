@@ -380,8 +380,9 @@ export async function deleteUdharTxn(ctx: TenantContext, id: number): Promise<vo
   if (!t || t.isDeleted) throw new HttpError(404, 'NOT_FOUND', 'Udhar transaction not found');
   await assertNotLinked(ctx, id);
   await prisma.$transaction(async (tx) => {
-    await tx.udharTxn.update({ where: { id }, data: { isDeleted: true } });
-    await unpostTxn(tx, ctx, t);
+    await tx.udharTxn.update({ where: { id }, data: { isDeleted: true } }); // also the row lock
+    // G7 H: undo the udhar as it is under the lock — an edit committed meanwhile may have moved its settlement to another bill
+    await unpostTxn(tx, ctx, await tx.udharTxn.findUniqueOrThrow({ where: { id } }));
     await logActivity(tx, ctx, { module: 'UDHAR', action: 'DELETED', entity: 'UdharTxn', entityId: String(id), summary: `Deleted udhar #${t.txnNo}` });
   });
 }
