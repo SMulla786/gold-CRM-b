@@ -70,6 +70,29 @@ describe('change password (ADM-07)', () => {
     expect(await db.session.count({ where: { userId: u.user.id, revokedAt: null } })).toBe(0);
   });
 
+  it('two refreshes racing on one token: exactly one rotates, the other is refused (G7 audit L1)', async () => {
+    const u = await setup();
+    const a = await loginAs(u.username);
+    const s = await db.session.findFirstOrThrow({ where: { userId: u.user.id, revokedAt: null } });
+    const waiters = async (n: number) => {
+      for (let i = 0; i < 300; i++) {
+        const [{ c } = { c: 0 }] = await db.$queryRaw<{ c: number }[]>`SELECT count(*)::int AS c FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock'`;
+        if (c >= n) return;
+        await new Promise((r) => setTimeout(r, 30));
+      }
+      throw new Error('the refreshes never queued on the session row');
+    };
+    let both!: Promise<number[]>;
+    // hold the session row: both refreshes read it as live, then queue on the rotation; release them together
+    await db.$transaction(async (t) => {
+      await t.$queryRaw`SELECT id FROM "Session" WHERE id = ${s.id} FOR UPDATE`;
+      both = Promise.all([refresh(a.cookie), refresh(a.cookie)]).then((rs) => rs.map((r) => r.status).sort());
+      await waiters(2);
+    }, { timeout: 30_000 });
+    expect(await both).toEqual([200, 401]);
+    expect(await db.session.count({ where: { userId: u.user.id, revokedAt: null } })).toBe(1); // only the winner's new session
+  });
+
   it('OTP reset and admin reset end old sessions without the cascade: the login made afterwards survives the old device refreshing', async () => {
     const u = await setup();
     const old = await loginAs(u.username);
