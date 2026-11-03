@@ -235,6 +235,10 @@ export async function deleteGirvi(ctx: TenantContext, id: number): Promise<void>
   if (batch.txns.length !== 1 || batch.txns[0]!.type !== 'GRANT') throw new HttpError(409, 'CONFLICT', 'Only a girvi with just the grant can be deleted');
   const lctx = lctxOf(ctx);
   await prisma.$transaction(async (tx) => {
+    // G7 audit L3: lock the loan, then re-check "grant only" — an interest / top-up / release that committed meanwhile blocks the delete
+    await tx.$queryRaw`SELECT id FROM "GirviBatch" WHERE id = ${id} FOR NO KEY UPDATE`;
+    const txns = await tx.girviTxn.findMany({ where: { batchId: id }, select: { type: true } });
+    if (txns.length !== 1 || txns[0]!.type !== 'GRANT') throw new HttpError(409, 'CONFLICT', 'Only a girvi with just the grant can be deleted');
     await ledger.reverse(tx, lctx, { source: 'GIRVI', sourceId: String(id) });
     await tx.girviBatch.delete({ where: { id } }); // cascades items + txns
     await logActivity(tx, ctx, { module: 'GIRVI', action: 'DELETED', entity: 'GIRVI', entityId: String(id), summary: `Deleted girvi #${batch.girviNo}` });
