@@ -139,6 +139,9 @@ async function postTxn(tx: Prisma.TransactionClient, ctx: TenantContext, h: { id
   // 5. Settle a pending bill: SELL takes the received money, PURCHASE the money paid out, as BillPayment(s).
   // Step 3 already moved the cash and step 4 already moved the party balance — so no extra ledger/udhar rows here.
   if (body.settleBillId != null) {
+    // Lock the bill before the due / cap read, as addBillPayments does — else a payment committing meanwhile lets the supplier be paid twice.
+    // Bill-first holds: this tx has taken no party row or pool lock yet (only the UDHAR sequence row and FK key-share locks).
+    await tx.$queryRaw`SELECT id FROM "Bill" WHERE id = ${body.settleBillId} FOR NO KEY UPDATE`;
     const b = await tx.bill.findUnique({ where: { id: body.settleBillId } }); // re-read inside tx: concurrency-safe checks + atomic paid
     if (!b) throw new HttpError(404, 'NOT_FOUND', 'Bill not found');
     if (b.partyId !== body.partyId || b.status !== 'ACTIVE') throw new HttpError(409, 'CONFLICT', 'Bill is not open for this party');
