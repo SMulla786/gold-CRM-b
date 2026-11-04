@@ -49,6 +49,20 @@ const paidToward = (b: any, to: Date) =>
     .reduce((a: Prisma.Decimal, t: any) => a.plus(D(t.interest)).plus(D(t.discount)), new Prisma.Decimal(0));
 /** Interest still due: accrued since interestFrom minus partial payments since (G7 D-b). */
 const dueOf = (b: any, to: Date): string => Prisma.Decimal.max(D(dueParts(b, to).interest).minus(paidToward(b, to)), 0).toFixed(2);
+/** G7 owner rule: a payment's audit meta = how it was split (principal / interest / discount), the principal before → after, and the
+ *  interest working it settled (accrued on which principal, from → to, at what rate, less what was paid before) — checkable by hand. */
+const allocationMeta = (b: any, txnDate: Date, a: { principal?: unknown; interest?: unknown; discount?: unknown }, principalAfter: unknown) => {
+  const parts = dueParts(b, txnDate);
+  return {
+    allocation: { principal: money(a.principal), interest: money(a.interest), discount: money(a.discount) },
+    principalBefore: money(b.principal),
+    principalAfter: money(principalAfter),
+    interest: {
+      from: dateOnly(b.interestFrom), to: dateOnly(txnDate), principal: money(b.principal), rate: parts.effectiveRate, ratePeriod: b.ratePeriod, type: b.interestType, ciPeriod: b.ciPeriod ?? null, method: b.method,
+      accrued: parts.interest, paidBefore: money(paidToward(b, txnDate)), due: dueOf(b, txnDate),
+    },
+  };
+};
 /** G7 D-b2: nothing dated before the loan's settled point (interestFrom, or its latest interest payment if later; needs `b.txns`). An earlier
  *  date's due ignores the later payments, so they'd be collected twice; a top-up / release there would move interestFrom back and charge those days again. */
 const assertNotBackdated = (b: any, txnDate: Date) => {
@@ -129,7 +143,12 @@ export async function payInterest(ctx: TenantContext, id: number, body: { txnDat
     const rows = girviMoneyRows(fresh.branchId, txnDate, 'IN', body.cash, body.online, body.bankAccountId ?? null, id, `Girvi #${fresh.girviNo} interest`);
     if (rows.length) await ledger.post(tx, lctx, rows);
     if (D(body.interest).plus(body.discount).equals(due)) await tx.girviBatch.update({ where: { id }, data: { interestFrom: txnDate } }); // settled to date — accrue from here
-    await logActivity(tx, ctx, { module: 'GIRVI', action: 'EDITED', entity: 'GIRVI', entityId: String(id), summary: `Girvi #${fresh.girviNo} interest ₹${body.interest}` });
+    // interest only: the principal (and so what interest compounds on) is untouched
+    const discount = D(body.discount).gt(0) ? ` + discount ₹${money(body.discount)}` : '';
+    await logActivity(tx, ctx, {
+      module: 'GIRVI', action: 'EDITED', entity: 'GIRVI', entityId: String(id), summary: `Girvi #${fresh.girviNo} interest ₹${money(body.interest)}${discount} of ₹${due} due — principal stays ₹${money(fresh.principal)}`,
+      meta: allocationMeta(fresh, txnDate, { interest: body.interest, discount: body.discount }, fresh.principal),
+    });
   });
   return getGirvi(ctx, id, new Date());
 }
@@ -152,7 +171,11 @@ export async function topupGirvi(ctx: TenantContext, id: number, body: { txnDate
     await tx.girviTxn.create({ data: { batchId: id, type: 'TOPUP', txnDate, principal: body.principal, cash: body.cash, online: body.online, bankAccountId: body.online > 0 ? body.bankAccountId! : null, createdById: ctx.userId } });
     await ledger.post(tx, lctx, girviMoneyRows(fresh.branchId, txnDate, 'OUT', body.cash, body.online, body.bankAccountId ?? null, id, `Girvi #${fresh.girviNo} top-up`));
     await tx.girviBatch.update({ where: { id }, data: { principal: { increment: body.principal }, interestFrom: txnDate } });
-    await logActivity(tx, ctx, { module: 'GIRVI', action: 'EDITED', entity: 'GIRVI', entityId: String(id), summary: `Girvi #${fresh.girviNo} top-up ₹${body.principal}` });
+    const after = D(fresh.principal).plus(body.principal);
+    await logActivity(tx, ctx, {
+      module: 'GIRVI', action: 'EDITED', entity: 'GIRVI', entityId: String(id), summary: `Girvi #${fresh.girviNo} top-up ₹${money(body.principal)} — principal ₹${money(fresh.principal)} → ₹${money(after)}`,
+      meta: allocationMeta(fresh, txnDate, { principal: body.principal }, after),
+    });
   });
   return getGirvi(ctx, id, new Date());
 }
@@ -191,7 +214,13 @@ export async function releaseGirvi(ctx: TenantContext, id: number, body: GirviRe
     const rows = girviMoneyRows(fresh.branchId, txnDate, 'IN', body.cash, body.online, body.bankAccountId ?? null, id, `Girvi #${fresh.girviNo} release`);
     if (rows.length) await ledger.post(tx, lctx, rows);
     await tx.girviBatch.update({ where: { id }, data: { principal: { decrement: body.principalPaid }, interestFrom: txnDate, ...(isLast ? { status: 'CLOSED', closedAt: new Date() } : {}) } });
-    await logActivity(tx, ctx, { module: 'GIRVI', action: isLast ? 'DELETED' : 'EDITED', entity: 'GIRVI', entityId: String(id), summary: `Girvi #${fresh.girviNo} release` });
+    const after = D(fresh.principal).minus(body.principalPaid);
+    const discount = D(body.discount).gt(0) ? ` + discount ₹${money(body.discount)}` : '';
+    await logActivity(tx, ctx, {
+      module: 'GIRVI', action: isLast ? 'DELETED' : 'EDITED', entity: 'GIRVI', entityId: String(id),
+      summary: `Girvi #${fresh.girviNo} release: principal ₹${money(body.principalPaid)} + interest ₹${money(body.interestPaid)}${discount} — principal ₹${money(fresh.principal)} → ₹${money(after)}`,
+      meta: { ...allocationMeta(fresh, txnDate, { principal: body.principalPaid, interest: body.interestPaid, discount: body.discount }, after), itemIds },
+    });
   });
   return getGirvi(ctx, id, new Date());
 }
