@@ -76,7 +76,8 @@ describe('impersonation restrictions (direct API)', () => {
     const s = await setup();
     const staff = await api.post('/api/admin/users').set('Authorization', s.as).send({ name: 'New Staff', username: 'new.staff', password: TEST_PASSWORD, level: 'BRANCH_USER', branchId: s.root.id });
     expect(staff.status).toBe(201);
-    expect((await api.patch('/api/admin/business').set('Authorization', s.as).send({ address: 'Shop 4, Main Road' })).status).toBe(200);
+    // the profile form re-sends the unchanged mobile with the edit: that is not a contact change
+    expect((await api.patch('/api/admin/business').set('Authorization', s.as).send({ address: 'Shop 4, Main Road', mobile: s.business.mobile })).status).toBe(200);
     const refused = await api.patch(`/api/admin/users/${s.owner.user.id}`).set('Authorization', s.as).send({ email: 'x@example.com' });
     expect(blocked(refused)).toBe(true);
 

@@ -476,8 +476,10 @@ export async function getBusiness(ctx: TenantContext): Promise<BusinessProfileDt
 }
 
 export async function updateBusiness(ctx: TenantContext, body: Record<string, unknown> & { stateId?: number | null; districtId?: number | null }): Promise<BusinessProfileDto> {
-  if (body.email !== undefined || body.mobile !== undefined || body.alternateMobile !== undefined) assertNotImpersonating(ctx, "the owner's email or mobile");
-  const current = await prisma.business.findUniqueOrThrow({ where: { id: ctx.businessId! }, select: { stateId: true, districtId: true } });
+  const current = await prisma.business.findUniqueOrThrow({ where: { id: ctx.businessId! }, select: { stateId: true, districtId: true, email: true, mobile: true, alternateMobile: true } });
+  // the profile form re-sends unchanged contacts; only an actual change is the owner's to make
+  const contactChanged = (['email', 'mobile', 'alternateMobile'] as const).some((k) => body[k] !== undefined && (body[k] ?? null) !== current[k]);
+  if (contactChanged) assertNotImpersonating(ctx, "the owner's email or mobile");
   await prisma.business.update({ where: { id: ctx.businessId! }, data: { ...body, ...(await checkedGeo(body, current)) } });
   return getBusiness(ctx);
 }
