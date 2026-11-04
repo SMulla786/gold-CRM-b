@@ -101,6 +101,18 @@ describe('impersonation restrictions (direct API)', () => {
     expect(await db.activityLog.count({ where: { module: 'IMPERSONATION' } })).toBe(0);
   });
 
+  it('the support banner\'s End runs on the impersonation token: it closes the log and kills the token; a normal token → 403', async () => {
+    const s = await setup();
+    expect((await api.post('/api/platform/impersonation/end').set('Authorization', s.as)).status).toBe(403); // the old UI call: owner level
+    const own = bearer((await loginAs(s.owner.username)).token!);
+    expect((await api.post('/api/auth/impersonation/end').set('Authorization', own)).status).toBe(403);
+    expect((await api.post('/api/auth/impersonation/end').set('Authorization', s.as)).status).toBe(204);
+    expect((await api.get('/api/admin/users').set('Authorization', s.as)).status).toBe(401);
+    expect((await db.impersonationLog.findFirstOrThrow({ where: { superAdminId: s.sa.user.id } })).endedAt).not.toBeNull();
+    expect((await api.get('/api/platform/businesses').set('Authorization', s.saAuth)).status).toBe(200);
+    expect((await api.get('/api/admin/users').set('Authorization', own)).status).toBe(200); // the owner's own session is untouched
+  });
+
   it('ending the impersonation restores the Super Admin: platform access works, the impersonation token is dead', async () => {
     const s = await setup();
     expect((await api.get('/api/platform/businesses').set('Authorization', s.as)).status).toBe(403); // the owner token is no Super Admin

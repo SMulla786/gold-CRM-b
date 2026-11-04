@@ -15,6 +15,7 @@ import {
   verifyMpinBody,
 } from '../../shared';
 import * as svc from './service';
+import { endImpersonation } from '../platform/service';
 
 const cookieOpts = {
   httpOnly: true,
@@ -62,6 +63,14 @@ authRouter.post('/password', requireAuth, loadContext, async (req, res) => {
 authRouter.post('/mpin', requireAuth, loadContext, async (req, res) => {
   notImpersonating(req);
   await svc.setMpin(req.auth!.userId, setMpinBody.parse(req.body));
+  res.status(204).end();
+});
+
+// G7 review 4: "End" in the support banner runs on the impersonation token itself (the Super Admin's own token is not
+// in memory then), so /platform/impersonation/end refused it (403) and the impersonation stayed open server-side.
+authRouter.post('/impersonation/end', requireAuth, loadContext, async (req, res) => {
+  if (req.auth!.impersonatorId == null) throw new HttpError(403, 'FORBIDDEN', 'Not impersonating');
+  await endImpersonation(req.auth!.impersonatorId);
   res.status(204).end();
 });
 
