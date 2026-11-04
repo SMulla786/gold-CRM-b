@@ -77,3 +77,51 @@ describe('order → bill lifecycle', () => {
     expect(await state(s.order.id, s.pieces)).toEqual(['DELIVERED', bill.id, ['DELIVERED', 'DELIVERED'], ['SOLD', 'SOLD']]);
   });
 });
+
+/** Resolves once `n` other connections of this DB are waiting on a row lock. */
+async function lockWaiters(n: number): Promise<void> {
+  for (let i = 0; i < 100; i++) {
+    const [{ w } = { w: 0 }] = await db.$queryRaw<{ w: number }[]>`SELECT count(*)::int AS w FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock'`;
+    if (w >= n) return;
+    await new Promise((r) => setTimeout(r, 30));
+  }
+  throw new Error(`never ${n} connections blocked on the bill row`);
+}
+
+describe('G7 owner rule: deleting an order bill returns its stock atomically and exactly once', () => {
+  it('race: two deletes queued on the bill row → one returns the stock, the other 409; a repeat changes nothing', async () => {
+    const s = await setup();
+    const bill = await billing.createBill(s.ctx, s.body());
+    const sold = await db.ledgerEntry.findMany({ where: { source: 'SELL_BILL', sourceId: String(bill.id), stockItemId: { not: null }, reversalOfId: null }, select: { id: true } });
+    expect(sold).toHaveLength(2);
+
+    let locked!: () => void;
+    let release!: () => void;
+    const isLocked = new Promise<void>((r) => (locked = r));
+    const held = new Promise<void>((r) => (release = r));
+    const hold = db.$transaction(async (t) => {
+      await t.$queryRaw`SELECT id FROM "Bill" WHERE id = ${bill.id} FOR UPDATE`;
+      locked();
+      await held;
+    }, { timeout: 20_000 });
+    await isLocked;
+    const del = () => billing.deleteBill(s.ctx, bill.id, true).then(() => 'deleted', (e: unknown) => e);
+    const both = Promise.all([del(), del()]);
+    await lockWaiters(2); // both deletes wait to flip the bill
+    release();
+    await hold;
+    const results = await both;
+
+    expect(results.filter((r) => r === 'deleted')).toHaveLength(1);
+    expect(results.find((r) => r !== 'deleted')).toMatchObject({ status: 409 });
+    const once = async () => [
+      await state(s.order.id, s.pieces),
+      await db.ledgerEntry.count({ where: { reversalOfId: { in: sold.map((r) => r.id) } } }),
+      await db.activityLog.count({ where: { entity: 'BILL', entityId: String(bill.id), action: 'DELETED' } }),
+    ];
+    expect(await once()).toEqual([['READY', null, ['RECEIVED', 'RECEIVED'], ['RESERVED', 'RESERVED']], 2, 1]);
+
+    await expect(billing.deleteBill(s.ctx, bill.id, true)).rejects.toMatchObject({ status: 409 });
+    expect(await once()).toEqual([['READY', null, ['RECEIVED', 'RECEIVED'], ['RESERVED', 'RESERVED']], 2, 1]);
+  });
+});
