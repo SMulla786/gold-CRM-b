@@ -7,7 +7,7 @@ import { prisma } from './lib/prisma';
 import { errorHandler } from './middleware/error';
 import { requestLog } from './middleware/requestLog';
 import { requireAuth } from './middleware/auth';
-import { loadContext } from './middleware/context';
+import { loadContext, requireActiveBranch } from './middleware/context';
 import { requireLevel } from './middleware/guards';
 import { authRouter } from './modules/auth/routes';
 import { publicRouter } from './modules/public/routes';
@@ -43,6 +43,7 @@ export function createApp() {
     loadContext,
     requireLevel('ADMIN', 'BRANCH_USER'),
     requireWrite,
+    requireActiveBranch,
     appRouter,
   );
 

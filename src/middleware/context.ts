@@ -1,3 +1,4 @@
+import type { Prisma } from '@prisma/client';
 import type { RequestHandler } from 'express';
 import { prisma } from '../lib/prisma';
 import { loadAccess } from '../lib/access';
@@ -106,5 +107,29 @@ export const loadContext: RequestHandler = async (req, _res, next) => {
     permissions,
     impersonatorId: auth.impersonatorId,
   };
+  next();
+};
+
+/** G7: 403 BRANCH_INACTIVE when any of these branches of the business is switched off. Ids that are no branch (0 = business-wide) pass. */
+export async function assertBranchesActive(db: Pick<Prisma.TransactionClient, 'branch'>, businessId: number, ids: Array<number | null | undefined>): Promise<void> {
+  const want = [...new Set(ids.filter((i): i is number => Number.isInteger(i) && i! > 0))];
+  if (!want.length) return;
+  const off = await db.branch.findFirst({ where: { businessId, id: { in: want }, isActive: false }, select: { id: true, name: true } });
+  if (off) throw new HttpError(403, 'BRANCH_INACTIVE', `Branch "${off.name}" is inactive. Reactivate it in Settings → Branches to record new entries.`, { branchId: off.id });
+}
+
+/** Every value under a key ending in branchId (branchId, toBranchId, metals[].branchId …), however deep. */
+const bodyBranchIds = (v: unknown): number[] =>
+  Array.isArray(v)
+    ? v.flatMap(bodyBranchIds)
+    : v && typeof v === 'object'
+      ? Object.entries(v).flatMap(([k, x]) => (/branchId$/i.test(k) ? [Number(x)] : bodyBranchIds(x)))
+      : [];
+
+/** G7: no write lands on an inactive branch — the X-Branch-Id / own / scope branch, or any branch id the client puts in the body.
+ *  GETs (history, reports) stay open. Writes on an existing document's branch are caught again at ledger.post / reverse. */
+export const requireActiveBranch: RequestHandler = async (req, _res, next) => {
+  const ctx = req.ctx!;
+  if (req.method !== 'GET') await assertBranchesActive(prisma, ctx.businessId!, [ctx.activeBranchId ?? ctx.scopeBranchId, ...bodyBranchIds(req.body)]);
   next();
 };
