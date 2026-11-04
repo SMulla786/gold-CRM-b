@@ -2,3 +2,5 @@
 *.png binary
 *.jpg binary
 *.ico binary
+# vendored master data: kept byte for byte so its SHA-256 matches the source (prisma/data/README.md)
+prisma/data/*.csv -text
