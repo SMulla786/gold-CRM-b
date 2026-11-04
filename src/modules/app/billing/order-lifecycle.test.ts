@@ -1,7 +1,7 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { db, truncateAll } from '../../../../test/helpers/db';
 import { createBusiness } from '../../../../test/helpers/factory';
-import { billBody } from '../../../shared';
+import { billBody, billListQuery } from '../../../shared';
 import * as inv from '../inventory';
 import * as billing from './service';
 import type { TenantContext } from '../../../middleware/context';
@@ -89,6 +89,14 @@ async function lockWaiters(n: number): Promise<void> {
 }
 
 describe('G7 owner rule: deleting an order bill returns its stock atomically and exactly once', () => {
+  it('the bill list marks an order bill (orderId), so the delete dialog offers only "return stock"; a plain bill has none', async () => {
+    const s = await setup();
+    const orderBill = await billing.createBill(s.ctx, s.body());
+    const plain = await billing.createBill(s.ctx, billBody.parse({ kind: 'SELL', billType: 'ROUGH', partyId: s.party.id, items: [{ description: 'Repair work', stockClass: 'SILVER', gross: 0, other: 500 }] }));
+    const listed = new Map((await billing.listBills(s.ctx, billListQuery.parse({ kind: 'SELL' }))).items.map((b) => [b.id, b.orderId]));
+    expect([listed.get(orderBill.id), listed.get(plain.id)]).toEqual([s.order.id, null]);
+  });
+
   it('race: two deletes queued on the bill row → one returns the stock, the other 409; a repeat changes nothing', async () => {
     const s = await setup();
     const bill = await billing.createBill(s.ctx, s.body());

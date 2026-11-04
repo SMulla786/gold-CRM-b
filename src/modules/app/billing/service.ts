@@ -746,8 +746,9 @@ export async function listBills(ctx: TenantContext, query: any): Promise<Paged<B
   const parties = new Map((await sdb.party.findMany({ where: { id: { in: [...new Set(rows.map((b) => b.partyId))] } } })).map((p) => [p.id, p]));
   const branches = new Map((await sdb.branch.findMany({ where: { id: { in: [...new Set(rows.map((b) => b.branchId))] } }, select: { id: true, name: true } })).map((b) => [b.id, b.name]));
   const users = await userNames(ctx, rows.map((b) => b.createdById).filter((x): x is number => x != null));
+  const orderOf = new Map((await sdb.order.findMany({ where: { billId: { in: rows.map((b) => b.id) } }, select: { id: true, billId: true } })).map((o) => [o.billId, o.id]));
   return {
-    items: rows.map((b) => listItemFields(b, partyRef(parties.get(b.partyId)), branches.get(b.branchId) ?? '', b.createdById != null ? (users.get(b.createdById) ?? null) : null)),
+    items: rows.map((b) => ({ ...listItemFields(b, partyRef(parties.get(b.partyId)), branches.get(b.branchId) ?? '', b.createdById != null ? (users.get(b.createdById) ?? null) : null), orderId: orderOf.get(b.id) ?? null })),
     total, page: query.page, pageSize: query.pageSize,
   };
 }

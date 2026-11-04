@@ -235,6 +235,8 @@ export interface BillListItemDto {
   itemCount: number;
   /** TASK-83: e.g. "2× Ring, 1× Chain" — filled by the pending-bills list only */
   itemsSummary?: string;
+  /** G7: the order this bill delivers (bill list) — deleting it always returns the stock to the order */
+  orderId?: number | null;
   final: string;
   paid: string;
   /** final − paid (negative = advance) */
