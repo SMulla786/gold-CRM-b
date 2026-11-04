@@ -9,6 +9,7 @@ import { prisma } from '../../../lib/prisma';
 import { scopedDb } from '../../../lib/db';
 import { logActivity } from '../../../lib/activity';
 import { HttpError } from '../../../middleware/error';
+import { assertDocBranchActive } from '../../../middleware/context';
 import type { TenantContext } from '../../../middleware/context';
 import type {
   Paged,
@@ -151,6 +152,7 @@ export async function createSample(ctx: TenantContext, body: CreateBody): Promis
 
 export async function updateSample(ctx: TenantContext, id: number, body: UpdateBody): Promise<SampleDetailDto> {
   const s = await findSample(ctx, id);
+  await assertDocBranchActive(ctx, s); // G7: an inactive branch takes no new writes, whatever X-Branch-Id says
   if (!EDITABLE.includes(s.status as SampleStatus)) throw new HttpError(409, 'CONFLICT', `A ${s.status.toLowerCase().replace('_', ' ')} sample cannot be edited`);
   await assertParties(ctx, body.partyId, body.karigarId);
   const gross = body.grossWt ?? s.grossWt;
@@ -200,6 +202,7 @@ async function transition(
   x: { partyId?: number | null; karigarId?: number | null; note?: string | null; partyName?: string | null },
 ): Promise<SampleDetailDto> {
   const s = await findSample(ctx, id);
+  await assertDocBranchActive(ctx, s); // G7: an inactive branch takes no new writes, whatever X-Branch-Id says
   if (!from.includes(s.status as SampleStatus)) throw new HttpError(409, 'CONFLICT', `A ${s.status.toLowerCase().replace('_', ' ')} sample cannot be ${action.toLowerCase()}`);
   await prisma.$transaction((tx) => flipSampleTx(tx, ctx, s, from, to, action, x));
   return getSample(ctx, id);

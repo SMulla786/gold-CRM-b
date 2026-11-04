@@ -6,6 +6,7 @@ import * as udhar from '../../../lib/udhar';
 import { poolGuard, type Pool } from '../../../lib/kacha';
 import { logActivity } from '../../../lib/activity';
 import { HttpError } from '../../../middleware/error';
+import { assertDocBranchActive } from '../../../middleware/context';
 import type { TenantContext } from '../../../middleware/context';
 import { computeLine, RATE_UNIT_GRAMS } from '../../../shared';
 import type { OrderDto, OrderItemDto, KarigarIssueDto, BillPaymentInput, BulkCancelOrdersResultDto, OrderNextNoDto } from '../../../shared';
@@ -167,6 +168,7 @@ export async function cancelOrder(ctx: TenantContext, id: number): Promise<void>
   const sdb = scopedDb(ctx);
   const order = await sdb.order.findUnique({ where: { id }, include: { items: true } });
   if (!order) throw new HttpError(404, 'NOT_FOUND', 'Order not found');
+  await assertDocBranchActive(ctx, order); // G7: an inactive branch takes no new writes, whatever X-Branch-Id says
   if (order.status !== 'PENDING' && order.status !== 'IN_PROCESS') throw new HttpError(409, 'CONFLICT', `A ${order.status.toLowerCase()} order cannot be cancelled`);
   if (order.items.some((it) => it.status === 'ASSIGNED')) throw new HttpError(409, 'CONFLICT', 'Receive or close the open karigar issue before cancelling');
   await prisma.$transaction(async (tx) => {
@@ -491,8 +493,9 @@ function paymentDto(p: any) {
 // ───────────── Design file (TASK-97) ─────────────
 
 export async function saveOrderDesign(ctx: TenantContext, id: number, buffer: Buffer): Promise<void> {
-  const order = await scopedDb(ctx).order.findUnique({ where: { id }, select: { designUrl: true } });
+  const order = await scopedDb(ctx).order.findUnique({ where: { id }, select: { designUrl: true, branchId: true } });
   if (!order) throw new HttpError(404, 'NOT_FOUND', 'Order not found');
+  await assertDocBranchActive(ctx, order); // G7: an inactive branch takes no new writes, whatever X-Branch-Id says
   await replaceFile(ctx, 'orders', buffer, order.designUrl, (rel) => scopedDb(ctx).order.update({ where: { id }, data: { designUrl: rel } }), true);
 }
 
@@ -501,8 +504,9 @@ export async function orderDesignPath(ctx: TenantContext, id: number): Promise<s
 }
 
 export async function removeOrderDesign(ctx: TenantContext, id: number): Promise<void> {
-  const order = await scopedDb(ctx).order.findUnique({ where: { id }, select: { designUrl: true } });
+  const order = await scopedDb(ctx).order.findUnique({ where: { id }, select: { designUrl: true, branchId: true } });
   if (!order) throw new HttpError(404, 'NOT_FOUND', 'Order not found');
+  await assertDocBranchActive(ctx, order); // G7: an inactive branch takes no new writes, whatever X-Branch-Id says
   if (!order.designUrl) return;
   await scopedDb(ctx).order.update({ where: { id }, data: { designUrl: null } });
   await removeFile(order.designUrl);

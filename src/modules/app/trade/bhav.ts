@@ -8,6 +8,7 @@ import { HttpError } from '../../../middleware/error';
 import type { z } from 'zod';
 import { bhavBookingBody, bhavListQuery, metalToMoney } from '../../../shared';
 import type { BhavBookingDto, Paged, TradeHistoryDto } from '../../../shared';
+import { assertDocBranchActive } from '../../../middleware/context';
 import type { TenantContext } from '../../../middleware/context';
 import { D, activeBranch, dateOnly, dateRange, docHistory, lctxOf, loadPayments, loadRefs, money, nextNo, payPlan, payRows, savePayments, settingsUnit, snap, userName, wt } from './common';
 import type { PayPlan } from './common';
@@ -81,6 +82,7 @@ export async function updateBhav(ctx: TenantContext, id: number, body: BhavBody)
   const sdb = scopedDb(ctx);
   const old = await sdb.bhavBooking.findFirst({ where: { id }, include: withLines });
   if (!old) throw new HttpError(404, 'NOT_FOUND', 'Booking not found');
+  await assertDocBranchActive(ctx, old); // G7: an inactive branch takes no new writes, whatever X-Branch-Id says
   if (old.status !== 'PENDING') throw new HttpError(409, 'CONFLICT', 'Only a pending (undelivered) booking can be edited');
   const party = await sdb.party.findUnique({ where: { id: body.partyId } });
   if (!party) throw new HttpError(404, 'NOT_FOUND', 'Party not found');
@@ -116,6 +118,7 @@ export async function cancelBhav(ctx: TenantContext, id: number): Promise<BhavBo
   const sdb = scopedDb(ctx);
   const bk = await sdb.bhavBooking.findFirst({ where: { id } });
   if (!bk) throw new HttpError(404, 'NOT_FOUND', 'Booking not found');
+  await assertDocBranchActive(ctx, bk); // G7: an inactive branch takes no new writes, whatever X-Branch-Id says
   await prisma.$transaction(async (tx) => {
     const upd = await tx.bhavBooking.updateMany({ where: { id, status: { in: ['PENDING', 'PARTIAL'] } }, data: { status: 'CANCELLED' } });
     if (upd.count !== 1) throw new HttpError(409, 'CONFLICT', 'Booking is not open'); // the advance stays on the party's account (refund = a normal udhar entry)
@@ -129,6 +132,7 @@ export async function undeliverBhav(ctx: TenantContext, id: number): Promise<Bha
   const sdb = scopedDb(ctx);
   const bk = await sdb.bhavBooking.findFirst({ where: { id } });
   if (!bk) throw new HttpError(404, 'NOT_FOUND', 'Booking not found');
+  await assertDocBranchActive(ctx, bk); // G7: an inactive branch takes no new writes, whatever X-Branch-Id says
   await prisma.$transaction(async (tx) => {
     // a buy-sell holds this booking as its first (bhavBookingId) or as any of its multi-booking deliveries (TRD-03)
     const linked = await tx.buySell.count({ where: { businessId: ctx.businessId!, OR: [{ bhavBookingId: id }, { deliveries: { some: { bookingId: id } } }] } });
@@ -145,6 +149,7 @@ export async function verifyBhav(ctx: TenantContext, id: number, verified: boole
   const sdb = scopedDb(ctx);
   const bk = await sdb.bhavBooking.findFirst({ where: { id } });
   if (!bk) throw new HttpError(404, 'NOT_FOUND', 'Booking not found');
+  await assertDocBranchActive(ctx, bk); // G7: an inactive branch takes no new writes, whatever X-Branch-Id says
   await prisma.$transaction(async (tx) => {
     const upd = await tx.bhavBooking.updateMany({
       where: { id, verifiedAt: verified ? null : { not: null } },
@@ -159,6 +164,7 @@ export async function deleteBhav(ctx: TenantContext, id: number): Promise<void> 
   const sdb = scopedDb(ctx);
   const bk = await sdb.bhavBooking.findFirst({ where: { id } });
   if (!bk) throw new HttpError(404, 'NOT_FOUND', 'Booking not found');
+  await assertDocBranchActive(ctx, bk); // G7: an inactive branch takes no new writes, whatever X-Branch-Id says
   const lctx = lctxOf(ctx);
   await prisma.$transaction(async (tx) => {
     // Only an untouched PENDING booking (status PENDING ⇒ no delivery, pendingWeight = weight) can be deleted.

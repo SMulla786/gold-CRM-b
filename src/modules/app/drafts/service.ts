@@ -3,6 +3,7 @@ import { prisma } from '../../../lib/prisma';
 import { scopedDb } from '../../../lib/db';
 import { logActivity } from '../../../lib/activity';
 import { HttpError } from '../../../middleware/error';
+import { assertDocBranchActive } from '../../../middleware/context';
 import type { TenantContext } from '../../../middleware/context';
 import { computeLine, RATE_UNIT_GRAMS } from '../../../shared';
 import type { SalesDraftDto } from '../../../shared';
@@ -134,6 +135,7 @@ export async function decideDraft(ctx: TenantContext, id: number, body: Decision
   const sdb = scopedDb(ctx);
   const draft = await sdb.salesDraft.findUnique({ where: { id } });
   if (!draft) throw new HttpError(404, 'NOT_FOUND', 'Draft not found');
+  await assertDocBranchActive(ctx, draft); // G7: an inactive branch takes no new writes, whatever X-Branch-Id says
   if (derivedStatus(draft.status, draft.expiresAt) !== 'PENDING') throw new HttpError(409, 'CONFLICT', 'Only a pending draft can be approved or rejected');
   const data = body.decision === 'APPROVE'
     ? { status: 'APPROVED' as const, approvedDiscount: body.approvedDiscount, approvedDiscountUnit: body.approvedDiscountUnit, decidedById: ctx.userId!, decidedAt: new Date() }
@@ -147,6 +149,7 @@ export async function cancelDraft(ctx: TenantContext, id: number): Promise<Sales
   const sdb = scopedDb(ctx);
   const draft = await sdb.salesDraft.findUnique({ where: { id } });
   if (!draft) throw new HttpError(404, 'NOT_FOUND', 'Draft not found');
+  await assertDocBranchActive(ctx, draft); // G7: an inactive branch takes no new writes, whatever X-Branch-Id says
   if (draft.status !== 'PENDING' && draft.status !== 'APPROVED') throw new HttpError(409, 'CONFLICT', `A ${draft.status.toLowerCase()} draft cannot be cancelled`);
   await sdb.salesDraft.update({ where: { id }, data: { status: 'CANCELLED' } });
   await prisma.$transaction((tx) => logActivity(tx, ctx, { module: 'SALES_DRAFT', action: 'DELETED', entity: 'SALES_DRAFT', entityId: String(id), summary: `Draft #${draft.draftNo} cancelled` }));
@@ -158,6 +161,7 @@ export async function deleteDraft(ctx: TenantContext, id: number): Promise<void>
   const sdb = scopedDb(ctx);
   const draft = await sdb.salesDraft.findUnique({ where: { id } });
   if (!draft) throw new HttpError(404, 'NOT_FOUND', 'Draft not found');
+  await assertDocBranchActive(ctx, draft); // G7: an inactive branch takes no new writes, whatever X-Branch-Id says
   if (draft.status === 'BILLED' || draft.billId != null) throw new HttpError(409, 'CONFLICT', 'A billed draft cannot be deleted');
   await sdb.salesDraft.delete({ where: { id } });
   await prisma.$transaction((tx) => logActivity(tx, ctx, { module: 'SALES_DRAFT', action: 'DELETED', entity: 'SALES_DRAFT', entityId: String(id), summary: `Draft #${draft.draftNo} deleted` }));

@@ -5,6 +5,7 @@ import * as ledger from '../../../lib/ledger';
 import * as udhar from '../../../lib/udhar';
 import { logActivity } from '../../../lib/activity';
 import { HttpError } from '../../../middleware/error';
+import { assertDocBranchActive } from '../../../middleware/context';
 import type { TenantContext } from '../../../middleware/context';
 import type { RepairConsumableDto, RepairTicketDto } from '../../../shared';
 import { filePath, replaceFile } from '../orders/files';
@@ -70,6 +71,7 @@ export async function updateRepairStatus(ctx: TenantContext, id: number, body: {
   const sdb = scopedDb(ctx);
   const t = await sdb.repairTicket.findUnique({ where: { id } });
   if (!t) throw new HttpError(404, 'NOT_FOUND', 'Repair ticket not found');
+  await assertDocBranchActive(ctx, t); // G7: an inactive branch takes no new writes, whatever X-Branch-Id says
   if (t.status === 'DELIVERED' || t.status === 'CANCELLED') throw new HttpError(409, 'CONFLICT', `A ${t.status.toLowerCase()} ticket cannot change status`);
   if (body.karigarId != null) {
     // same tenant + KARIGAR check as createRepair (a foreign/non-karigar id must never be persisted)
@@ -109,6 +111,7 @@ export async function updateRepairStatus(ctx: TenantContext, id: number, body: {
 export async function rejectRepair(ctx: TenantContext, id: number, body: { remarks: string }): Promise<RepairTicketDto> {
   const t = await scopedDb(ctx).repairTicket.findUnique({ where: { id } });
   if (!t) throw new HttpError(404, 'NOT_FOUND', 'Repair ticket not found');
+  await assertDocBranchActive(ctx, t); // G7: an inactive branch takes no new writes, whatever X-Branch-Id says
   if (t.status !== 'IN_REVIEW') throw new HttpError(409, 'CONFLICT', `Only a ticket in QA review can be returned to the bench (this one is ${t.status})`);
   const note = `QA returned: ${body.remarks}`;
   await prisma.$transaction(async (tx) => {
@@ -127,6 +130,7 @@ export async function deliverRepair(ctx: TenantContext, id: number, body: Delive
   const sdb = scopedDb(ctx);
   const t = await sdb.repairTicket.findUnique({ where: { id } });
   if (!t) throw new HttpError(404, 'NOT_FOUND', 'Repair ticket not found');
+  await assertDocBranchActive(ctx, t); // G7: an inactive branch takes no new writes, whatever X-Branch-Id says
   if (t.status !== 'READY') throw new HttpError(409, 'CONFLICT', 'Only a READY ticket can be delivered');
   if (body.bankAccountId != null && !(await sdb.bankAccount.findUnique({ where: { id: body.bankAccountId } }))) throw new HttpError(404, 'NOT_FOUND', 'Bank account not found');
 
@@ -215,8 +219,9 @@ export async function getRepair(ctx: TenantContext, id: number): Promise<RepairT
 // ───────────── Photo (TASK-97) ─────────────
 
 export async function saveRepairPhoto(ctx: TenantContext, id: number, buffer: Buffer): Promise<void> {
-  const t = await scopedDb(ctx).repairTicket.findUnique({ where: { id }, select: { photoUrl: true } });
+  const t = await scopedDb(ctx).repairTicket.findUnique({ where: { id }, select: { photoUrl: true, branchId: true } });
   if (!t) throw new HttpError(404, 'NOT_FOUND', 'Repair ticket not found');
+  await assertDocBranchActive(ctx, t); // G7: an inactive branch takes no new writes, whatever X-Branch-Id says
   await replaceFile(ctx, 'repair', buffer, t.photoUrl, (rel) => scopedDb(ctx).repairTicket.update({ where: { id }, data: { photoUrl: rel } }));
 }
 
@@ -257,13 +262,14 @@ export async function createConsumable(ctx: TenantContext, body: ConsumableBody)
 }
 
 export async function updateConsumable(ctx: TenantContext, id: number, body: Partial<Omit<ConsumableBody, 'category'>> & { category?: string | null }): Promise<RepairConsumableDto> {
-  await findConsumable(ctx, id);
+  await assertDocBranchActive(ctx, await findConsumable(ctx, id)); // G7: an inactive branch takes no new writes
   const c = await prisma.repairConsumable.update({ where: { id }, data: { ...body, ...(body.category !== undefined ? { category: body.category || null } : {}) } });
   return consumableDto(c);
 }
 
 export async function adjustConsumable(ctx: TenantContext, id: number, body: { delta: number; reason?: string }): Promise<RepairConsumableDto> {
   const c = await findConsumable(ctx, id);
+  await assertDocBranchActive(ctx, c); // G7: an inactive branch takes no new writes, whatever X-Branch-Id says
   // atomic: stock never goes below zero, even with two quick taps
   const r = await prisma.repairConsumable.updateMany({ where: { id, ...(body.delta < 0 ? { currentStock: { gte: -body.delta } } : {}) }, data: { currentStock: { increment: body.delta } } });
   if (r.count !== 1) throw new HttpError(409, 'CONFLICT', 'Not enough stock to take out');

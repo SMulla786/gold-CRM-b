@@ -6,6 +6,7 @@ import { parseCsv } from '../../lib/csv';
 import * as ledger from '../../lib/ledger';
 import { logActivity } from '../../lib/activity';
 import { HttpError } from '../../middleware/error';
+import { assertDocBranchActive } from '../../middleware/context';
 import type { TenantContext } from '../../middleware/context';
 import { computeLine, stockRowInput } from '../../shared';
 import type { StockStoneDto } from '../../shared';
@@ -454,6 +455,7 @@ async function editStock(ctx: TenantContext, uniq: number[], patch: any): Promis
   const items = await sdb.stockItem.findMany({ where: { id: { in: uniq } }, include: { itemName: true } });
   if (items.length !== uniq.length) throw new HttpError(404, 'NOT_FOUND', 'One or more stock items not found');
   for (const it of items) if (it.status !== 'AVAILABLE') throw new HttpError(409, 'CONFLICT', `Item #${it.id} is not AVAILABLE`);
+  for (const it of items) await assertDocBranchActive(ctx, it); // G7: an inactive branch takes no new writes (a remark-only edit posts nothing)
   const touchByCode = await touchMap(sdb);
   const lctx = lctxOf(ctx);
   await prisma.$transaction(async (tx) => {
@@ -493,6 +495,7 @@ export async function deleteStock(ctx: TenantContext, id: number): Promise<void>
 export async function removeStockPhoto(ctx: TenantContext, id: number): Promise<void> {
   const item = await scopedDb(ctx).stockItem.findUnique({ where: { id } });
   if (!item) throw new HttpError(404, 'NOT_FOUND', 'Stock item not found');
+  await assertDocBranchActive(ctx, item); // G7: an inactive branch takes no new writes, whatever X-Branch-Id says
   if (!item.photoUrl) return;
   const abs = await stockImagePath(ctx, id).catch(() => null);
   await scopedDb(ctx).stockItem.update({ where: { id }, data: { photoUrl: null } });

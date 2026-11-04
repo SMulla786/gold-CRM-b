@@ -7,6 +7,7 @@ import { HttpError } from '../../../middleware/error';
 import type { z } from 'zod';
 import { girviBody, girviDue, girviEffectiveRate, girviItemReplaceBody, girviReleaseBody } from '../../../shared';
 import type { GirviBatchDto, GirviItemDto, GirviListItemDto, GirviTxnDto, Paged, PartyRefDto } from '../../../shared';
+import { assertDocBranchActive } from '../../../middleware/context';
 import type { TenantContext } from '../../../middleware/context';
 
 type GirviBody = z.infer<typeof girviBody>;
@@ -229,6 +230,7 @@ export async function releaseGirvi(ctx: TenantContext, id: number, body: GirviRe
 export async function replaceGirviItem(ctx: TenantContext, batchId: number, itemId: number, body: z.infer<typeof girviItemReplaceBody>): Promise<GirviBatchDto> {
   const batch = await scopedDb(ctx).girviBatch.findFirst({ where: { id: batchId } });
   if (!batch) throw new HttpError(404, 'NOT_FOUND', 'Girvi not found');
+  await assertDocBranchActive(ctx, batch); // G7: an inactive branch takes no new writes, whatever X-Branch-Id says
   const fine = D(body.net).times(body.purity).div(100);
   const valuation = fine.times(body.rate);
   await prisma.$transaction(async (tx) => {

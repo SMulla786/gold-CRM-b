@@ -118,6 +118,9 @@ export async function assertBranchesActive(db: Pick<Prisma.TransactionClient, 'b
   if (off) throw new HttpError(403, 'BRANCH_INACTIVE', `Branch "${off.name}" is inactive. Reactivate it in Settings → Branches to record new entries.`, { branchId: off.id });
 }
 
+/** G7: a write on an existing document checks the document's own branch — X-Branch-Id 'all' or another branch doesn't get round it. */
+export const assertDocBranchActive = (ctx: TenantContext, doc: { branchId: number }): Promise<void> => assertBranchesActive(prisma, ctx.businessId!, [doc.branchId]);
+
 /** Every value under a key ending in branchId (branchId, toBranchId, metals[].branchId …), however deep. */
 const bodyBranchIds = (v: unknown): number[] =>
   Array.isArray(v)
