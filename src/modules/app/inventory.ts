@@ -430,11 +430,16 @@ async function applyStockEdit(tx: Prisma.TransactionClient, lctx: ledger.LedgerC
 /** A sold item can't be edited/deleted — but only while its SELL_BILL row is live. A bill deleted with stock return reverses that row, so the item is AVAILABLE again and must stay editable. */
 // G7 D-f: run inside the tx, after the stock rows are locked — a partial LOOSE sale doesn't change the status, so only this sees a sale that committed meanwhile.
 async function assertNotSold(tx: Prisma.TransactionClient, ctx: TenantContext, ids: number[]): Promise<void> {
-  const sellRows = await tx.ledgerEntry.findMany({ where: { businessId: ctx.businessId!, stockItemId: { in: ids }, source: 'SELL_BILL', reversalOfId: null }, select: { id: true, stockItemId: true } });
+  const sellRows = await tx.ledgerEntry.findMany({ where: { businessId: ctx.businessId!, stockItemId: { in: ids }, source: 'SELL_BILL', reversalOfId: null }, select: { id: true, stockItemId: true, sourceId: true } });
   if (sellRows.length === 0) return;
   const reversed = new Set((await tx.ledgerEntry.findMany({ where: { businessId: ctx.businessId!, reversalOfId: { in: sellRows.map((r) => r.id) } }, select: { reversalOfId: true } })).map((r) => r.reversalOfId));
-  const live = sellRows.find((r) => !reversed.has(r.id));
-  if (live) throw new HttpError(409, 'CONFLICT', `Item #${live.stockItemId} is on a sell bill — correct it from the bill`);
+  const sold = sellRows.filter((r) => !reversed.has(r.id));
+  if (sold.length === 0) return;
+  // G7 owner rule: only a sale on a live (not deleted) bill holds the lot — a bill deleted without its stock leaves its sale rows but no longer does
+  const bills = await tx.bill.findMany({ where: { businessId: ctx.businessId!, id: { in: sold.map((r) => Number(r.sourceId)).filter(Number.isInteger) } }, select: { id: true, billNo: true, status: true } });
+  const live = sold.find((r) => bills.find((b) => b.id === Number(r.sourceId))?.status !== 'DELETED');
+  const bill = bills.find((b) => b.id === Number(live?.sourceId));
+  if (live) throw new HttpError(409, 'CONFLICT', `Item #${live.stockItemId} has a sale on live bill ${bill ? bill.billNo : `#${live.sourceId}`} — it can't be transferred, edited or deleted until that bill is corrected or deleted`);
 }
 
 /** Lock the ids inside the tx and confirm all are still AVAILABLE (count must equal n), else 409 — closes the edit-vs-transfer/delete race. */

@@ -71,6 +71,16 @@ describe('a partly sold LOOSE lot', () => {
     expect([after.branchId, Number(after.gross)]).toEqual([s.child.id, 20]);
   });
 
+  it('owner rule: the 409 names the live bill; a bill deleted WITHOUT its stock no longer holds the lot — it moves with what is left (15 g)', async () => {
+    const s = await setup();
+    const bill = await billing.createBill(s.ctx, billBody.parse({ kind: 'SELL', billType: 'ROUGH', partyId: s.party.id, items: [{ stockItemId: s.lot, gross: 5, pcs: 1, rate: 60000 }] }));
+    await expect(s.move()).rejects.toMatchObject({ status: 409, message: expect.stringContaining(`has a sale on live bill ${bill.billNo}`) });
+    await billing.deleteBill(s.ctx, bill.id, false); // the 5 g stays sold
+    await s.move();
+    const after = await lotRow(s);
+    expect([after.branchId, Number(after.gross)]).toEqual([s.child.id, 15]);
+  });
+
   it('race: a sale that commits while the transfer waits on the row → 409, the lot stays (15 g, root branch)', async () => {
     const s = await setup();
     expect(await duringSale(s, s.move)).toMatchObject({ status: 409 });
