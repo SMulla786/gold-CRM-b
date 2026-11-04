@@ -1,4 +1,5 @@
 import type { Prisma } from '@prisma/client';
+import { prisma } from './prisma';
 import type { ActivityAction } from '../shared';
 import type { TenantContext } from '../middleware/context';
 
@@ -33,4 +34,26 @@ export async function logActivity(tx: Prisma.TransactionClient, ctx: TenantConte
       ...(meta !== undefined ? { meta } : {}),
     },
   });
+}
+
+/**
+ * G7 review 4: one audit row per write a Super Admin made — or tried — while impersonating: userId is the impersonated
+ * user, meta.impersonatorId the real actor. Path and status only, never the body (it may hold passwords).
+ */
+export async function logImpersonatedWrite(r: { businessId: number | null; branchId: number | null; userId: number; impersonatorId: number; method: string; path: string; status: number }): Promise<void> {
+  await prisma.activityLog
+    .create({
+      data: {
+        businessId: r.businessId,
+        branchId: r.branchId,
+        userId: r.userId,
+        module: 'IMPERSONATION',
+        action: 'EDITED',
+        entity: 'Request',
+        entityId: `${r.method} ${r.path}`,
+        summary: `Super Admin #${r.impersonatorId} acting as user #${r.userId}: ${r.method} ${r.path} → ${r.status}${r.status >= 400 ? ' (refused)' : ''}`,
+        meta: { impersonatorId: r.impersonatorId, impersonatedUserId: r.userId, method: r.method, path: r.path, status: r.status },
+      },
+    })
+    .catch((e: unknown) => console.error('[audit] impersonated write not recorded', e));
 }

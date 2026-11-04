@@ -4,6 +4,7 @@ import { prisma } from '../../lib/prisma';
 import { scopedDb } from '../../lib/db';
 import { logActivity } from '../../lib/activity';
 import { HttpError } from '../../middleware/error';
+import { assertNotImpersonating } from './service';
 import type { TenantContext } from '../../middleware/context';
 import type { Paged, PermissionEnquiryDto } from '../../shared';
 
@@ -83,6 +84,7 @@ async function loadForDecision(ctx: TenantContext, id: number): Promise<{ enq: P
 
 /** Manager: approve → merge the requested actions into the user's permission override (edit||delete ⇒ view). */
 export async function approveEnquiry(ctx: TenantContext, id: number): Promise<PermissionEnquiryDto> {
+  assertNotImpersonating(ctx, 'changing access permissions');
   const { enq } = await loadForDecision(ctx, id);
   await prisma.$transaction(async (tx) => {
     const res = await tx.permissionEnquiry.updateMany({ where: { id, status: 'PENDING' }, data: { status: 'APPROVED', decidedById: ctx.userId, decidedAt: new Date() } });

@@ -2,6 +2,7 @@ import jwt from 'jsonwebtoken';
 import type { RequestHandler } from 'express';
 import { env } from '../config/env';
 import { HttpError } from './error';
+import { logImpersonatedWrite } from '../lib/activity';
 
 export interface AuthContext {
   userId: number;
@@ -29,7 +30,7 @@ export function signAccessToken(claims: AccessTokenClaims): string {
 }
 
 /** Verifies the Bearer access token and attaches req.auth. 401 UNAUTHENTICATED when missing/invalid/expired. */
-export const requireAuth: RequestHandler = (req, _res, next) => {
+export const requireAuth: RequestHandler = (req, res, next) => {
   const header = req.headers.authorization;
   const token = header?.startsWith('Bearer ') ? header.slice(7) : null;
   if (!token) throw new HttpError(401, 'UNAUTHENTICATED', 'Authentication required');
@@ -40,5 +41,13 @@ export const requireAuth: RequestHandler = (req, _res, next) => {
     throw new HttpError(401, 'UNAUTHENTICATED', 'Invalid or expired token');
   }
   req.auth = { userId: Number(payload.sub), sessionId: payload.sid, impersonatorId: payload.imp ?? null };
+  const { userId, impersonatorId } = req.auth;
+  // G7 review 4: every write made while impersonating is audited with BOTH identities, whether it was allowed or refused
+  if (impersonatorId != null && req.method !== 'GET') {
+    const path = req.originalUrl.split('?')[0]!;
+    res.on('finish', () => {
+      void logImpersonatedWrite({ businessId: req.ctx?.businessId ?? null, branchId: req.ctx ? (req.ctx.activeBranchId ?? req.ctx.scopeBranchId) : null, userId, impersonatorId, method: req.method, path, status: res.statusCode });
+    });
+  }
   next();
 };
