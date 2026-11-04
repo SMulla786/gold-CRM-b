@@ -151,6 +151,7 @@ export async function updateBranch(ctx: TenantContext, branchId: number, body: R
 }
 
 export async function moveBranch(ctx: TenantContext, branchId: number, newParentId: number): Promise<void> {
+  assertNotImpersonating(ctx, 'moving a branch (it changes which admins can reach it)');
   const sdb = scopedDb(ctx);
   const [branch, newParent] = await Promise.all([
     sdb.branch.findUnique({ where: { id: branchId } }),
@@ -238,10 +239,10 @@ export async function createUser(ctx: TenantContext, body: {
   extraBranchIds: number[];
   viewDaysLimit?: number | null;
 }): Promise<UserDto> {
+  assertNotImpersonating(ctx, 'creating a user');
   const sdb = scopedDb(ctx);
   const branch = await sdb.branch.findUnique({ where: { id: body.branchId } });
   if (!branch) throw new HttpError(404, 'NOT_FOUND', 'Branch not found');
-  if (body.level === 'ADMIN') assertNotImpersonating(ctx, 'creating an admin');
   if (body.level === 'ADMIN' && !branch.isAdminNode) throw new HttpError(400, 'VALIDATION', 'Admin users must be on an admin-node branch');
   if (body.roleId != null) {
     const role = await prisma.role.findFirst({ where: { id: body.roleId, OR: [{ businessId: null }, { businessId: ctx.businessId! }] } });
@@ -284,12 +285,11 @@ export async function updateUser(ctx: TenantContext, userId: number, body: {
   extraBranchIds?: number[];
   viewDaysLimit?: number | null;
 }): Promise<UserDto> {
+  assertNotImpersonating(ctx, "changing a user's profile, branch, role or access");
   const sdb = scopedDb(ctx);
   const target = await sdb.user.findUnique({ where: { id: userId }, include: { branch: true } });
   if (!target) throw new HttpError(404, 'NOT_FOUND', 'User not found');
   if (target.isOwner && !ctx.isOwner) throw new HttpError(403, 'FORBIDDEN', 'Only the owner can edit the owner');
-  if (ownerOrAdmin(target)) assertNotImpersonating(ctx, target.isOwner ? "the owner's profile, email or mobile" : "an admin's profile, email or mobile");
-  if (body.level === 'ADMIN') assertNotImpersonating(ctx, 'making a user an admin');
   if (target.id === ctx.userId && ((body.level != null && body.level !== target.level) || (body.branchId != null && body.branchId !== target.branchId))) {
     throw new HttpError(403, 'FORBIDDEN', 'You cannot change your own level or branch');
   }
@@ -328,40 +328,40 @@ export async function updateUser(ctx: TenantContext, userId: number, body: {
 
 /** BLOCKED / DELETED (trash, soft) both revoke sessions; ACTIVE = unblock or restore from trash. */
 export async function setUserStatus(ctx: TenantContext, userId: number, status: 'ACTIVE' | 'BLOCKED' | 'DELETED'): Promise<void> {
+  assertNotImpersonating(ctx, 'blocking, unblocking, deleting or restoring a user');
   const target = await scopedDb(ctx).user.findUnique({ where: { id: userId } });
   if (!target) throw new HttpError(404, 'NOT_FOUND', 'User not found');
   if (status === 'DELETED' && target.isOwner) throw new HttpError(403, 'FORBIDDEN', 'The owner cannot be deleted');
   if (target.isOwner && !ctx.isOwner) throw new HttpError(403, 'FORBIDDEN', 'Only the owner can block the owner');
   if (status !== 'ACTIVE' && target.id === ctx.userId) throw new HttpError(403, 'FORBIDDEN', 'You cannot block or delete yourself');
-  if (ownerOrAdmin(target)) assertNotImpersonating(ctx, 'blocking, deleting or restoring an admin');
   await scopedDb(ctx).user.update({ where: { id: userId }, data: { status } });
   if (status !== 'ACTIVE') await prisma.session.updateMany({ where: { userId, revokedAt: null }, data: { revokedAt: new Date(), revokeReason: status } });
 }
 
 /**
- * G7 review 4: an impersonating Super Admin acts as the owner but must never change who controls the business —
- * owner / admin credentials, email, mobile or status, admin creation or promotion, access grants. Enforced here, not only in the UI.
+ * G7 review 4 + closure: an impersonating Super Admin acts as the owner but must never change who can sign in or what they
+ * can reach — no user account (any user, any field), credentials, MPIN or status, no permission grant, role deletion or role
+ * permissions, no branch move, nor the owner's contacts — since such a change outlives the impersonation. Enforced here, not only in the UI.
  */
 export function assertNotImpersonating(ctx: TenantContext, what: string): void {
   if (ctx.impersonatorId != null) throw new HttpError(403, 'FORBIDDEN', `Not allowed while impersonating: ${what}`);
 }
-const ownerOrAdmin = (t: { isOwner: boolean; level: string }): boolean => t.isOwner || t.level === 'ADMIN';
 
 export async function resetUserPassword(ctx: TenantContext, userId: number, password: string): Promise<void> {
+  assertNotImpersonating(ctx, "resetting a user's password");
   const target = await scopedDb(ctx).user.findUnique({ where: { id: userId } });
   if (!target) throw new HttpError(404, 'NOT_FOUND', 'User not found');
   if (target.isOwner && !ctx.isOwner) throw new HttpError(403, 'FORBIDDEN', 'Only the owner can reset the owner');
-  if (ownerOrAdmin(target)) assertNotImpersonating(ctx, "the owner's or an admin's password");
   await scopedDb(ctx).user.update({ where: { id: userId }, data: { passwordHash: await argon2.hash(password) } });
   await prisma.session.updateMany({ where: { userId, revokedAt: null }, data: { revokedAt: new Date(), revokeReason: 'ADMIN_RESET' } });
 }
 
 /** Admin sets/resets a user's MPIN (staff otherwise can't pass MPIN-gated actions until they set one themselves). */
 export async function resetUserMpin(ctx: TenantContext, userId: number, mpin: string): Promise<void> {
+  assertNotImpersonating(ctx, "resetting a user's MPIN");
   const target = await scopedDb(ctx).user.findUnique({ where: { id: userId } });
   if (!target) throw new HttpError(404, 'NOT_FOUND', 'User not found');
   if (target.isOwner && !ctx.isOwner) throw new HttpError(403, 'FORBIDDEN', 'Only the owner can reset the owner');
-  if (ownerOrAdmin(target)) assertNotImpersonating(ctx, "the owner's or an admin's MPIN");
   await scopedDb(ctx).user.update({ where: { id: userId }, data: { mpinHash: await argon2.hash(mpin) } });
 }
 
@@ -440,6 +440,7 @@ export async function renameRole(ctx: TenantContext, roleId: number, name: strin
 }
 
 export async function deleteRole(ctx: TenantContext, roleId: number): Promise<void> {
+  assertNotImpersonating(ctx, 'deleting a role');
   await ownRole(ctx, roleId);
   const users = await prisma.user.count({ where: { roleId } });
   if (users) throw new HttpError(409, 'CONFLICT', `Role is assigned to ${users} user(s); move them to another role first`);

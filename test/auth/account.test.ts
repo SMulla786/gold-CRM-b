@@ -127,9 +127,9 @@ describe('set / change MPIN (ADM-07)', () => {
 });
 
 describe("impersonating Super Admin cannot change the owner's credentials (G2b B)", () => {
-  it("403 on /auth/password, /auth/mpin and the owner's reset-password / reset-mpin; staff resets still work; nothing changes", async () => {
+  it("403 on /auth/password, /auth/mpin and the owner's reset-password / reset-mpin, and a staff reset too (G7 closure); nothing changes", async () => {
     const u = await setup();
-    const staff = await createUser({ businessId: u.user.businessId, branchId: u.user.branchId, level: 'BRANCH_USER' });
+    const staff = await createUser({ businessId: u.user.businessId, branchId: u.user.branchId, level: 'BRANCH_USER', mpin: TEST_MPIN });
     const sa = await createUser({ level: 'SUPER_ADMIN' });
     const saAuth = bearer((await loginAs(sa.username)).token!);
     const imp = await api.post(`/api/platform/businesses/${u.user.businessId}/impersonate`).set('Authorization', saAuth).send({ reason: 'support ticket' });
@@ -145,7 +145,10 @@ describe("impersonating Super Admin cannot change the owner's credentials (G2b B
     const owner = await db.user.findUniqueOrThrow({ where: { id: u.user.id } });
     expect([await argon2.verify(owner.passwordHash, TEST_PASSWORD), await argon2.verify(owner.mpinHash!, TEST_MPIN)]).toEqual([true, true]);
 
-    expect((await api.post(`/api/admin/users/${staff.user.id}/reset-mpin`).set('Authorization', as).send({ mpin: '4321' })).status).toBe(204);
+    // a branch user's MPIN set during support would outlive the impersonation as well
+    const staffReset = await api.post(`/api/admin/users/${staff.user.id}/reset-mpin`).set('Authorization', as).send({ mpin: '4321' });
+    expect([staffReset.status, staffReset.body.error?.code]).toEqual([403, 'FORBIDDEN']);
+    expect(await argon2.verify((await db.user.findUniqueOrThrow({ where: { id: staff.user.id } })).mpinHash!, TEST_MPIN)).toBe(true);
     // the real owner (not impersonated) still can
     const ownerAuth = bearer((await loginAs(u.username)).token!);
     expect((await api.post('/api/auth/mpin').set('Authorization', ownerAuth).send({ password: TEST_PASSWORD, mpin: '9999' })).status).toBe(204);
