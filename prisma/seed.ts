@@ -1,11 +1,12 @@
 /**
- * Idempotent seed: states, permission catalog, system roles, plans, super admin.
+ * Idempotent seed: states, districts (LGD, prisma/data/README.md), permission catalog, system roles, plans, super admin.
  * SEED_DEMO=true also creates a demo business with a small branch tree and users (password = SEED_SUPERADMIN_PASSWORD).
  */
 import { PrismaClient, type Prisma } from '@prisma/client';
 import { INDIAN_STATES, MODULES, MODULE_KEYS } from '../src/shared';
 import { ensureBusinessDefaults } from '../src/modules/platform/service';
 import { seedPasswordHash } from './seed-password';
+import { importDistricts } from './districts';
 
 const prisma = new PrismaClient();
 const env = (k: string, d?: string) => {
@@ -212,6 +213,8 @@ async function seedDemo(passwordHash: string) {
 async function main() {
   const passwordHash = await seedPasswordHash(); // first: a refused password must leave the DB untouched
   await seedStates();
+  const d = await importDistricts(prisma, { apply: true });
+  console.log(`Districts: ${d.created} created, ${d.updated.length} updated, ${d.unchanged} unchanged, ${d.notInSource.length} kept (not in LGD)`);
   await seedPermissions();
   await seedSystemRoles();
   await seedPlans();

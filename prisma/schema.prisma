@@ -74,6 +74,8 @@ model District {
   id             Int             @id @default(autoincrement())
   stateId        Int
   name           String
+  /// Local Government Directory district code (prisma/data/README.md); null = created before the LGD import
+  lgdCode        Int?            @unique
   state          State           @relation(fields: [stateId], references: [id])
   businesses     Business[]
   signupRequests SignupRequest[]
