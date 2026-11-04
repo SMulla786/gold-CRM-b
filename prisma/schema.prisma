@@ -373,6 +373,8 @@ model Session {
   /// why it ended: null = token rotation (or legacy) — a replayed token then signs out every session (theft);
   /// PASSWORD_CHANGED / PASSWORD_RESET / ADMIN_RESET / BLOCKED / DELETED = ended on purpose, a replay is a plain 401
   revokeReason     String?
+  /// set on rotation: the successor session. A duplicate refresh within the grace window resolves to it (two tabs at once).
+  replacedById     String?
   impersonatorId   Int?
   userAgent        String?
   ip               String?

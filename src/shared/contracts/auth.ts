@@ -26,6 +26,8 @@ export interface BranchRef {
   path: string;
   depth: number;
   isAdminNode: boolean;
+  /** inactive: kept for history and read-only reports, never offered for new entries */
+  isActive: boolean;
 }
 
 export type PermissionMap = Record<string, Partial<Record<PermissionAction, boolean>>>;

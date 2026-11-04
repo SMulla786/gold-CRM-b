@@ -29,6 +29,8 @@ export const authRouter = Router();
 
 authRouter.post('/login', authRateLimit, async (req, res) => {
   const { response, refreshToken } = await svc.login(loginBody.parse(req.body), meta(req));
+  // signing in over this browser's cookie (account switch / sign in again) ends that session, so no late refresh revives it
+  await svc.logout(req.cookies?.[REFRESH_COOKIE]);
   res.cookie(REFRESH_COOKIE, refreshToken, cookieOpts).json(response);
 });
 

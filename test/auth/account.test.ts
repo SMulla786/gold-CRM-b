@@ -64,6 +64,8 @@ describe('change password (ADM-07)', () => {
     const a = await loginAs(u.username);
     const other = await loginAs(u.username);
     expect((await refresh(a.cookie)).status).toBe(200); // rotates a
+    // past the 5 s two-tab grace window (refresh-grace.test.ts covers the duplicate inside it)
+    await db.session.updateMany({ where: { replacedById: { not: null } }, data: { revokedAt: new Date(Date.now() - 6000) } });
     const replay = await refresh(a.cookie);
     expect([replay.status, replay.body.error.message]).toEqual([401, 'Refresh token reused']);
     expect((await refresh(other.cookie)).status).toBe(401);

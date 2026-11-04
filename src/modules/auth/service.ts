@@ -1,4 +1,4 @@
-import { createHash, randomBytes, randomInt } from 'node:crypto';
+import { createHash, createHmac, randomBytes, randomInt } from 'node:crypto';
 import argon2 from 'argon2';
 import { prisma } from '../../lib/prisma';
 import { env } from '../../config/env';
@@ -24,7 +24,8 @@ const toRef = (b: {
   path: string;
   depth: number;
   isAdminNode: boolean;
-}): BranchRef => ({ id: b.id, name: b.name, parentId: b.parentId, path: b.path, depth: b.depth, isAdminNode: b.isAdminNode });
+  isActive: boolean;
+}): BranchRef => ({ id: b.id, name: b.name, parentId: b.parentId, path: b.path, depth: b.depth, isAdminNode: b.isAdminNode, isActive: b.isActive });
 
 /** Creates a refresh session (stored hashed) and the access token, returns the raw refresh token for the cookie. */
 async function createSession(
@@ -60,32 +61,75 @@ export async function login(input: { login: string; password: string }, meta: Se
   return { response: { accessToken, user: me }, refreshToken };
 }
 
+/** Two tabs of one browser share the cookie and may refresh at the same moment: a duplicate within this window is not theft. */
+export const REFRESH_GRACE_MS = 5000;
+// The successor token is derived from the presented one (server-keyed), so a duplicate re-derives the SAME token without
+// any raw token ever being stored. Only a holder of the old token can derive it — and that holder could refresh anyway.
+const successorToken = (raw: string): string => createHmac('sha256', env.JWT_REFRESH_SECRET).update(`rt-successor:${raw}`).digest('base64url');
+
+type RefreshOutcome = { accessToken: string; refreshToken: string } | { fail: string; revokeAllOf?: number };
+
 export async function refresh(rawToken: string | undefined, meta: SessionMeta): Promise<{ accessToken: string; refreshToken: string }> {
   if (!rawToken) throw new HttpError(401, 'UNAUTHENTICATED', 'No refresh token');
-  const session = await prisma.session.findUnique({ where: { refreshTokenHash: hashToken(rawToken) } });
-  if (!session) throw new HttpError(401, 'UNAUTHENTICATED', 'Invalid refresh token');
-  if (session.revokedAt) {
-    // A session ended on purpose (password change/reset, block…) is just over — its other device must not sign out the rest.
-    if (session.revokeReason) throw new HttpError(401, 'UNAUTHENTICATED', 'Session ended');
-    // Reuse of an already-rotated token ⇒ treat as theft: revoke every live session for the user.
-    await prisma.session.updateMany({ where: { userId: session.userId, revokedAt: null }, data: { revokedAt: new Date() } });
-    throw new HttpError(401, 'UNAUTHENTICATED', 'Refresh token reused');
+  const nextToken = successorToken(rawToken);
+  const out = await prisma.$transaction(async (tx): Promise<RefreshOutcome> => {
+    // Row lock first: a simultaneous duplicate waits here until this rotation commits, then reads it below.
+    const hit = await tx.$queryRaw<{ id: string }[]>`SELECT id FROM "Session" WHERE "refreshTokenHash" = ${hashToken(rawToken)} FOR NO KEY UPDATE`;
+    const session = hit[0] ? await tx.session.findUnique({ where: { id: hit[0].id } }) : null;
+    if (!session) return { fail: 'Invalid refresh token' };
+    const user = await tx.user.findUnique({ where: { id: session.userId }, select: { status: true } });
+    const now = new Date();
+    if (session.revokedAt) {
+      // Ended on purpose (logout, password change/reset, block, impersonation end…): just over — no grace, no mass sign-out.
+      if (session.revokeReason) return { fail: 'Session ended' };
+      if (user?.status !== 'ACTIVE') return { fail: 'Account unavailable' };
+      const next = session.replacedById ? await tx.session.findUnique({ where: { id: session.replacedById } }) : null;
+      const inGrace = now.getTime() - session.revokedAt.getTime() <= REFRESH_GRACE_MS;
+      if (next && inGrace && !next.revokedAt && next.expiresAt > now && next.userAgent === (meta.userAgent ?? null)) {
+        return { accessToken: signAccessToken({ sub: next.userId, sid: next.id, imp: next.impersonatorId ?? undefined }), refreshToken: nextToken };
+      }
+      // its successor was ended on purpose (a logout / block racing this refresh): over, not theft
+      if (next?.revokeReason) return { fail: 'Session ended' };
+      // Reuse of an already-rotated token outside the window ⇒ treat as theft: revoke every live session for the user.
+      return { fail: 'Refresh token reused', revokeAllOf: session.userId };
+    }
+    if (session.expiresAt < now) return { fail: 'Refresh token expired' };
+    // Blocked/deleted users must not be able to keep refreshing a live session.
+    if (!user || user.status !== 'ACTIVE') {
+      await tx.session.update({ where: { id: session.id }, data: { revokedAt: now, revokeReason: user?.status ?? 'DELETED' } });
+      return { fail: 'Account unavailable' };
+    }
+    const next = await tx.session.create({
+      data: {
+        userId: session.userId,
+        refreshTokenHash: hashToken(nextToken),
+        expiresAt: new Date(now.getTime() + REFRESH_TTL_MS),
+        impersonatorId: session.impersonatorId ?? undefined,
+        userAgent: meta.userAgent ?? undefined,
+        ip: meta.ip ?? undefined,
+      },
+    });
+    await tx.session.update({ where: { id: session.id }, data: { revokedAt: now, replacedById: next.id } });
+    return { accessToken: signAccessToken({ sub: next.userId, sid: next.id, imp: next.impersonatorId ?? undefined }), refreshToken: nextToken };
+  });
+  if ('fail' in out) {
+    if (out.revokeAllOf) await prisma.session.updateMany({ where: { userId: out.revokeAllOf, revokedAt: null }, data: { revokedAt: new Date() } });
+    throw new HttpError(401, 'UNAUTHENTICATED', out.fail);
   }
-  if (session.expiresAt < new Date()) throw new HttpError(401, 'UNAUTHENTICATED', 'Refresh token expired');
-  // Blocked/deleted users must not be able to keep refreshing a live session.
-  const user = await prisma.user.findUnique({ where: { id: session.userId }, select: { status: true } });
-  if (!user || user.status !== 'ACTIVE') {
-    await prisma.session.update({ where: { id: session.id }, data: { revokedAt: new Date() } });
-    throw new HttpError(401, 'UNAUTHENTICATED', 'Account unavailable');
-  }
-  await prisma.session.update({ where: { id: session.id }, data: { revokedAt: new Date() } });
-  const { refreshToken, accessToken } = await createSession(session.userId, session.impersonatorId ?? null, meta);
-  return { accessToken, refreshToken };
+  return out;
 }
 
+/** Ends the cookie's session. If another tab's refresh rotated it a moment ago, ends the successor too — a logout is never undone. */
 export async function logout(rawToken: string | undefined): Promise<void> {
-  if (rawToken) {
-    await prisma.session.updateMany({ where: { refreshTokenHash: hashToken(rawToken), revokedAt: null }, data: { revokedAt: new Date() } });
+  if (!rawToken) return;
+  let where: { refreshTokenHash: string } | { id: string } = { refreshTokenHash: hashToken(rawToken) };
+  for (let hop = 0; hop < 3; hop++) {
+    // the guarded update waits on a refresh holding the row, then sees whether it rotated
+    const ended = await prisma.session.updateMany({ where: { ...where, revokedAt: null }, data: { revokedAt: new Date(), revokeReason: 'LOGOUT' } });
+    if (ended.count) return;
+    const s: { revokeReason: string | null; replacedById: string | null } | null = await prisma.session.findUnique({ where, select: { revokeReason: true, replacedById: true } });
+    if (!s?.replacedById || s.revokeReason) return;
+    where = { id: s.replacedById };
   }
 }
 
