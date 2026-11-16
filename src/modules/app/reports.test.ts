@@ -52,6 +52,19 @@ describe('reports dashboard', () => {
     expect(d.parties.customers).toBe(1);
   });
 
+  it('DASH-02 monthly series (the dashboard earnings bar = sales − purchases): this month is the last row, per bill kind', async () => {
+    const { business, root } = await createBusiness({ name: 'A' });
+    const p = await party(business.id);
+    await sellBill(business.id, root.id, p.id, { final: 10300 });
+    await db.bill.create({ data: { businessId: business.id, branchId: root.id, kind: 'PURCHASE', billType: 'ROUGH', billNo: 'PUR-1', seq: 1, partyId: p.id, billDate: businessDate(), sub: 4000, taxable: 4000, total: 4000, final: 4000.5, paid: 0 } });
+    const d = await dashboard(ctxFor(business.id, [root.id], root.id));
+    const cur = d.monthly.at(-1)!;
+    expect(cur.month).toBe(businessDate().toISOString().slice(0, 7));
+    expect([cur.sales, cur.purchases]).toEqual(['10300.00', '4000.50']);
+    expect(Number(cur.sales) - Number(cur.purchases)).toBe(6299.5);
+    expect(d.monthly.slice(0, -1).every((m) => m.sales === '0.00' && m.purchases === '0.00')).toBe(true);
+  });
+
   it('udhari receivable counts only positive party balances; cash from MONEY ledger', async () => {
     const { business, root } = await createBusiness({ name: 'A' });
     const owed = await party(business.id, 'Owes');
@@ -192,6 +205,25 @@ describe('reports activity + GST', () => {
     const ctx = ctxFor(business.id, [root.id], root.id);
     expect((await activity(ctx, { page: 1, pageSize: 20, q: 'ramesh' })).items.map((r) => r.entityId)).toEqual(['1']);
     expect((await activity(ctx, { page: 1, pageSize: 20, q: 'inv-1' })).items.map((r) => r.entityId)).toEqual(['2']);
+  });
+
+  it('activity entity + entityId filter = one record history (edit-history popup)', async () => {
+    const { business, root } = await createBusiness({ name: 'A' });
+    await db.activityLog.createMany({
+      data: [
+        { businessId: business.id, branchId: root.id, userId: 1, module: 'UDHAR', action: 'CREATED', entity: 'UdharTxn', entityId: '7', summary: 'Udhar #7' },
+        { businessId: business.id, branchId: root.id, userId: 1, module: 'UDHAR', action: 'EDITED', entity: 'UdharTxn', entityId: '7', summary: 'Edited udhar #7' },
+        { businessId: business.id, branchId: root.id, userId: 1, module: 'UDHAR', action: 'CREATED', entity: 'UdharTxn', entityId: '8', summary: 'Udhar #8' },
+        { businessId: business.id, branchId: root.id, userId: 1, module: 'GIRVI', action: 'CREATED', entity: 'GIRVI', entityId: '7', summary: 'Girvi #7' },
+      ],
+    });
+    const ctx = ctxFor(business.id, [root.id], root.id);
+    const res = await activity(ctx, { page: 1, pageSize: 20, entity: 'UdharTxn', entityId: '7' });
+    expect(res.items.map((r) => r.summary)).toEqual(['Edited udhar #7', 'Udhar #7']);
+    expect((await activity(ctx, { page: 1, pageSize: 20, entity: 'GIRVI' })).total).toBe(1);
+    // other business's rows stay out even with a matching entity
+    const B = await createBusiness({ name: 'B' });
+    expect((await activity(ctxFor(B.business.id, [B.root.id], B.root.id), { page: 1, pageSize: 20, entity: 'UdharTxn', entityId: '7' })).total).toBe(0);
   });
 
   it('GST register lists ACTIVE GST bills with HSN codes; ROUGH excluded', async () => {

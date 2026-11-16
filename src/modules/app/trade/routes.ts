@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { requireMpin, requirePermission } from '../../../middleware/guards';
-import { bhavBookingBody, bhavListQuery, buySellBody, buySellListQuery, exchangeBody, exchangeListQuery, id as idSchema, kachaBalanceQuery, kachaListQuery, kachaProcessBody } from '../../../shared';
+import { bhavBookingBody, bhavListQuery, buySellBody, buySellListQuery, exchangeBody, exchangeListQuery, id as idSchema, kachaBalanceQuery, kachaListQuery, kachaProcessBody, kachaSummaryQuery } from '../../../shared';
 import * as exchange from './exchange';
 import * as kacha from './kacha';
 import * as buysell from './buysell';
@@ -28,6 +28,8 @@ tradeRouter.delete('/exchange/:id', requirePermission(EX, 'delete'), requireMpin
 tradeRouter.post('/kacha/process', requirePermission(EX, 'edit'), requireMpin, async (req, res) => res.status(201).json(await kacha.processKacha(req.ctx!, kachaProcessBody.parse(req.body))));
 tradeRouter.get('/kacha', requirePermission(EX_LIST, 'view'), async (req, res) => res.json(await kacha.listKacha(req.ctx!, kachaListQuery.parse(req.query))));
 tradeRouter.get('/kacha/balance', requirePermission(EX_LIST, 'view'), async (req, res) => res.json(await kacha.kachaBalanceCard(req.ctx!, kachaBalanceQuery.parse(req.query))));
+tradeRouter.get('/kacha/summary', requirePermission(EX_LIST, 'view'), async (req, res) => res.json(await kacha.kachaSummary(req.ctx!, kachaSummaryQuery.parse(req.query))));
+tradeRouter.get('/kacha/:id', requirePermission(EX_LIST, 'view'), async (req, res) => res.json(await kacha.getKacha(req.ctx!, idSchema.parse(req.params.id))));
 tradeRouter.post('/kacha/:id/revert', requirePermission(EX, 'edit'), requireMpin, async (req, res) => res.json(await kacha.revertKacha(req.ctx!, idSchema.parse(req.params.id))));
 
 // ───────────── Buy-sell ─────────────

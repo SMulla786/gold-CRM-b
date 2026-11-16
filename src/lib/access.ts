@@ -22,9 +22,14 @@ export async function loadAccess(businessId: number, status: 'ACTIVE' | 'SUSPEND
   });
   const displaySub = activeSub ?? (await prisma.subscription.findFirst({ where: { businessId }, orderBy: { endsAt: 'desc' }, include: { plan: true } }));
   const active = !!activeSub && status === 'ACTIVE';
+  // Ads: only the term in effect NOW (not the latest-ending or a queued one) and only its own snapshot — never the plan's price.
+  const current = active
+    ? await prisma.subscription.findFirst({ where: { businessId, status: 'ACTIVE', startsAt: { lte: now }, endsAt: { gt: now } }, orderBy: { startsAt: 'desc' }, select: { adSupported: true } })
+    : null;
   const { modules, subscription } = resolveAccess(
     active,
     displaySub ? { planName: displaySub.plan.name, endsAt: displaySub.endsAt, modules: displaySub.modules } : null,
+    current?.adSupported === true,
   );
   return { active, readOnly: !active, modules, subscription, limits: activeSub ? { maxBranches: activeSub.maxBranches, maxUsers: activeSub.maxUsers } : null };
 }

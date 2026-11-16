@@ -5,9 +5,10 @@
 import { z } from 'zod';
 import { STOCK_CLASSES } from '../enums';
 import { id, pageQuery } from './common';
-import { CHARGE_UNITS } from './inventory';
+import { CHARGE_UNITS, stockRowInput, stockStoneInput } from './inventory';
 import { decimalInput, METALS, PARTY_TYPES } from './masters';
 import type { PartyRefDto } from './masters';
+import type { StockStoneDto } from './inventory';
 
 export const BILL_KINDS = ['SELL', 'PURCHASE'] as const;
 export type BillKind = (typeof BILL_KINDS)[number];
@@ -55,6 +56,15 @@ export const billLineInput = z.object({
   saleRate: decimalInput.optional(),
   saleLabour: decimalInput.optional(),
   saleLabourUnit: z.enum(CHARGE_UNITS).optional(),
+  /** PURCHASE (group C): stone elements saved on the created stock item. Descriptive — stoneCharge stays the line's stone money. Ignored on SELL. */
+  stones: z.array(stockStoneInput).max(20).optional(),
+  /** PURCHASE: HUID / RFID EPC / remark written onto the created stock item (same rules as New Stock). Ignored on SELL. */
+  huid: stockRowInput.shape.huid,
+  epcCode: stockRowInput.shape.epcCode,
+  remarks: stockRowInput.shape.remarks,
+  /** PURCHASE: the supplier's own item name / tag no. (original "Supp item" / "Supp tag"); kept on the bill line, descriptive */
+  supplierItem: z.string().trim().max(120).optional(),
+  supplierTag: z.string().trim().max(30).optional(),
 });
 export type BillLineInput = z.infer<typeof billLineInput>;
 
@@ -71,6 +81,8 @@ export const billPaymentInput = z.discriminatedUnion('mode', [
     /** per settings rate unit; amount = fine × rate / unit */
     rate: decimalInput,
     remark: z.string().max(200).optional(),
+    /** group (C): jewellery type of the received metal (global or own business list); descriptive, sell/purchase bills only */
+    jewelleryTypeId: id.optional(),
   }),
 ]);
 export type BillPaymentInput = z.infer<typeof billPaymentInput>;
@@ -101,8 +113,10 @@ export const billBody = z
     gstPercent: z.coerce.number().min(0).max(28).default(3),
     payments: z.array(billPayInput).max(20).default([]),
     keepBalanceAs: z.enum(KEEP_BALANCE_AS).default('MONEY'),
-    /** required when keepBalanceAs is GOLD/SILVER; per settings rate unit */
+    /** required when keepBalanceAs is GOLD/SILVER; per the shop rate unit at save (frozen on the bill: keepRateUnitGrams) */
     keepRate: decimalInput.optional(),
+    /** BILL-15 R6 (edit only): true to confirm changing a stored keep rate / kept metal; without it such an edit is 409 KEEP_RATE_CHANGE */
+    keepRateChange: z.boolean().optional(),
     /** sent when the server answered PAN_REQUIRED; saved onto the party */
     pan: z
       .string()
@@ -177,6 +191,15 @@ export interface BillLineDto {
   metalAmount: string;
   labourAmount: string;
   total: string;
+  /** PURCHASE: supplier's item name / tag no. (null on SELL) */
+  supplierItem?: string | null;
+  supplierTag?: string | null;
+  /** PURCHASE: the created stock item's HUID / RFID EPC / remark (getBill only) */
+  huid?: string | null;
+  epcCode?: string | null;
+  remarks?: string | null;
+  /** PURCHASE (INV-12): the created stock item's stone elements (getBill only) */
+  stones?: StockStoneDto[];
 }
 
 export interface BillPaymentDto {
@@ -194,6 +217,8 @@ export interface BillPaymentDto {
   remark: string | null;
   /** TASK-98: SCHEME payments — the redeemed enrollment */
   schemeEnrollmentId?: number | null;
+  /** group (C) METAL payments */
+  jewelleryType?: { id: number; name: string } | null;
   txnDate: string;
   isActive: boolean;
   createdAt: string;
@@ -210,6 +235,8 @@ export interface BillListItemDto {
   itemCount: number;
   /** TASK-83: e.g. "2× Ring, 1× Chain" — filled by the pending-bills list only */
   itemsSummary?: string;
+  /** G7: the order this bill delivers (bill list) — deleting it always returns the stock to the order */
+  orderId?: number | null;
   final: string;
   paid: string;
   /** final − paid (negative = advance) */
@@ -236,6 +263,8 @@ export interface BillDto extends BillListItemDto {
   total: string;
   round: string;
   keepRate: string | null;
+  /** BILL-15 R2: grams per keepRate unit frozen on the bill (null: MONEY, or saved before the unit was stored) */
+  keepRateUnitGrams: string | null;
   remark: string | null;
   deletedWithStock: boolean | null;
   /** TASK-97 GST (always filled by the server) */

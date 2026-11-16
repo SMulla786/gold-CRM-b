@@ -3,8 +3,10 @@ import { prisma } from '../../../lib/prisma';
 import { scopedDb } from '../../../lib/db';
 import * as ledger from '../../../lib/ledger';
 import * as udhar from '../../../lib/udhar';
+import { poolGuard, type Pool } from '../../../lib/kacha';
 import { logActivity } from '../../../lib/activity';
 import { HttpError } from '../../../middleware/error';
+import { assertDocBranchActive } from '../../../middleware/context';
 import type { TenantContext } from '../../../middleware/context';
 import { computeLine, RATE_UNIT_GRAMS } from '../../../shared';
 import type { OrderDto, OrderItemDto, KarigarIssueDto, BillPaymentInput, BulkCancelOrdersResultDto, OrderNextNoDto } from '../../../shared';
@@ -151,8 +153,12 @@ export async function addOrderAdvance(ctx: TenantContext, id: number, payments: 
   if (!order) throw new HttpError(404, 'NOT_FOUND', 'Order not found');
   if (order.status === 'DELIVERED' || order.status === 'CANCELLED') throw new HttpError(409, 'CONFLICT', `Cannot add an advance to a ${order.status.toLowerCase()} order`);
   await prisma.$transaction(async (tx) => {
+    // claim first: the status-guarded row update locks the order, so a concurrent advance / cancel / deliver waits;
+    // the advance is incremented by what was actually posted (never read-then-write, which lost one of two advances)
+    const claim = await tx.order.updateMany({ where: { id, status: { notIn: ['DELIVERED', 'CANCELLED'] } }, data: { advance: { increment: 0 } } });
+    if (claim.count !== 1) throw new HttpError(409, 'CONFLICT', 'Order is no longer open for an advance');
     const added = await postAdvances(tx, ctx, id, order.branchId, ledger.businessDate(), payments);
-    await tx.order.update({ where: { id }, data: { advance: D(order.advance).plus(added) } });
+    await tx.order.update({ where: { id }, data: { advance: { increment: added } } });
     await logActivity(tx, ctx, { module: 'ORDER', action: 'EDITED', entity: 'Order', entityId: String(id), summary: `Advance added to order #${order.orderNo}` });
   });
   return getOrder(ctx, id);
@@ -162,6 +168,7 @@ export async function cancelOrder(ctx: TenantContext, id: number): Promise<void>
   const sdb = scopedDb(ctx);
   const order = await sdb.order.findUnique({ where: { id }, include: { items: true } });
   if (!order) throw new HttpError(404, 'NOT_FOUND', 'Order not found');
+  await assertDocBranchActive(ctx, order); // G7: an inactive branch takes no new writes, whatever X-Branch-Id says
   if (order.status !== 'PENDING' && order.status !== 'IN_PROCESS') throw new HttpError(409, 'CONFLICT', `A ${order.status.toLowerCase()} order cannot be cancelled`);
   if (order.items.some((it) => it.status === 'ASSIGNED')) throw new HttpError(409, 'CONFLICT', 'Receive or close the open karigar issue before cancelling');
   await prisma.$transaction(async (tx) => {
@@ -213,13 +220,22 @@ function docNoOf(kw: string): number | null {
 
 export async function listOrders(ctx: TenantContext, q: { page: number; pageSize: number; q?: string; status?: string; statuses?: string[]; partyId?: number }): Promise<{ items: OrderDto[]; total: number; page: number; pageSize: number }> {
   const sdb = scopedDb(ctx);
-  // keyword: order no / party name / party mobile
+  // keyword: order no / party name / party mobile / item name (task99)
   const kw = q.q?.trim();
   let kwWhere = {};
   if (kw) {
-    const partyIds = (await sdb.party.findMany({ where: { OR: [{ name: { contains: kw, mode: 'insensitive' } }, { mobile: { contains: kw } }] }, select: { id: true } })).map((p) => p.id);
+    const [parties, names] = await Promise.all([
+      sdb.party.findMany({ where: { OR: [{ name: { contains: kw, mode: 'insensitive' } }, { mobile: { contains: kw } }] }, select: { id: true } }),
+      sdb.itemName.findMany({ where: { name: { contains: kw, mode: 'insensitive' } }, select: { id: true } }),
+    ]);
     const no = docNoOf(kw);
-    kwWhere = { OR: [{ partyId: { in: partyIds } }, ...(no != null ? [{ orderNo: no }] : [])] };
+    kwWhere = {
+      OR: [
+        { partyId: { in: parties.map((p) => p.id) } },
+        ...(names.length ? [{ items: { some: { itemNameId: { in: names.map((n) => n.id) } } } }] : []),
+        ...(no != null ? [{ orderNo: no }] : []),
+      ],
+    };
   }
   // statuses (any of) narrows further by status when both are given
   const statuses = q.statuses?.length ? (q.status ? q.statuses.filter((x) => x === q.status) : q.statuses) : null;
@@ -265,6 +281,11 @@ export async function createKarigarIssue(ctx: TenantContext, body: KarigarIssueB
     const claim = await tx.orderItem.updateMany({ where: { id: { in: body.orderItemIds }, status: 'PENDING' }, data: { status: 'ASSIGNED', karigarIssueId: issue.id } });
     if (claim.count !== new Set(body.orderItemIds).size) throw new HttpError(409, 'CONFLICT', 'Some items were just assigned to another issue');
     await tx.order.updateMany({ where: { id: { in: [...new Set(items.map((i) => i.orderId))] }, status: 'PENDING' }, data: { status: 'IN_PROCESS' } });
+    // G7 D-i: the fine metal handed over comes out of the branch's BULLION pool — guarded like every draw (ACC-05 / G5 order: document rows, then pools)
+    const pools: Pool[] = [];
+    if (body.goldFine > 0) pools.push({ metal: 'GOLD', form: 'BULLION' });
+    if (body.silverFine > 0) pools.push({ metal: 'SILVER', form: 'BULLION' });
+    const bullion = await poolGuard(tx, branchId, pools);
     // samples go out with the issue atomically — any one no longer IN_HAND/RETURNED → 409 and the whole issue rolls back
     if (samples.length) await issueSamplesToKarigarTx(tx, ctx, samples, { karigarId: body.karigarId, karigarName: karigar.name, karigarIssueId: issue.id, issueNo });
 
@@ -275,6 +296,7 @@ export async function createKarigarIssue(ctx: TenantContext, body: KarigarIssueB
     if (body.cash > 0) ledRows.push({ branchId, txnDate: issueDate, asset: 'MONEY', direction: 'OUT', amount: body.cash, source: 'KARIGAR_ISSUE', sourceId, narration: 'Karigar cash issue' });
     if (body.online > 0) ledRows.push({ branchId, txnDate: issueDate, asset: 'MONEY', direction: 'OUT', bankAccountId: body.bankAccountId ?? null, amount: body.online, source: 'KARIGAR_ISSUE', sourceId, narration: 'Karigar online issue' });
     if (ledRows.length) await ledger.post(tx, lctx, ledRows);
+    await bullion(); // 409 BULLION_SHORT when the pool can't cover the issue
     // karigar now owes the shop the material + money handed over
     const amount = D(body.cash).plus(body.online);
     if (!(amount.isZero() && body.goldFine === 0 && body.silverFine === 0)) {
@@ -471,8 +493,9 @@ function paymentDto(p: any) {
 // ───────────── Design file (TASK-97) ─────────────
 
 export async function saveOrderDesign(ctx: TenantContext, id: number, buffer: Buffer): Promise<void> {
-  const order = await scopedDb(ctx).order.findUnique({ where: { id }, select: { designUrl: true } });
+  const order = await scopedDb(ctx).order.findUnique({ where: { id }, select: { designUrl: true, branchId: true } });
   if (!order) throw new HttpError(404, 'NOT_FOUND', 'Order not found');
+  await assertDocBranchActive(ctx, order); // G7: an inactive branch takes no new writes, whatever X-Branch-Id says
   await replaceFile(ctx, 'orders', buffer, order.designUrl, (rel) => scopedDb(ctx).order.update({ where: { id }, data: { designUrl: rel } }), true);
 }
 
@@ -481,8 +504,9 @@ export async function orderDesignPath(ctx: TenantContext, id: number): Promise<s
 }
 
 export async function removeOrderDesign(ctx: TenantContext, id: number): Promise<void> {
-  const order = await scopedDb(ctx).order.findUnique({ where: { id }, select: { designUrl: true } });
+  const order = await scopedDb(ctx).order.findUnique({ where: { id }, select: { designUrl: true, branchId: true } });
   if (!order) throw new HttpError(404, 'NOT_FOUND', 'Order not found');
+  await assertDocBranchActive(ctx, order); // G7: an inactive branch takes no new writes, whatever X-Branch-Id says
   if (!order.designUrl) return;
   await scopedDb(ctx).order.update({ where: { id }, data: { designUrl: null } });
   await removeFile(order.designUrl);

@@ -24,6 +24,8 @@ const IE_SOURCE_MAP: Record<IeSourceType, LedgerSource[]> = {
 const UNIT: Record<LedgerAsset, 'amount' | 'fine' | 'pcs'> = { MONEY: 'amount', GOLD: 'fine', SILVER: 'fine', STONE: 'pcs', ARTIFICIAL: 'pcs', FRANCHISE: 'pcs' };
 
 /** Admin with X-Branch-Id:all sees the whole subtree; otherwise just the active branch (own branch for branch users). */
+/** Ledger sources whose sourceId starts with the bill id (same set the frontend links to /app/billing/view/:id). */
+const BILL_SOURCES = new Set<string>(['SELL_BILL', 'PURCHASE_BILL', 'ORDER_SELL_BILL', 'ORDER_PURCHASE_BILL']);
 const branchFilter = (ctx: TenantContext): number[] => (ctx.activeBranchId != null ? [ctx.activeBranchId] : ctx.branchIds);
 
 const dec = (d: unknown): string | null => (d != null ? String(d) : null);
@@ -218,7 +220,9 @@ export async function updateIncomeExpense(ctx: TenantContext, id: number, body: 
   const lctx = { businessId: ctx.businessId!, branchIds: ctx.branchIds, userId: ctx.userId };
 
   await prisma.$transaction(async (tx) => {
-    await tx.incomeExpense.update({ where: { id }, data: { type: body.type, reason: body.reason, cash: body.cash, online: body.online, bankAccountId: body.online > 0 ? body.bankAccountId! : null, gold: body.gold, silver: body.silver, remark: body.remark ?? null } });
+    // G7 audit L4: the first write (the row lock) only takes a row that is still not deleted — a delete committed meanwhile makes this a 404
+    const edited = await tx.incomeExpense.updateMany({ where: { id, isDeleted: false }, data: { type: body.type, reason: body.reason, cash: body.cash, online: body.online, bankAccountId: body.online > 0 ? body.bankAccountId! : null, gold: body.gold, silver: body.silver, remark: body.remark ?? null } });
+    if (edited.count !== 1) throw new HttpError(404, 'NOT_FOUND', 'Entry not found');
     await ledger.reverse(tx, lctx, { source: 'INCOME_EXPENSE', sourceId: String(id) });
     await ledger.post(tx, lctx, ieLedgerRows(h.branchId, txnDate, body, String(id)));
     await logActivity(tx, ctx, { module: 'INCOME_EXPENSE', action: 'EDITED', entity: 'IncomeExpense', entityId: String(id), summary: `${body.type}: ${body.reason}` });
@@ -500,8 +504,8 @@ export async function getDayBookAllInOne(ctx: TenantContext, q: { page: number; 
     sdb.ledgerEntry.findMany({ where: scoped, select: { source: true, sourceId: true, txnDate: true, partyId: true, narration: true }, distinct: ['source', 'sourceId', 'txnDate'] }),
     // opening before `from` — same rule (scope + source filter) as getDayBook
     sdb.ledgerEntry.groupBy({ by: ['asset', 'direction'], where: { ...scope, asset: { in: [...RUN] }, txnDate: { lt: from } }, ...sum }),
-    // per-document sums from `from` up to the page's oldest date (covers every document at or below the page)
-    sdb.ledgerEntry.groupBy({ by: ['source', 'sourceId', 'txnDate', 'asset', 'direction'], where: { ...where, asset: { in: [...RUN] }, txnDate: { gte: from, lte: page.at(-1)!.txnDate } }, ...sum }),
+    // per-document sums from `from` up to the page's newest date (covers every document on and below the page)
+    sdb.ledgerEntry.groupBy({ by: ['source', 'sourceId', 'txnDate', 'asset', 'direction'], where: { ...where, asset: { in: [...RUN] }, txnDate: { gte: from, lte: page[0]!.txnDate } }, ...sum }),
   ]);
 
   // running balance: rows are newest first, so walk from the oldest document up to the page's first row
@@ -569,6 +573,7 @@ export async function getDayBookAllInOne(ctx: TenantContext, q: { page: number; 
       txnDate: dateOnly(d.txnDate),
       source: d.source as LedgerSource,
       sourceId: d.sourceId,
+      billId: BILL_SOURCES.has(d.source) ? parseInt(d.sourceId, 10) : null, // '<billId>' or '<billId>-P<n>'
       party: rep?.partyId != null ? { id: rep.partyId, name: partyNames.get(rep.partyId) ?? '' } : null,
       narration: rep?.narration ?? null,
       assets,

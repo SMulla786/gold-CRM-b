@@ -4,12 +4,13 @@ import { scopedDb } from '../../../lib/db';
 import * as ledger from '../../../lib/ledger';
 import * as udhar from '../../../lib/udhar';
 import { logActivity } from '../../../lib/activity';
+import { poolGuard, poolsOf, type Pool, type PoolUse } from '../../../lib/kacha';
 import { HttpError } from '../../../middleware/error';
-import { computeBill, computeLine, fineWeight, metalToMoney, moneyToMetal, netWeight, PAN_CASH_LIMIT, RATE_UNIT_GRAMS } from '../../../shared';
+import { computeBill, computeLine, fineWeight, metalToMoney, moneyToMetal, netWeight, PAN_CASH_LIMIT, RATE_UNIT_GRAMS, stoneTotal } from '../../../shared';
 import type { BillBody, BillDto, BillKind, BillLineDto, BillListItemDto, BillPayInput, BillPaymentDto, BillType, LedgerSource, Paged, PartyRefDto, StockClass } from '../../../shared';
 import type { TenantContext } from '../../../middleware/context';
 import { getSettings } from '../service';
-import { nextTagNo } from '../inventory';
+import { nextTagNo, stoneDto } from '../inventory';
 import { docKey, formatBillNo, seriesStart } from './numbering';
 import { redeemInTx, redeemRateFor, reopenForBill } from '../schemes/service';
 
@@ -56,6 +57,12 @@ export async function computePayments(ctx: TenantContext, payments: BillPayInput
     const have = new Set((await scopedDb(ctx).bankAccount.findMany({ where: { id: { in: bankIds } }, select: { id: true } })).map((b) => b.id));
     for (const id of bankIds) if (!have.has(id)) throw new HttpError(404, 'NOT_FOUND', 'Bank account not found');
   }
+  const jtIds = [...new Set(payments.flatMap((p) => (p.mode === 'METAL' && p.jewelleryTypeId != null ? [p.jewelleryTypeId] : [])))];
+  if (jtIds.length) {
+    // global list (businessId null) or this business's own types
+    const have = new Set((await prisma.jewelleryType.findMany({ where: { id: { in: jtIds }, OR: [{ businessId: null }, { businessId: ctx.businessId! }] }, select: { id: true } })).map((t) => t.id));
+    for (const id of jtIds) if (!have.has(id)) throw new HttpError(404, 'NOT_FOUND', 'Jewellery type not found');
+  }
   return payments.map((p): PayCalc => {
     if (p.mode === 'CASH') return { input: p, amount: String(p.amount) };
     if (p.mode === 'ONLINE') return { input: p, amount: String(p.amount), bankAccountId: p.bankAccountId };
@@ -72,6 +79,31 @@ function paymentLedgerRow(pc: PayCalc, paymentId: number, billId: number, kind: 
   const base = { branchId, txnDate, direction, source: billSource(kind), sourceId: `${billId}-P${paymentId}` } as const;
   if (pc.input.mode === 'METAL') return { ...base, asset: pc.metal!, metalForm: pc.metalForm, gross: pc.gross, net: pc.net, fine: pc.fine, amount: pc.amount, narration: 'Bill metal payment' };
   return { ...base, asset: 'MONEY', bankAccountId: pc.bankAccountId ?? null, amount: pc.amount, narration: 'Bill payment' };
+}
+
+// ───────────── ACC-05 / G5 pool guard (lib/kacha poolGuard) ─────────────
+
+/**
+ * ACC-05 / G5: a bill write may not take a KACHA or BULLION pool below zero (lib/kacha poolGuard: locks before the
+ * writes, checks after, same transaction). For a write that reverses this bill's own metal IN (delete / edit of a sell
+ * bill), the 409 names the later activity that drew that metal.
+ */
+const billPools = (tx: Prisma.TransactionClient, branchId: number, pays: { metal?: string | null; metalForm?: string | null }[][], own?: { kind: BillKind; billId: number }) =>
+  poolGuard(tx, branchId, poolsOf(...pays), own ? (pool) => laterDraws(tx, branchId, pool, own) : undefined);
+
+/** Metal of this pool drawn after this bill's own metal came in (still standing: not a reversal, not reversed). */
+async function laterDraws(tx: Prisma.TransactionClient, branchId: number, pool: Pool, own: { kind: BillKind; billId: number }): Promise<PoolUse[]> {
+  const first = await tx.ledgerEntry.findFirst({
+    where: { branchId, asset: pool.metal, metalForm: pool.form, direction: 'IN', source: billSource(own.kind), sourceId: { startsWith: `${own.billId}-P` }, reversalOfId: null },
+    orderBy: { createdAt: 'asc' }, select: { createdAt: true },
+  });
+  if (!first) return [];
+  const draws = await tx.ledgerEntry.findMany({
+    where: { branchId, asset: pool.metal, metalForm: pool.form, direction: 'OUT', reversalOfId: null, createdAt: { gt: first.createdAt } },
+    orderBy: { createdAt: 'asc' }, select: { id: true, source: true, sourceId: true, txnDate: true, fine: true },
+  });
+  const reversed = new Set((await tx.ledgerEntry.findMany({ where: { reversalOfId: { in: draws.map((d) => d.id) } }, select: { reversalOfId: true } })).map((r) => r.reversalOfId));
+  return draws.filter((d) => !reversed.has(d.id)).slice(0, 5).map((r) => ({ source: r.source, sourceId: r.sourceId, txnDate: r.txnDate.toISOString().slice(0, 10), fine: D(r.fine ?? 0).toFixed(3) }));
 }
 
 export const sumAmounts = (pcs: PayCalc[]) => pcs.reduce((a, pc) => a.plus(D(pc.amount)), new Prisma.Decimal(0));
@@ -112,7 +144,8 @@ async function postNoCashPays(tx: Prisma.TransactionClient, ctx: TenantContext, 
   await ledger.assertDaysOpen(tx, lctx, [{ branchId: bill.branchId, txnDate }]);
   const advance = special.filter((pc) => pc.input.mode === 'UDHAR_ADVANCE').reduce((a, pc) => a.plus(D(pc.amount)), new Prisma.Decimal(0));
   if (advance.gt(0)) {
-    await tx.$queryRaw`SELECT id FROM "Party" WHERE id = ${bill.partyId} FOR UPDATE`; // serialize concurrent uses of the same credit
+    // NO KEY UPDATE, not UPDATE: this tx already holds FOR KEY SHARE on the party (FK of the bill it inserted), so FOR UPDATE deadlocks
+    await tx.$queryRaw`SELECT id FROM "Party" WHERE id = ${bill.partyId} FOR NO KEY UPDATE`; // serialize concurrent uses of the same credit
     const sum = await tx.udharEntry.aggregate({ where: { businessId: ctx.businessId!, partyId: bill.partyId, NOT: { source: 'SELL_BILL', sourceId: String(bill.id) } }, _sum: { amount: true } });
     const credit = Prisma.Decimal.max(D(sum._sum.amount).negated(), 0);
     if (advance.gt(credit)) throw new HttpError(409, 'CONFLICT', `Udhar advance available is ₹${credit.toFixed(2)}`, { code: 'OVER_BALANCE' });
@@ -228,12 +261,14 @@ interface Prepared {
   billCalc: ReturnType<typeof computeBill>;
   bal: Prisma.Decimal;
   keepWeight: string | null;
+  /** grams per keepRate unit used for keepWeight (null on MONEY) */
+  keepUnitGrams: number | null;
   billDate: Date;
   dueDate: Date | null;
 }
 
 /** Pre-tx read + validation shared by create and edit: party, interState, recomputed lines/payments, PAN + rate-limit checks, totals, keep weight, dates. */
-async function prepareBill(ctx: TenantContext, body: BillBody, branchId: number, s: Settings, allowSold: Set<number> = new Set()): Promise<Prepared> {
+async function prepareBill(ctx: TenantContext, body: BillBody, branchId: number, s: Settings, allowSold: Set<number> = new Set(), storedKeepUnit?: number): Promise<Prepared> {
   const sdb = scopedDb(ctx);
   const party = await sdb.party.findUnique({ where: { id: body.partyId } });
   if (!party) throw new HttpError(404, 'NOT_FOUND', 'Party not found');
@@ -266,8 +301,10 @@ async function prepareBill(ctx: TenantContext, body: BillBody, branchId: number,
   const gstExempt = numbering.gstOnRemainingMetal ? payCalcs.filter((p) => p.input.mode === 'METAL').reduce((a, p) => a.plus(D(p.amount)), new Prisma.Decimal(0)) : new Prisma.Decimal(0);
   const billCalc = computeBill({ lineTotals: lines.map((r) => r.calc.total), discount: body.discount, discountUnit: body.discountUnit, gstPercent: body.billType === 'ROUGH' ? 0 : body.gstPercent, interState, gstExemptAmount: gstExempt, roundTo: 1 });
   const bal = D(billCalc.final).minus(paid);
-  const keepWeight = bal.gt(0) && body.keepBalanceAs !== 'MONEY' ? moneyToMetal(bal, body.keepRate!, metalUnitGrams(body.keepBalanceAs, s)) : null;
-  return { party, interState, lines, payCalcs, paid, billCalc, bal, keepWeight, billDate: ledger.businessDate(body.billDate ?? new Date()), dueDate: body.dueDate ? ledger.businessDate(body.dueDate) : null };
+  // BILL-15 R2: an edit keeps the unit the bill was saved with; a new keep uses the current shop unit
+  const keepUnitGrams = body.keepBalanceAs === 'MONEY' ? null : (storedKeepUnit ?? metalUnitGrams(body.keepBalanceAs, s));
+  const keepWeight = bal.gt(0) && keepUnitGrams != null ? moneyToMetal(bal, body.keepRate!, keepUnitGrams) : null;
+  return { party, interState, lines, payCalcs, paid, billCalc, bal, keepWeight, keepUnitGrams, billDate: ledger.businessDate(body.billDate ?? new Date()), dueDate: body.dueDate ? ledger.businessDate(body.dueDate) : null };
 }
 
 /** The line/stock/ledger/payment/udhar writes applied onto an existing Bill row (no numbering) — shared by create and edit. Carries the TASK-30b in-tx concurrency guards. */
@@ -285,8 +322,8 @@ async function writeBillContents(tx: Prisma.TransactionClient, ctx: TenantContex
       if (sold.count !== 1) throw new HttpError(409, 'CONFLICT', `Stock item ${r.stockItem.id} is no longer AVAILABLE`);
       stockItemId = r.stockItem.id;
     } else if (r.action === 'SELL_LOOSE') {
-      const taken = await tx.stockItem.updateMany({ where: { id: r.stockItem.id, status: { in: [...sellable(r.stockItem.id)] }, gross: { gte: r.gross }, less: { gte: r.less }, pcs: { gte: r.pcs } }, data: { gross: { decrement: r.gross }, less: { decrement: r.less }, pcs: { decrement: r.pcs } } });
-      if (taken.count !== 1) throw new HttpError(409, 'CONFLICT', `Stock item ${r.stockItem.id} does not hold that much`);
+      const taken = await tx.stockItem.updateMany({ where: { id: r.stockItem.id, status: { in: [...sellable(r.stockItem.id)] }, branchId, gross: { gte: r.gross }, less: { gte: r.less }, pcs: { gte: r.pcs } }, data: { gross: { decrement: r.gross }, less: { decrement: r.less }, pcs: { decrement: r.pcs } } });
+      if (taken.count !== 1) throw new HttpError(409, 'CONFLICT', `Stock item ${r.stockItem.id} does not hold that much in this branch`);
       const it = await tx.stockItem.findUniqueOrThrow({ where: { id: r.stockItem.id } });
       const net = Prisma.Decimal.max(D(it.gross).minus(it.less), 0);
       const fine = net.times(D(it.tunch)).div(100).times(D(it.wastage).div(100).plus(1));
@@ -298,9 +335,12 @@ async function writeBillContents(tx: Prisma.TransactionClient, ctx: TenantContex
       // TASK-98 "default sale value": optional sale rate/labour go onto the stock item only; purchaseCost stays the bill line total.
       const created = await tx.stockItem.create({
         data: {
-          businessId: ctx.businessId!, branchId, stockClass: r.stockClass, groupId: r.itemName.groupId, itemNameId: r.itemName.id, method, tagNo, huid: null, karatCode: r.karatCode,
+          businessId: ctx.businessId!, branchId, stockClass: r.stockClass, groupId: r.itemName.groupId, itemNameId: r.itemName.id, method, tagNo, huid: r.input.huid ?? null, karatCode: r.karatCode,
           pcs: r.pcs, gross: r.gross, less: r.less, net: r.calc.net, tunch: r.tunch, wastage: r.wastage, fine: r.calc.fine, stoneCharge: r.input.stoneCharge, labour: r.input.saleLabour ?? r.input.labour,
           labourUnit: r.input.saleLabourUnit ?? r.input.labourUnit, other: r.input.other, rate: r.input.saleRate ?? (r.input.rate || null), purchaseCost: r.calc.total, status: 'AVAILABLE', source: 'PURCHASE_BILL', sourceId: String(billId), createdById: ctx.userId,
+          remarks: r.input.remarks ?? null, ...(r.input.epcCode ? { codeType: 'RFID' as const, epcCode: r.input.epcCode } : {}),
+          // INV-12: stone elements; with rows, stoneCharge above is already their total (withStoneCharges)
+          ...(r.input.stones?.length ? { stones: { create: r.input.stones.map((st) => ({ businessId: ctx.businessId!, ...st })) } } : {}),
         },
       });
       stockItemId = created.id;
@@ -310,6 +350,7 @@ async function writeBillContents(tx: Prisma.TransactionClient, ctx: TenantContex
         billId, stockItemId, itemNameId: r.itemNameId, groupId: r.groupId, stockClass: r.stockClass, description: r.description, hsnCode: r.hsnCode, tagNo: r.tagNo, karatCode: r.karatCode,
         pcs: r.pcs, gross: r.gross, less: r.less, net: r.calc.net, tunch: r.tunch, wastage: r.wastage, fine: r.calc.fine, stoneCharge: r.input.stoneCharge, rate: r.input.rate, labour: r.input.labour,
         labourUnit: r.input.labourUnit, other: r.input.other, discount: r.input.discount, discountUnit: r.input.discountUnit, metalAmount: r.calc.metalAmount, labourAmount: r.calc.labourAmount, total: r.calc.total,
+        ...(body.kind === 'PURCHASE' ? { supplierItem: r.input.supplierItem || null, supplierTag: r.input.supplierTag || null } : {}),
       },
     });
     if (stockItemId != null) {
@@ -320,7 +361,7 @@ async function writeBillContents(tx: Prisma.TransactionClient, ctx: TenantContex
 
   await postNoCashPays(tx, ctx, { id: billId, billNo, branchId, partyId: prep.party.id }, prep.payCalcs, billDate, lctx);
   for (const pc of prep.payCalcs) {
-    const pay = await tx.billPayment.create({ data: { billId, mode: pc.input.mode, bankAccountId: pc.bankAccountId ?? null, metal: pc.metal ?? null, metalForm: pc.metalForm ?? null, gross: pc.gross ?? null, net: pc.net ?? null, tunch: pc.tunch ?? null, fine: pc.fine ?? null, rate: pc.rate ?? null, amount: pc.amount, remark: pc.input.remark ?? null, schemeEnrollmentId: pc.enrollment?.id ?? null, txnDate: billDate, isActive: true, createdById: ctx.userId } });
+    const pay = await tx.billPayment.create({ data: { billId, mode: pc.input.mode, bankAccountId: pc.bankAccountId ?? null, metal: pc.metal ?? null, metalForm: pc.metalForm ?? null, gross: pc.gross ?? null, net: pc.net ?? null, tunch: pc.tunch ?? null, fine: pc.fine ?? null, rate: pc.rate ?? null, amount: pc.amount, remark: pc.input.remark ?? null, schemeEnrollmentId: pc.enrollment?.id ?? null, jewelleryTypeId: pc.input.mode === 'METAL' ? pc.input.jewelleryTypeId ?? null : null, txnDate: billDate, isActive: true, createdById: ctx.userId } });
     if (!isNoCash(pc)) await ledger.post(tx, lctx, [paymentLedgerRow(pc, pay.id, billId, body.kind, branchId, billDate)]);
   }
 
@@ -347,7 +388,8 @@ async function undoBill(tx: Prisma.TransactionClient, ctx: TenantContext, bill: 
   if (bill.kind === 'PURCHASE') {
     const ids = bill.items.map((i: any) => i.stockItemId).filter((x: any): x is number => x != null);
     if (ids.length) {
-      const del = await tx.stockItem.updateMany({ where: { id: { in: ids }, status: 'AVAILABLE' }, data: { status: 'DELETED' } });
+      // edit only (undoBill's sole caller): the re-created items take the same tag no. / RFID EPC, both unique per business
+      const del = await tx.stockItem.updateMany({ where: { id: { in: ids }, status: 'AVAILABLE' }, data: { status: 'DELETED', tagNo: null, epcCode: null } });
       if (del.count !== ids.length) throw new HttpError(409, 'CONFLICT', 'A purchased item is no longer available — cannot return stock');
     }
     return;
@@ -375,7 +417,16 @@ const gstMeta = (b: BillBody) => ({
   reverseCharge: b.reverseCharge,
 });
 
+/** INV-12: on a purchase line with stone rows the stone charge is their total (it then counts once, in computeLine); without rows the typed charge stands. */
+const withStoneCharges = (body: BillBody): BillBody =>
+  body.kind !== 'PURCHASE' ? body : { ...body, items: body.items.map((l) => (l.stones?.length ? { ...l, stoneCharge: Number(stoneTotal(l.stones.map((st) => st.amount))) } : l)) };
+
+/** G7 D-d: an order is billed whole — every finished piece of it is a line on the bill (a left-out piece would stay RESERVED for good). */
+const billsWholeOrder = (order: { items: { stockItemId: number | null }[] }, body: BillBody) =>
+  order.items.every((i) => i.stockItemId == null || body.items.some((l) => l.stockItemId === i.stockItemId));
+
 export async function createBill(ctx: TenantContext, body: BillBody): Promise<BillDto> {
+  body = withStoneCharges(body);
   const branchId = activeBranch(ctx);
   const s = await getSettings(ctx);
   const numbering = s[body.kind === 'SELL' ? 'invoice.sale' : 'invoice.purchase'];
@@ -387,6 +438,7 @@ export async function createBill(ctx: TenantContext, body: BillBody): Promise<Bi
     if (body.kind !== 'SELL') throw new HttpError(400, 'VALIDATION', 'An order can only be billed as a sell bill');
     const order = await scopedDb(ctx).order.findFirst({ where: { id: body.orderId }, include: { items: { select: { stockItemId: true } } } });
     if (!order || order.partyId !== body.partyId || order.status !== 'READY') throw new HttpError(409, 'CONFLICT', 'Order is not READY for this party');
+    if (!billsWholeOrder(order, body)) throw new HttpError(409, 'CONFLICT', 'Bill every finished piece of the order');
     reservedIds = new Set(order.items.map((i) => i.stockItemId).filter((x): x is number => x != null));
   }
   const prep = await prepareBill(ctx, body, branchId, s, reservedIds);
@@ -413,11 +465,13 @@ export async function createBill(ctx: TenantContext, body: BillBody): Promise<Bi
         sub: prep.billCalc.sub, discount: body.discount, discountUnit: body.discountUnit, discountAmount: prep.billCalc.discountAmount,
         gstPercent: body.billType === 'ROUGH' ? 0 : body.gstPercent, taxable: prep.billCalc.taxable, cgst: prep.billCalc.cgst, sgst: prep.billCalc.sgst, igst: prep.billCalc.igst,
         total: prep.billCalc.total, round: prep.billCalc.round, final: prep.billCalc.final, paid: prep.paid, keepBalanceAs: body.keepBalanceAs,
-        keepRate: body.keepBalanceAs !== 'MONEY' ? (body.keepRate ?? null) : null, keepWeight: prep.keepWeight, remark: body.remark ?? null, status: 'ACTIVE', createdById: ctx.userId,
+        keepRate: body.keepBalanceAs !== 'MONEY' ? (body.keepRate ?? null) : null, keepWeight: prep.keepWeight, keepRateUnitGrams: prep.keepUnitGrams, remark: body.remark ?? null, status: 'ACTIVE', createdById: ctx.userId,
         ...gstMeta(body),
       },
     });
+    const kacha = await billPools(tx, branchId, [prep.payCalcs]); // ACC-05: a purchase paid in kacha / bullion draws the pool
     await writeBillContents(tx, ctx, bill, body, prep, lctx, reservedIds);
+    await kacha();
     if (body.draftId != null) {
       const flip = await tx.salesDraft.updateMany({ where: { id: body.draftId, status: 'APPROVED' }, data: { status: 'BILLED', billId: bill.id } });
       if (flip.count !== 1) throw new HttpError(409, 'CONFLICT', 'Draft has already been billed');
@@ -436,22 +490,39 @@ export async function createBill(ctx: TenantContext, body: BillBody): Promise<Bi
 
 /** Edit a saved bill (today only): undo it like delete-with-return but keep the row, then re-apply the body onto the same id/billNo/seq. */
 export async function editBill(ctx: TenantContext, id: number, body: BillBody): Promise<BillDto> {
+  body = withStoneCharges(body);
   const sdb = scopedDb(ctx);
   const bill = await sdb.bill.findFirst({ where: { id }, include: { items: true, payments: true } });
   if (!bill) throw new HttpError(404, 'NOT_FOUND', 'Bill not found');
   if (bill.status !== 'ACTIVE') throw new HttpError(409, 'CONFLICT', 'Bill is not active');
   if (bill.kind !== body.kind || bill.billType !== body.billType) throw new HttpError(400, 'VALIDATION', 'Cannot change a bill’s kind or type on edit');
   if (bill.billDate.getTime() !== ledger.businessDate().getTime()) throw new HttpError(400, 'VALIDATION', "Only today's bill can be edited — delete and re-create for a past day");
+  // G7 D-d: an order's bill stays with the order — its party and every finished piece (the order stays DELIVERED on this bill)
+  const order = await sdb.order.findFirst({ where: { billId: id }, include: { items: { select: { stockItemId: true } } } });
+  if (order && (order.partyId !== body.partyId || !billsWholeOrder(order, body))) throw new HttpError(409, 'CONFLICT', "An order's bill must keep the order's party and every finished piece");
   const s = await getSettings(ctx);
   // This bill's own stock items are still SOLD/reduced until the in-tx undo; allow them when re-resolving the new lines.
   const ownStockIds = new Set(bill.items.map((i) => i.stockItemId).filter((x): x is number => x != null));
-  const prep = await prepareBill(ctx, body, bill.branchId, s, ownStockIds);
+  // BILL-15 R6: a stored keep rate (or kept metal) changes only when the user confirms it; the change is logged below
+  const rateChanged = bill.keepBalanceAs !== 'MONEY' && (body.keepBalanceAs !== bill.keepBalanceAs || !D(body.keepRate ?? 0).eq(D(bill.keepRate)));
+  if (rateChanged && !body.keepRateChange) throw new HttpError(409, 'CONFLICT', 'This changes the bill’s stored keep rate — confirm the rate change', { code: 'KEEP_RATE_CHANGE' });
+  // BILL-15 R2: same kept metal → the unit frozen on the bill (legacy rows without one: the current shop unit, as before)
+  const storedUnit = body.keepBalanceAs === bill.keepBalanceAs && bill.keepRateUnitGrams != null ? Number(bill.keepRateUnitGrams) : undefined;
+  const prep = await prepareBill(ctx, body, bill.branchId, s, ownStockIds, storedUnit);
   const lctx = lctxOf(ctx);
 
   await prisma.$transaction(async (tx) => {
     // Lock the row + confirm still ACTIVE (TASK-30b-style guard against a concurrent edit/delete).
     const locked = await tx.bill.updateMany({ where: { id, status: 'ACTIVE' }, data: { status: 'ACTIVE' } });
     if (locked.count !== 1) throw new HttpError(409, 'CONFLICT', 'Bill is not active');
+    // G7 D-a: an Udhar settlement's money sits under source UDHAR, which undoBill does not reverse — re-posting it would book it twice
+    if (await tx.billPayment.count({ where: { billId: id, isActive: true, udharTxnId: { not: null } } })) {
+      throw new HttpError(409, 'CONFLICT', 'This bill was settled from Udhar. Delete that Udhar entry first, then edit the bill.');
+    }
+    // G7 audit M3: undo the bill as it is under the lock, not the first read — a payment that committed in between is undone with the rest
+    const bill = await tx.bill.findUniqueOrThrow({ where: { id }, include: { items: true, payments: true } });
+    // ACC-05: checked on the projected post-edit balance (old kacha payments undone, new ones posted)
+    const kacha = await billPools(tx, bill.branchId, [bill.payments, prep.payCalcs], { kind: bill.kind, billId: id });
     await undoBill(tx, ctx, bill, lctx, true); // undo old effects (always returns stock) before re-applying
     await tx.billItem.deleteMany({ where: { billId: id } });
     await tx.bill.update({
@@ -461,12 +532,19 @@ export async function editBill(ctx: TenantContext, id: number, body: BillBody): 
         sub: prep.billCalc.sub, discount: body.discount, discountUnit: body.discountUnit, discountAmount: prep.billCalc.discountAmount,
         gstPercent: body.billType === 'ROUGH' ? 0 : body.gstPercent, taxable: prep.billCalc.taxable, cgst: prep.billCalc.cgst, sgst: prep.billCalc.sgst, igst: prep.billCalc.igst,
         total: prep.billCalc.total, round: prep.billCalc.round, final: prep.billCalc.final, paid: prep.paid, keepBalanceAs: body.keepBalanceAs,
-        keepRate: body.keepBalanceAs !== 'MONEY' ? (body.keepRate ?? null) : null, keepWeight: prep.keepWeight, remark: body.remark ?? null,
+        keepRate: body.keepBalanceAs !== 'MONEY' ? (body.keepRate ?? null) : null, keepWeight: prep.keepWeight, keepRateUnitGrams: prep.keepUnitGrams, remark: body.remark ?? null,
         ...gstMeta(body),
       },
     });
     await writeBillContents(tx, ctx, { id: bill.id, branchId: bill.branchId, billNo: bill.billNo, billDate: bill.billDate }, body, prep, lctx);
+    await kacha();
     await logActivity(tx, ctx, { module: bill.kind, action: 'EDITED', entity: 'BILL', entityId: String(id), summary: `Edited ${bill.kind === 'SELL' ? 'sell' : 'purchase'} bill ${bill.billNo} ₹${prep.billCalc.final}`, partyName: prep.party.name });
+    if (rateChanged) {
+      const was = { keepBalanceAs: bill.keepBalanceAs, keepRate: String(bill.keepRate), unitGrams: bill.keepRateUnitGrams != null ? String(bill.keepRateUnitGrams) : null };
+      const now = { keepBalanceAs: body.keepBalanceAs, keepRate: body.keepBalanceAs !== 'MONEY' ? String(body.keepRate) : null, unitGrams: prep.keepUnitGrams != null ? String(prep.keepUnitGrams) : null };
+      // user + timestamp are the activity row's own userId / createdAt
+      await logActivity(tx, ctx, { module: bill.kind, action: 'EDITED', entity: 'BILL', entityId: String(id), summary: `Keep rate changed on ${bill.billNo}: ${was.keepBalanceAs} ₹${was.keepRate} → ${now.keepBalanceAs}${now.keepRate != null ? ` ₹${now.keepRate}` : ''}`, partyName: prep.party.name, meta: { change: 'KEEP_RATE', old: was, new: now } });
+    }
   });
   return getBill(ctx, id);
 }
@@ -486,13 +564,22 @@ export async function addBillPayments(ctx: TenantContext, id: number, body: { pa
   const lctx = lctxOf(ctx);
 
   await prisma.$transaction(async (tx) => {
-    const fresh = await tx.bill.findUnique({ where: { id }, select: { status: true } });
+    // G7 D-e: the document row first (kacha.ts lock order), so the due cap and the PAN total below read settled numbers
+    await tx.$queryRaw`SELECT id FROM "Bill" WHERE id = ${id} FOR NO KEY UPDATE`;
+    const fresh = await tx.bill.findUnique({ where: { id }, select: { status: true, final: true, paid: true } });
     if (!fresh || fresh.status !== 'ACTIVE') throw new HttpError(409, 'CONFLICT', 'Bill is not active');
+    // Paying a supplier more than the bill's due has no meaning on the bill (as the udhar settle; a sell overpay stays the customer's advance).
+    const due = D(fresh.final).minus(fresh.paid);
+    if (bill.kind === 'PURCHASE' && added.gt(due)) throw new HttpError(409, 'CONFLICT', `Paid amount exceeds the bill due (${due.toFixed(2)})`);
+    const cash = payCalcs.filter((p) => p.input.mode === 'CASH').reduce((a, p) => a.plus(D(p.amount)), new Prisma.Decimal(0));
+    await assertPanForLaterCash(tx, { id, kind: bill.kind, partyId: bill.partyId }, cash);
+    const kacha = await billPools(tx, bill.branchId, [payCalcs]); // ACC-05
     await postNoCashPays(tx, ctx, bill, payCalcs, txnDate, lctx);
     for (const pc of payCalcs) {
-      const pay = await tx.billPayment.create({ data: { billId: id, mode: pc.input.mode, bankAccountId: pc.bankAccountId ?? null, metal: pc.metal ?? null, metalForm: pc.metalForm ?? null, gross: pc.gross ?? null, net: pc.net ?? null, tunch: pc.tunch ?? null, fine: pc.fine ?? null, rate: pc.rate ?? null, amount: pc.amount, remark: pc.input.remark ?? null, schemeEnrollmentId: pc.enrollment?.id ?? null, txnDate, isActive: true, createdById: ctx.userId } });
+      const pay = await tx.billPayment.create({ data: { billId: id, mode: pc.input.mode, bankAccountId: pc.bankAccountId ?? null, metal: pc.metal ?? null, metalForm: pc.metalForm ?? null, gross: pc.gross ?? null, net: pc.net ?? null, tunch: pc.tunch ?? null, fine: pc.fine ?? null, rate: pc.rate ?? null, amount: pc.amount, remark: pc.input.remark ?? null, schemeEnrollmentId: pc.enrollment?.id ?? null, jewelleryTypeId: pc.input.mode === 'METAL' ? pc.input.jewelleryTypeId ?? null : null, txnDate, isActive: true, createdById: ctx.userId } });
       if (!isNoCash(pc)) await ledger.post(tx, lctx, [paymentLedgerRow(pc, pay.id, id, bill.kind, bill.branchId, txnDate)]);
     }
+    await kacha();
     await tx.bill.update({ where: { id }, data: { paid: { increment: added } } }); // atomic — no lost update under concurrent payments
     if (!added.isZero()) {
       // Later payments always reduce the party's MONEY balance (SELL: party owes less; PURCHASE: shop owes less).
@@ -503,6 +590,15 @@ export async function addBillPayments(ctx: TenantContext, id: number, body: { pa
   return getBill(ctx, id);
 }
 
+/** PAN rule as on create, for cash received on a SELL bill after it was made (add-payment, Udhar settlement): the bill's
+ *  active cash so far plus this cash reaching PAN_CASH_LIMIT needs the party's PAN. Call with the bill row locked. */
+export async function assertPanForLaterCash(tx: Prisma.TransactionClient, bill: { id: number; kind: BillKind; partyId: number }, cash: Prisma.Decimal): Promise<void> {
+  if (bill.kind !== 'SELL' || !cash.gt(0)) return;
+  const before = await tx.billPayment.aggregate({ where: { billId: bill.id, isActive: true, mode: 'CASH' }, _sum: { amount: true } });
+  const party = await tx.party.findUnique({ where: { id: bill.partyId }, select: { pan: true } });
+  if (cash.plus(D(before._sum.amount)).gte(PAN_CASH_LIMIT) && !party?.pan) throw new HttpError(400, 'VALIDATION', "PAN required for this cash amount — add the party's PAN first", { code: 'PAN_REQUIRED' });
+}
+
 // ───────────── Delete ─────────────
 
 export async function deleteBill(ctx: TenantContext, id: number, returnStock: boolean): Promise<void> {
@@ -510,17 +606,30 @@ export async function deleteBill(ctx: TenantContext, id: number, returnStock: bo
   const bill = await sdb.bill.findFirst({ where: { id }, include: { items: true, payments: true } });
   if (!bill) throw new HttpError(404, 'NOT_FOUND', 'Bill not found');
   if (bill.status !== 'ACTIVE') throw new HttpError(409, 'CONFLICT', 'Bill is not active');
+  // G7 D-d: deleting an order's bill re-opens the order (READY, pieces back to RESERVED) so it can be billed again — only with its stock back
+  const order = await sdb.order.findFirst({ where: { billId: id }, include: { items: { select: { stockItemId: true } } } });
+  if (order && !returnStock) throw new HttpError(409, 'CONFLICT', "Return the stock to delete an order's bill — the order is then ready to bill again");
+  const orderPieces = new Set(order?.items.map((i) => i.stockItemId));
   const lctx = lctxOf(ctx);
 
   await prisma.$transaction(async (tx) => {
     // Flip ACTIVE→DELETED atomically FIRST — two concurrent deletes can't both run the return (double stock).
     const flipped = await tx.bill.updateMany({ where: { id, status: 'ACTIVE' }, data: { status: 'DELETED', deletedAt: new Date(), deletedWithStock: returnStock } });
     if (flipped.count !== 1) throw new HttpError(409, 'CONFLICT', 'Bill is not active');
+    // G7 audit M3: undo the bill as it is under the lock, not the first read — a payment that committed in between is undone with the rest
+    const bill = await tx.bill.findUniqueOrThrow({ where: { id }, include: { items: true, payments: true } });
+    if (order) {
+      await tx.order.update({ where: { id: order.id }, data: { status: 'READY', billId: null } });
+      await tx.orderItem.updateMany({ where: { orderId: order.id }, data: { status: 'RECEIVED' } });
+    }
+    // ACC-05: checked on the projected post-reversal balance, before the purchase early return below
+    const kacha = await billPools(tx, bill.branchId, [bill.payments], { kind: bill.kind, billId: id });
     await reopenSchemes(tx, ctx, bill);
     await tx.billPayment.updateMany({ where: { billId: id }, data: { isActive: false } });
     for (const p of bill.payments) await ledger.reverse(tx, lctx, { source: billSource(bill.kind), sourceId: `${id}-P${p.id}` });
     await udhar.reverse(tx, lctx, { source: billSource(bill.kind), sourceId: String(id) });
     await udhar.reverse(tx, lctx, { source: billSource(bill.kind), sourceId: `${id}-A` }); // TASK-98 advance / scheme uses
+    await kacha();
 
     if (returnStock) {
       await ledger.reverse(tx, lctx, { source: billSource(bill.kind), sourceId: String(id) }); // stock rows
@@ -528,7 +637,7 @@ export async function deleteBill(ctx: TenantContext, id: number, returnStock: bo
         // Availability check + delete in one atomic write: every created item must still be AVAILABLE.
         const ids = bill.items.map((i) => i.stockItemId).filter((x): x is number => x != null);
         if (ids.length) {
-          const del = await tx.stockItem.updateMany({ where: { id: { in: ids }, status: 'AVAILABLE' }, data: { status: 'DELETED' } });
+          const del = await tx.stockItem.updateMany({ where: { id: { in: ids }, status: 'AVAILABLE' }, data: { status: 'DELETED', epcCode: null } }); // RFID EPC is unique per business: free it for re-use / the edit's re-created item
           if (del.count !== ids.length) throw new HttpError(409, 'CONFLICT', 'A purchased item is no longer available — cannot return stock');
         }
         await logActivity(tx, ctx, { module: bill.kind, action: 'DELETED', entity: 'BILL', entityId: String(id), summary: `Deleted purchase bill ${bill.billNo}` });
@@ -544,7 +653,7 @@ export async function deleteBill(ctx: TenantContext, id: number, returnStock: bo
           const net = Prisma.Decimal.max(g.minus(l), 0);
           const fine = net.times(D(stock.tunch)).div(100).times(D(stock.wastage).div(100).plus(1));
           await tx.stockItem.update({ where: { id: stock.id }, data: { gross: g, less: l, pcs: stock.pcs + it.pcs, net, fine, status: 'AVAILABLE' } });
-        } else await tx.stockItem.update({ where: { id: stock.id }, data: { status: 'AVAILABLE' } });
+        } else await tx.stockItem.update({ where: { id: stock.id }, data: { status: orderPieces.has(stock.id) ? 'RESERVED' : 'AVAILABLE' } });
       }
     }
     await logActivity(tx, ctx, { module: bill.kind, action: 'DELETED', entity: 'BILL', entityId: String(id), summary: `Deleted ${bill.kind === 'SELL' ? 'sell' : 'purchase'} bill ${bill.billNo}` });
@@ -553,16 +662,19 @@ export async function deleteBill(ctx: TenantContext, id: number, returnStock: bo
 
 // ───────────── List / get + DTO mappers ─────────────
 
-const lineDto = (i: any): BillLineDto => ({
+const lineDto = (i: any, stock?: Map<number, Pick<BillLineDto, 'huid' | 'epcCode' | 'remarks' | 'stones'>>): BillLineDto => ({
   id: i.id, stockItemId: i.stockItemId, itemNameId: i.itemNameId, stockClass: i.stockClass, description: i.description, hsnCode: i.hsnCode, tagNo: i.tagNo, karatCode: i.karatCode,
   pcs: i.pcs, gross: String(i.gross), less: String(i.less), net: String(i.net), tunch: String(i.tunch), wastage: String(i.wastage), fine: String(i.fine), stoneCharge: String(i.stoneCharge),
   rate: String(i.rate), labour: String(i.labour), labourUnit: i.labourUnit, other: String(i.other), discount: String(i.discount), discountUnit: i.discountUnit, metalAmount: String(i.metalAmount), labourAmount: String(i.labourAmount), total: String(i.total),
+  supplierItem: i.supplierItem ?? null, supplierTag: i.supplierTag ?? null,
+  ...(stock && i.stockItemId != null && stock.has(i.stockItemId) ? stock.get(i.stockItemId) : {}),
 });
 
-const paymentDto = (p: any, baMap: Map<number, string>): BillPaymentDto => ({
+const paymentDto = (p: any, baMap: Map<number, string>, jtMap: Map<number, string>): BillPaymentDto => ({
   id: p.id, mode: p.mode, bankAccount: p.bankAccountId != null ? { id: p.bankAccountId, name: baMap.get(p.bankAccountId) ?? '' } : null, metal: p.metal, metalForm: p.metalForm,
   gross: p.gross != null ? String(p.gross) : null, net: p.net != null ? String(p.net) : null, tunch: p.tunch != null ? String(p.tunch) : null, fine: p.fine != null ? String(p.fine) : null, rate: p.rate != null ? String(p.rate) : null,
-  amount: String(p.amount), remark: p.remark, schemeEnrollmentId: p.schemeEnrollmentId ?? null, txnDate: p.txnDate.toISOString().slice(0, 10), isActive: p.isActive, createdAt: p.createdAt.toISOString(),
+  amount: String(p.amount), remark: p.remark, schemeEnrollmentId: p.schemeEnrollmentId ?? null,
+  jewelleryType: p.jewelleryTypeId != null ? { id: p.jewelleryTypeId, name: jtMap.get(p.jewelleryTypeId) ?? '' } : null, txnDate: p.txnDate.toISOString().slice(0, 10), isActive: p.isActive, createdAt: p.createdAt.toISOString(),
 });
 
 const listItemFields = (b: any, party: PartyRefDto, branchName: string, createdBy: string | null): BillListItemDto => ({
@@ -596,13 +708,18 @@ export async function getBill(ctx: TenantContext, id: number): Promise<BillDto> 
   const creator = (await userNames(ctx, bill.createdById != null ? [bill.createdById] : [])).get(bill.createdById!) ?? null;
   const baIds = [...new Set(bill.payments.map((p) => p.bankAccountId).filter((x): x is number => x != null))];
   const baMap = new Map((baIds.length ? await sdb.bankAccount.findMany({ where: { id: { in: baIds } }, select: { id: true, bankName: true } }) : []).map((b) => [b.id, b.bankName]));
+  // PURCHASE: the created stock items' HUID / RFID / remark / stones, so an edit (which re-creates the stock) keeps them
+  const stockIds = bill.kind === 'PURCHASE' ? bill.items.map((i) => i.stockItemId).filter((x): x is number => x != null) : [];
+  const stockMap = new Map((stockIds.length ? await sdb.stockItem.findMany({ where: { id: { in: stockIds } }, select: { id: true, huid: true, epcCode: true, remarks: true, stones: { orderBy: { id: 'asc' } } } }) : []).map(({ id: sid, stones, ...rest }) => [sid, { ...rest, stones: stones.map(stoneDto) }]));
+  const jtIds = [...new Set(bill.payments.map((p) => p.jewelleryTypeId).filter((x): x is number => x != null))];
+  const jtMap = new Map((jtIds.length ? await prisma.jewelleryType.findMany({ where: { id: { in: jtIds } }, select: { id: true, name: true } }) : []).map((t) => [t.id, t.name]));
   return {
     ...listItemFields(bill, partyRef(party), branch?.name ?? '', creator),
     dueDate: bill.dueDate ? bill.dueDate.toISOString().slice(0, 10) : null, interState: bill.interState, sub: String(bill.sub), discount: String(bill.discount), discountUnit: bill.discountUnit, discountAmount: String(bill.discountAmount),
     gstPercent: String(bill.gstPercent), taxable: String(bill.taxable), cgst: String(bill.cgst), sgst: String(bill.sgst), igst: String(bill.igst), total: String(bill.total), round: String(bill.round),
-    keepRate: bill.keepRate != null ? String(bill.keepRate) : null, remark: bill.remark, deletedWithStock: bill.deletedWithStock,
+    keepRate: bill.keepRate != null ? String(bill.keepRate) : null, keepRateUnitGrams: bill.keepRateUnitGrams != null ? String(bill.keepRateUnitGrams) : null, remark: bill.remark, deletedWithStock: bill.deletedWithStock,
     itcEligibility: bill.itcEligibility, itcBlockReason: bill.itcBlockReason, supplierInvoiceNo: bill.supplierInvoiceNo, supplyCategory: bill.supplyCategory, reverseCharge: bill.reverseCharge,
-    items: bill.items.map(lineDto), payments: bill.payments.map((p) => paymentDto(p, baMap)),
+    items: bill.items.map((i) => lineDto(i, stockMap)), payments: bill.payments.map((p) => paymentDto(p, baMap, jtMap)),
   };
 }
 
@@ -633,8 +750,9 @@ export async function listBills(ctx: TenantContext, query: any): Promise<Paged<B
   const parties = new Map((await sdb.party.findMany({ where: { id: { in: [...new Set(rows.map((b) => b.partyId))] } } })).map((p) => [p.id, p]));
   const branches = new Map((await sdb.branch.findMany({ where: { id: { in: [...new Set(rows.map((b) => b.branchId))] } }, select: { id: true, name: true } })).map((b) => [b.id, b.name]));
   const users = await userNames(ctx, rows.map((b) => b.createdById).filter((x): x is number => x != null));
+  const orderOf = new Map((await sdb.order.findMany({ where: { billId: { in: rows.map((b) => b.id) } }, select: { id: true, billId: true } })).map((o) => [o.billId, o.id]));
   return {
-    items: rows.map((b) => listItemFields(b, partyRef(parties.get(b.partyId)), branches.get(b.branchId) ?? '', b.createdById != null ? (users.get(b.createdById) ?? null) : null)),
+    items: rows.map((b) => ({ ...listItemFields(b, partyRef(parties.get(b.partyId)), branches.get(b.branchId) ?? '', b.createdById != null ? (users.get(b.createdById) ?? null) : null), orderId: orderOf.get(b.id) ?? null })),
     total, page: query.page, pageSize: query.pageSize,
   };
 }

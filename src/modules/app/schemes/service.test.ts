@@ -290,5 +290,28 @@ describe('schemes', () => {
     const bParty = await db.party.create({ data: { businessId: other.business.id, type: 'CUSTOMER', name: 'B', mobile: '9111111111', countryCode: '+91' } });
     await expect(schemes.enroll(s.ctx, { schemeId: scheme.id, partyId: bParty.id, assignId: 'X', displayName: 'C', tokenAmount: 0 } as any)).rejects.toMatchObject({ status: 404 });
     await expect(schemes.getScheme(ctxFor(other.business.id, other.root.id), scheme.id)).rejects.toMatchObject({ status: 404 });
+    await schemes.createGroup(s.ctx, { schemeId: scheme.id, name: 'G1' });
+    expect(await schemes.listGroups(ctxFor(other.business.id, other.root.id), { schemeId: scheme.id })).toEqual([]); // G7 audit M1
+    expect((await schemes.listGroups(s.ctx, { schemeId: scheme.id })).map((g) => g.name)).toEqual(['G1']);
+  });
+});
+
+describe('scheme collected (dashboard schemes overview)', () => {
+  it('collected = Σ non-reversed money-in payments (CASH/ONLINE/TOKEN/CHEQUE); DRAW and reversed rows excluded', async () => {
+    const s = await setup();
+    const scheme = await cashScheme(s.ctx);
+    const other = await cashScheme(s.ctx, { name: 'Other' });
+    expect((await schemes.getScheme(s.ctx, scheme.id)).collected).toBe('0.00');
+    const e = await schemes.enroll(s.ctx, { schemeId: scheme.id, partyId: s.party.id, assignId: 'A1', displayName: 'C', tokenAmount: 500 } as any);
+    await schemes.addPayment(s.ctx, { enrollmentId: e.id, emiNo: 1, amount: 2000, medium: 'CASH' } as any);
+    const rev = await schemes.addPayment(s.ctx, { enrollmentId: e.id, emiNo: 2, amount: 2000, medium: 'CASH' } as any);
+    await schemes.reversePayment(s.ctx, rev.payments.find((p) => p.emiNo === 2)!.id);
+    await schemes.addPayment(s.ctx, { enrollmentId: e.id, emiNo: 3, amount: 2000, medium: 'DRAW' } as any);
+    const e2 = await schemes.enroll(s.ctx, { schemeId: other.id, partyId: s.party.id, assignId: 'B1', displayName: 'C', tokenAmount: 0 } as any);
+    await schemes.addPayment(s.ctx, { enrollmentId: e2.id, emiNo: 1, amount: 2000, medium: 'CASH' } as any);
+
+    const list = await schemes.listSchemes(s.ctx, { page: 1, pageSize: 20 });
+    expect(list.items.find((x) => x.id === scheme.id)!.collected).toBe('2500.00'); // token 500 + EMI 1
+    expect(list.items.find((x) => x.id === other.id)!.collected).toBe('2000.00');
   });
 });

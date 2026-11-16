@@ -6,8 +6,10 @@ import { parseCsv } from '../../lib/csv';
 import * as ledger from '../../lib/ledger';
 import { logActivity } from '../../lib/activity';
 import { HttpError } from '../../middleware/error';
+import { assertDocBranchActive } from '../../middleware/context';
 import type { TenantContext } from '../../middleware/context';
 import { computeLine, stockRowInput } from '../../shared';
+import type { StockStoneDto } from '../../shared';
 import { stockImagePath } from './uploads';
 import type {
   BulkResultDto,
@@ -195,6 +197,8 @@ export async function updateItemName(ctx: TenantContext, itemNameId: number, bod
 
 // ───────────── Stock mapper + helpers ─────────────
 
+export const stoneDto = (x: any): StockStoneDto => ({ id: x.id, name: x.name, pcs: x.pcs, weight: num(x.weight), unit: x.unit, rate: num(x.rate), amount: num(x.amount) });
+
 const stockDto = (s: any, branchName: string, hsnCode: string | null): StockItemDto => ({
   id: s.id,
   branch: { id: s.branchId, name: branchName },
@@ -226,6 +230,9 @@ const stockDto = (s: any, branchName: string, hsnCode: string | null): StockItem
   createdAt: s.createdAt.toISOString(),
   codeType: s.codeType,
   epcCode: s.epcCode ?? null,
+  discount: num(s.discount),
+  total: s.total != null ? num(s.total) : null,
+  ...(s.stones ? { stones: s.stones.map(stoneDto) } : {}),
 });
 
 async function decorateStock(ctx: TenantContext, items: any[]): Promise<StockItemDto[]> {
@@ -277,16 +284,19 @@ function resolveRow(row: any, itemName: any, touchByCode: Map<string, number>) {
   const line = computeLine({
     pcs: row.pcs, gross: row.gross, less: row.less, tunch, wastage: row.wastage,
     stoneCharge: row.stoneCharge, labour: row.labour, labourUnit: row.labourUnit, other: row.other,
-    rate: row.rate, rateUnitGrams: 1, basis: 'NET',
+    rate: row.rate, rateUnitGrams: 1, basis: 'NET', discount: row.discount ?? 0,
   });
   // Keep string/number weights as-is (no Number() round-trip for money/weights).
-  const purchaseCost: string | number | null = row.purchaseCost != null ? row.purchaseCost : row.rate != null ? line.total : null;
-  return { karatCode, tunch, net: line.net, fine: line.fine, purchaseCost };
+  const total = row.rate != null ? line.total : null;
+  // A negative total would become a negative purchase cost and ledger amount.
+  if (total != null && Number(total) < 0) throw new HttpError(400, 'VALIDATION', 'Discount cannot exceed the line total');
+  const purchaseCost: string | number | null = row.purchaseCost != null ? row.purchaseCost : total;
+  return { karatCode, tunch, net: line.net, fine: line.fine, purchaseCost, total };
 }
 
 // ───────────── Stock entry ─────────────
 
-export async function createStockEntry(ctx: TenantContext, body: { stockClass: StockClass; method: 'LOOSE' | 'TAG'; branchId?: number; txnDate?: Date; rows: any[] }): Promise<StockEntryResultDto> {
+export async function createStockEntry(ctx: TenantContext, body: { stockClass: StockClass; method: 'LOOSE' | 'TAG' | 'BOTH'; branchId?: number; txnDate?: Date; rows: any[] }): Promise<StockEntryResultDto> {
   const branchId = body.branchId ?? ctx.activeBranchId ?? ctx.scopeBranchId;
   if (branchId == null || !ctx.branchIds.includes(branchId)) throw new HttpError(404, 'NOT_FOUND', 'Branch not found');
   const sdb = scopedDb(ctx);
@@ -295,12 +305,15 @@ export async function createStockEntry(ctx: TenantContext, body: { stockClass: S
   const nameIds = [...new Set(body.rows.map((r) => r.itemNameId))];
   const itemNames = await sdb.itemName.findMany({ where: { id: { in: nameIds } }, include: { group: true } });
   const byId = new Map(itemNames.map((n) => [n.id, n]));
+  // BOTH entries: every row carries its own LOOSE/TAG (contract-enforced); otherwise the entry's method applies to all rows.
+  const methodOf = (r: any): 'LOOSE' | 'TAG' => (body.method === 'BOTH' ? r.method : body.method);
   for (const r of body.rows) {
     const n = byId.get(r.itemNameId);
     if (!n) throw new HttpError(404, 'NOT_FOUND', `Item name ${r.itemNameId} not found`);
     if (n.group.stockClass !== body.stockClass) throw new HttpError(400, 'VALIDATION', 'Item name does not match stock class');
-    if (n.method !== 'BOTH' && n.method !== body.method) throw new HttpError(400, 'VALIDATION', `Item "${n.name}" does not allow ${body.method}`);
-    if (body.method === 'TAG' && !r.tagNo && (!n.tagPrefix || !n.tagDigits)) throw new HttpError(400, 'VALIDATION', `Item "${n.name}" has no tag prefix/digits for auto-tagging`);
+    if (!methodOf(r)) throw new HttpError(400, 'VALIDATION', 'Pick Loose or Tag for every row');
+    if (n.method !== 'BOTH' && n.method !== methodOf(r)) throw new HttpError(400, 'VALIDATION', `Item "${n.name}" does not allow ${methodOf(r)}`);
+    if (methodOf(r) === 'TAG' && !r.tagNo && (!n.tagPrefix || !n.tagDigits)) throw new HttpError(400, 'VALIDATION', `Item "${n.name}" has no tag prefix/digits for auto-tagging`);
   }
   const touchByCode = new Map((await sdb.karatMapping.findMany({ select: { code: true, touch: true } })).map((k) => [k.code, Number(k.touch)]));
   const lctx = { businessId: ctx.businessId!, branchIds: ctx.branchIds, userId: ctx.userId };
@@ -311,15 +324,16 @@ export async function createStockEntry(ctx: TenantContext, body: { stockClass: S
     for (const row of body.rows) {
       const n = byId.get(row.itemNameId)!;
       const r = resolveRow(row, n, touchByCode);
-      const tagNo = body.method === 'TAG' ? (row.tagNo ?? (await nextTagNo(tx, ctx.businessId!, n.tagPrefix!, n.tagDigits!))) : null;
-      const pcs = body.method === 'TAG' ? (row.pcs ?? 1) : row.pcs;
+      const method = methodOf(row);
+      const tagNo = method === 'TAG' ? (row.tagNo ?? (await nextTagNo(tx, ctx.businessId!, n.tagPrefix!, n.tagDigits!))) : null;
+      const pcs = method === 'TAG' ? (row.pcs ?? 1) : row.pcs;
       const item = await tx.stockItem.create({
         data: {
-          businessId: ctx.businessId!, branchId, stockClass: body.stockClass, groupId: n.groupId, itemNameId: n.id, method: body.method,
+          businessId: ctx.businessId!, branchId, stockClass: body.stockClass, groupId: n.groupId, itemNameId: n.id, method,
           tagNo, huid: row.huid ?? null, karatCode: r.karatCode, pcs, gross: row.gross, less: row.less, net: r.net, tunch: r.tunch, wastage: row.wastage,
           fine: r.fine, stoneCharge: row.stoneCharge, labour: row.labour, labourUnit: row.labourUnit, other: row.other, rate: row.rate ?? null,
           purchaseCost: r.purchaseCost, status: 'AVAILABLE', source: 'STOCK_INSERT', sourceId: String(entryNo), entryNo, remarks: row.remarks ?? null, createdById: ctx.userId,
-          codeType: row.codeType ?? 'BARCODE', epcCode: row.epcCode ?? null,
+          codeType: row.codeType ?? 'BARCODE', epcCode: row.epcCode ?? null, discount: row.discount ?? 0, total: r.total,
         },
       });
       await ledger.post(tx, lctx, [{
@@ -369,7 +383,7 @@ export async function listStock(ctx: TenantContext, query: any): Promise<StockLi
 }
 
 export async function getStock(ctx: TenantContext, id: number): Promise<StockItemDto> {
-  const item = await scopedDb(ctx).stockItem.findUnique({ where: { id }, include: { group: true, itemName: true } });
+  const item = await scopedDb(ctx).stockItem.findUnique({ where: { id }, include: { group: true, itemName: true, stones: { orderBy: { id: 'asc' } } } });
   if (!item) throw new HttpError(404, 'NOT_FOUND', 'Stock item not found');
   return (await decorateStock(ctx, [item]))[0]!;
 }
@@ -407,26 +421,33 @@ const lctxOf = (ctx: TenantContext) => ({ businessId: ctx.businessId!, branchIds
 
 /** Recompute one item, reverse ALL its ledger rows (any source, so a transferred item nets to 0 at both branches), repost the fresh IN at its current branch. */
 async function applyStockEdit(tx: Prisma.TransactionClient, lctx: ledger.LedgerContext, item: any, body: any, touchByCode: Map<string, number>): Promise<void> {
-  const merged = { pcs: item.pcs, gross: numN(item.gross), less: numN(item.less), tunch: numN(item.tunch), wastage: numN(item.wastage), stoneCharge: numN(item.stoneCharge), labour: numN(item.labour), labourUnit: item.labourUnit, other: numN(item.other), rate: item.rate != null ? numN(item.rate) : undefined, purchaseCost: item.purchaseCost != null ? numN(item.purchaseCost) : undefined, karatCode: item.karatCode ?? undefined, huid: item.huid ?? undefined, remarks: item.remarks ?? undefined, codeType: item.codeType, epcCode: item.epcCode ?? undefined, ...body };
+  const merged = { pcs: item.pcs, gross: numN(item.gross), less: numN(item.less), tunch: numN(item.tunch), wastage: numN(item.wastage), stoneCharge: numN(item.stoneCharge), labour: numN(item.labour), labourUnit: item.labourUnit, other: numN(item.other), rate: item.rate != null ? numN(item.rate) : undefined, purchaseCost: item.purchaseCost != null ? numN(item.purchaseCost) : undefined, karatCode: item.karatCode ?? undefined, huid: item.huid ?? undefined, remarks: item.remarks ?? undefined, codeType: item.codeType, epcCode: item.epcCode ?? undefined, discount: numN(item.discount), ...body };
   const r = resolveRow(merged, item.itemName, touchByCode);
-  await tx.stockItem.update({ where: { id: item.id }, data: { pcs: merged.pcs, gross: merged.gross, less: merged.less, tunch: r.tunch, wastage: merged.wastage, net: r.net, fine: r.fine, stoneCharge: merged.stoneCharge, labour: merged.labour, labourUnit: merged.labourUnit, other: merged.other, rate: merged.rate ?? null, purchaseCost: r.purchaseCost, karatCode: r.karatCode, huid: merged.huid ?? null, remarks: merged.remarks ?? null, codeType: merged.codeType, epcCode: merged.epcCode ?? null } });
+  await tx.stockItem.update({ where: { id: item.id }, data: { pcs: merged.pcs, gross: merged.gross, less: merged.less, tunch: r.tunch, wastage: merged.wastage, net: r.net, fine: r.fine, stoneCharge: merged.stoneCharge, labour: merged.labour, labourUnit: merged.labourUnit, other: merged.other, rate: merged.rate ?? null, purchaseCost: r.purchaseCost, karatCode: r.karatCode, huid: merged.huid ?? null, remarks: merged.remarks ?? null, codeType: merged.codeType, epcCode: merged.epcCode ?? null, discount: merged.discount ?? 0, total: r.total } });
   await ledger.reverseForItem(tx, lctx, item.id);
   await ledger.post(tx, lctx, [{ branchId: item.branchId, asset: ledger.assetForStockClass(item.stockClass), direction: 'IN', karatCode: r.karatCode, pcs: merged.pcs, gross: merged.gross, net: r.net, fine: r.fine, amount: r.purchaseCost, source: 'STOCK_INSERT', sourceId: String(item.id), stockItemId: item.id, narration: `Edit stock item #${item.id}` }]);
 }
 
 /** A sold item can't be edited/deleted — but only while its SELL_BILL row is live. A bill deleted with stock return reverses that row, so the item is AVAILABLE again and must stay editable. */
-async function assertNotSold(ctx: TenantContext, ids: number[]): Promise<void> {
-  const sellRows = await prisma.ledgerEntry.findMany({ where: { businessId: ctx.businessId!, stockItemId: { in: ids }, source: 'SELL_BILL', reversalOfId: null }, select: { id: true, stockItemId: true } });
+// G7 D-f: run inside the tx, after the stock rows are locked — a partial LOOSE sale doesn't change the status, so only this sees a sale that committed meanwhile.
+async function assertNotSold(tx: Prisma.TransactionClient, ctx: TenantContext, ids: number[]): Promise<void> {
+  const sellRows = await tx.ledgerEntry.findMany({ where: { businessId: ctx.businessId!, stockItemId: { in: ids }, source: 'SELL_BILL', reversalOfId: null }, select: { id: true, stockItemId: true, sourceId: true } });
   if (sellRows.length === 0) return;
-  const reversed = new Set((await prisma.ledgerEntry.findMany({ where: { businessId: ctx.businessId!, reversalOfId: { in: sellRows.map((r) => r.id) } }, select: { reversalOfId: true } })).map((r) => r.reversalOfId));
-  const live = sellRows.find((r) => !reversed.has(r.id));
-  if (live) throw new HttpError(409, 'CONFLICT', `Item #${live.stockItemId} is on a sell bill — correct it from the bill`);
+  const reversed = new Set((await tx.ledgerEntry.findMany({ where: { businessId: ctx.businessId!, reversalOfId: { in: sellRows.map((r) => r.id) } }, select: { reversalOfId: true } })).map((r) => r.reversalOfId));
+  const sold = sellRows.filter((r) => !reversed.has(r.id));
+  if (sold.length === 0) return;
+  // G7 owner rule: only a sale on a live (not deleted) bill holds the lot — a bill deleted without its stock leaves its sale rows but no longer does
+  const bills = await tx.bill.findMany({ where: { businessId: ctx.businessId!, id: { in: sold.map((r) => Number(r.sourceId)).filter(Number.isInteger) } }, select: { id: true, billNo: true, status: true } });
+  const live = sold.find((r) => bills.find((b) => b.id === Number(r.sourceId))?.status !== 'DELETED');
+  const bill = bills.find((b) => b.id === Number(live?.sourceId));
+  if (live) throw new HttpError(409, 'CONFLICT', `Item #${live.stockItemId} has a sale on live bill ${bill ? bill.billNo : `#${live.sourceId}`} — it can't be transferred, edited or deleted until that bill is corrected or deleted`);
 }
 
 /** Lock the ids inside the tx and confirm all are still AVAILABLE (count must equal n), else 409 — closes the edit-vs-transfer/delete race. */
-async function lockAvailable(tx: Prisma.TransactionClient, ids: number[]): Promise<void> {
+async function lockAvailable(tx: Prisma.TransactionClient, ctx: TenantContext, ids: number[]): Promise<void> {
   const locked = await tx.stockItem.updateMany({ where: { id: { in: ids }, status: 'AVAILABLE' }, data: { status: 'AVAILABLE' } });
   if (locked.count !== ids.length) throw new HttpError(409, 'CONFLICT', 'A stock item is not AVAILABLE or changed concurrently');
+  await assertNotSold(tx, ctx, ids);
 }
 
 async function editStock(ctx: TenantContext, uniq: number[], patch: any): Promise<number> {
@@ -434,12 +455,13 @@ async function editStock(ctx: TenantContext, uniq: number[], patch: any): Promis
   const items = await sdb.stockItem.findMany({ where: { id: { in: uniq } }, include: { itemName: true } });
   if (items.length !== uniq.length) throw new HttpError(404, 'NOT_FOUND', 'One or more stock items not found');
   for (const it of items) if (it.status !== 'AVAILABLE') throw new HttpError(409, 'CONFLICT', `Item #${it.id} is not AVAILABLE`);
-  await assertNotSold(ctx, uniq);
+  for (const it of items) await assertDocBranchActive(ctx, it); // G7: an inactive branch takes no new writes (a remark-only edit posts nothing)
   const touchByCode = await touchMap(sdb);
   const lctx = lctxOf(ctx);
   await prisma.$transaction(async (tx) => {
-    await lockAvailable(tx, uniq);
-    for (const item of items) await applyStockEdit(tx, lctx, item, patch, touchByCode);
+    await lockAvailable(tx, ctx, uniq);
+    // G7 G: edit the rows as they are under the lock — a bill deleted with stock return meanwhile has put grams back on a LOOSE lot
+    for (const item of await tx.stockItem.findMany({ where: { id: { in: uniq } }, include: { itemName: true } })) await applyStockEdit(tx, lctx, item, patch, touchByCode);
     await logActivity(tx, ctx, { module: 'STOCK', action: 'EDITED', entity: 'StockItem', entityId: uniq.join(','), summary: `Edited ${items.length} stock item(s)` });
   });
   return items.length;
@@ -449,11 +471,11 @@ async function deleteStockItems(ctx: TenantContext, uniq: number[]): Promise<num
   const sdb = scopedDb(ctx);
   const items = await sdb.stockItem.findMany({ where: { id: { in: uniq } } });
   if (items.length !== uniq.length) throw new HttpError(404, 'NOT_FOUND', 'One or more stock items not found');
-  await assertNotSold(ctx, uniq);
   const lctx = lctxOf(ctx);
   await prisma.$transaction(async (tx) => {
     const locked = await tx.stockItem.updateMany({ where: { id: { in: uniq }, status: 'AVAILABLE' }, data: { status: 'DELETED' } });
     if (locked.count !== uniq.length) throw new HttpError(409, 'CONFLICT', 'A stock item is not AVAILABLE or changed concurrently');
+    await assertNotSold(tx, ctx, uniq);
     for (const id of uniq) await ledger.reverseForItem(tx, lctx, id);
     await logActivity(tx, ctx, { module: 'STOCK', action: 'DELETED', entity: 'StockItem', entityId: uniq.join(','), summary: `Deleted ${uniq.length} stock item(s)` });
   });
@@ -473,6 +495,7 @@ export async function deleteStock(ctx: TenantContext, id: number): Promise<void>
 export async function removeStockPhoto(ctx: TenantContext, id: number): Promise<void> {
   const item = await scopedDb(ctx).stockItem.findUnique({ where: { id } });
   if (!item) throw new HttpError(404, 'NOT_FOUND', 'Stock item not found');
+  await assertDocBranchActive(ctx, item); // G7: an inactive branch takes no new writes, whatever X-Branch-Id says
   if (!item.photoUrl) return;
   const abs = await stockImagePath(ctx, id).catch(() => null);
   await scopedDb(ctx).stockItem.update({ where: { id }, data: { photoUrl: null } });
@@ -482,6 +505,8 @@ export async function removeStockPhoto(ctx: TenantContext, id: number): Promise<
 // ───────────── Bulk edit / delete (one tx, reuse the single-item path) ─────────────
 
 export async function bulkEditStock(ctx: TenantContext, ids: number[], patch: any): Promise<BulkResultDto> {
+  // EPC is unique per business — one value can never be applied to many items.
+  if (patch && 'epcCode' in patch) throw new HttpError(400, 'VALIDATION', 'EPC code cannot be bulk-edited — set it per item');
   return { updated: await editStock(ctx, [...new Set(ids)], patch) };
 }
 
@@ -518,7 +543,9 @@ export async function createStockTransfer(ctx: TenantContext, body: { fromBranch
     // Move + race-guard in one write: only still-AVAILABLE items in the source branch move (stays AVAILABLE); count must match.
     const moved = await tx.stockItem.updateMany({ where: { id: { in: uniq }, branchId: body.fromBranchId, status: 'AVAILABLE' }, data: { branchId: body.toBranchId } });
     if (moved.count !== uniq.length) throw new HttpError(409, 'CONFLICT', 'A stock item is no longer AVAILABLE in the source branch');
-    for (const it of items) {
+    // G7 D-f: a partly sold LOOSE lot stays put (a bill delete returns the sold part to it in its own branch); weights as of the lock
+    await assertNotSold(tx, ctx, uniq);
+    for (const it of await tx.stockItem.findMany({ where: { id: { in: uniq } } })) {
       const common = { asset: ledger.assetForStockClass(it.stockClass), karatCode: it.karatCode, pcs: it.pcs, gross: it.gross, net: it.net, fine: it.fine, amount: it.purchaseCost, source: 'STOCK_TRANSFER' as const, sourceId: String(h.id), stockItemId: it.id };
       await ledger.post(tx, lctx, [
         { ...common, branchId: body.fromBranchId, direction: 'OUT', txnDate, narration: `Transfer #${transferNo} out` },

@@ -1,7 +1,7 @@
 import path from 'node:path';
 import { Router } from 'express';
 import multer from 'multer';
-import { requireMpin, requirePermission } from '../../middleware/guards';
+import { requireAnyPermission, requireMpin, requirePermission } from '../../middleware/guards';
 import { HttpError } from '../../middleware/error';
 import { saveStockImage, stockImagePath } from './uploads';
 import {
@@ -68,9 +68,11 @@ inventoryRouter.delete('/tag-templates/:id', requirePermission(PRINTER, 'delete'
 inventoryRouter.post('/tag-templates/:id/activate', requirePermission(PRINTER, 'edit'), async (req, res) => res.json(await extras.activateTagTemplate(req.ctx!, idSchema.parse(req.params.id))));
 
 // Stock — specific paths before /stock/:id so they aren't captured as an id.
-inventoryRouter.get('/stock/all-summary', requirePermission('inventory.all_stock', 'view'), async (req, res) => res.json(await extras.allStockSummary(req.ctx!)));
+// All Stock Summary is also its own plan module (stock_summary): reads accept either key; Set Stock stays inventory edit + MPIN.
+const SUMMARY_READ = ['stock_summary.view', 'inventory.all_stock'];
+inventoryRouter.get('/stock/all-summary', requireAnyPermission(SUMMARY_READ), async (req, res) => res.json(await extras.allStockSummary(req.ctx!)));
 inventoryRouter.post('/stock/all-summary/set', requirePermission('inventory.all_stock', 'edit'), requireMpin, async (req, res) => res.status(201).json(await extras.setStock(req.ctx!, setStockBody.parse(req.body))));
-inventoryRouter.get('/stock/set-stock-logs', requirePermission('inventory.all_stock', 'view'), async (req, res) => res.json(await extras.listSetStockLogs(req.ctx!, setStockLogQuery.parse(req.query))));
+inventoryRouter.get('/stock/set-stock-logs', requireAnyPermission(SUMMARY_READ), async (req, res) => res.json(await extras.listSetStockLogs(req.ctx!, setStockLogQuery.parse(req.query))));
 inventoryRouter.post('/stock/entries', requirePermission('inventory.new_stock', 'edit'), async (req, res) => res.status(201).json(await inv.createStockEntry(req.ctx!, stockEntryBody.parse(req.body))));
 // TASK-98: live tag-no preview for New Stock (read-only peek, never consumes a number)
 inventoryRouter.get('/stock/next-tag', requirePermission('inventory.new_stock', 'view'), async (req, res) => res.json(await inv.peekNextTag(req.ctx!, nextTagQuery.parse(req.query).itemNameId)));

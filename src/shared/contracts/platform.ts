@@ -25,6 +25,8 @@ export const planBody = z.object({
   maxUsers: z.number().int().min(1),
   modules: z.array(moduleKey).min(1),
   isActive: z.boolean().default(true),
+  /** Phase 5: ad-supported free plan — new terms on it show ads (existing terms keep their own snapshot) */
+  adSupported: z.boolean().default(false),
 });
 
 const ownerBody = z.object({
@@ -99,7 +101,11 @@ export const recordPaymentBody = z
   });
 
 /** TASK-95: Super Admin decides a business-submitted payment (only while PENDING). */
-export const reviewPaymentBody = z.object({ status: z.enum(['CONFIRMED', 'REJECTED']) });
+export const reviewPaymentBody = z.object({
+  status: z.enum(['CONFIRMED', 'REJECTED']),
+  /** G2b: explicit renewal decision on CONFIRMED; omitted = the payment's own renewOnConfirm (false on payments older than the flag) */
+  renew: z.boolean().optional(),
+});
 
 export const impersonateBody = z.object({ reason: z.string().trim().min(3).max(300) });
 
@@ -147,6 +153,7 @@ export interface PlanDto {
   maxUsers: number;
   modules: string[];
   isActive: boolean;
+  adSupported: boolean;
   activeSubscriptions: number;
 }
 
@@ -179,6 +186,8 @@ export interface PaymentDto {
   hasProof: boolean;
   /** Plan the business asked for when submitting, else the linked subscription's plan. */
   planName?: string | null;
+  /** G2b: confirming renews that plan automatically (false on legacy / platform-recorded payments: renewal is an explicit choice) */
+  renewOnConfirm?: boolean;
 }
 
 /** Row in /platform/businesses. subscriptionState: active | expiring (≤15 days) | expired | none */

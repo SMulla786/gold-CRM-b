@@ -1,7 +1,9 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { db, truncateAll } from '../../../../test/helpers/db';
 import { createBusiness } from '../../../../test/helpers/factory';
+import { openingBalanceBody } from '../../../shared';
 import * as inv from '../inventory';
+import { createOpeningBalances } from '../opening';
 import * as orders from './service';
 import * as samples from '../samples/service';
 import type { TenantContext } from '../../../middleware/context';
@@ -24,6 +26,8 @@ async function setup() {
   const itemName = await inv.createItemName(ctx, { groupId: group!.id, name: 'Gold Ring', method: 'TAG', tagPrefix: 'GR', tagDigits: 4 });
   const customer = await db.party.create({ data: { businessId: business.id, type: 'CUSTOMER', name: 'Cust', mobile: '9000000001', countryCode: '+91' } });
   const karigar = await db.party.create({ data: { businessId: business.id, type: 'KARIGAR', name: 'Karigar', mobile: '9000000002', countryCode: '+91' } });
+  // karigar issues draw fine gold from the branch's bullion pool (G7 D-i): put some in
+  await createOpeningBalances(ctx, openingBalanceBody.parse({ entries: [{ kind: 'METAL', metal: 'GOLD', metalForm: 'BULLION', fine: 100 }] }));
   return { business, root, ctx, itemName: itemName!, customer, karigar };
 }
 
@@ -174,6 +178,24 @@ describe('orders', () => {
     expect((await orders.listOrders(s.ctx, { ...page, statuses: ['IN_PROCESS', 'CANCELLED'] })).total).toBe(2);
     expect((await orders.listOrders(s.ctx, { ...page, statuses: ['PENDING'] })).total).toBe(0);
     expect((await orders.listOrders(s.ctx, { ...page, status: 'CANCELLED', statuses: ['IN_PROCESS', 'CANCELLED'] })).items.map((o) => o.id)).toEqual([o2.id]);
+  });
+  it('task99: list q searches order no / party name / party mobile / item name', async () => {
+    const s = await setup();
+    const other = await db.party.create({ data: { businessId: s.business.id, type: 'CUSTOMER', name: 'Ramesh Patil', mobile: '9876543210', countryCode: '+91' } });
+    const [group] = await inv.createItemGroups(s.ctx, { stockClass: 'GOLD', names: ['Chains'], gstRate: 3 });
+    const chain = await inv.createItemName(s.ctx, { groupId: group!.id, name: 'Rope Chain', method: 'TAG', tagPrefix: 'RC', tagDigits: 4 });
+    const o1 = await makeOrder(s.ctx, s.itemName.id, s.customer.id);
+    const o2 = await makeOrder(s.ctx, chain!.id, other.id);
+    const page = { page: 1, pageSize: 20 };
+    const ids = async (q: string) => (await orders.listOrders(s.ctx, { ...page, q })).items.map((o) => o.id).sort();
+    expect(await ids(String(o2.orderNo))).toEqual([o2.id]);
+    expect(await ids(`#${o1.orderNo}`)).toEqual([o1.id]);
+    expect(await ids('ramesh')).toEqual([o2.id]);
+    expect(await ids('98765')).toEqual([o2.id]);
+    expect(await ids('rope')).toEqual([o2.id]);
+    expect(await ids('gold ring')).toEqual([o1.id]);
+    expect(await ids('zzz-nothing')).toEqual([]);
+    expect((await orders.listOrders(s.ctx, { ...page, q: '  ' })).total).toBe(2); // blank q = no filter
   });
   it('TASK-98: next-no peeks without consuming (two calls equal, then create gets it); next-tag peek likewise', async () => {
     const s = await setup();

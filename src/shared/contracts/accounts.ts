@@ -182,6 +182,9 @@ export interface DayBookAllInOneRowDto {
   /** TASK-98: running balance AFTER this document (MONEY amount, GOLD/SILVER fine), chronological: opening before `from`
    *  (Day-Book rule, same source filter) + every document up to this one. Rows are listed newest first. */
   balance?: Record<'MONEY' | 'GOLD' | 'SILVER', string>;
+  /** G2b C2: the parent bill of a bill row ('<billId>') and of each of its payment rows ('<billId>-P<n>'); null for other sources.
+   *  Payments stay separate rows — the bill's own row carries only its stock movement, so MONEY is never counted twice. */
+  billId?: number | null;
 }
 
 /**

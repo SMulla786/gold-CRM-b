@@ -160,6 +160,8 @@ export interface SchemeDto {
   branch: { id: number; name: string };
   memberCount: number;
   createdAt: string;
+  /** additive: Σ non-reversed payments that brought money in (CASH / ONLINE / TOKEN / CHEQUE — the media that post a SCHEME ledger row; DRAW / VENDOR excluded) */
+  collected?: string;
 }
 
 export interface SchemeGroupDto {

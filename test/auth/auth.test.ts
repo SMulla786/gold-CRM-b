@@ -70,6 +70,8 @@ describe('auth/refresh + logout', () => {
   it('A6 reusing a rotated (old) refresh token -> 401', async () => {
     const { cookie } = await freshLogin();
     await api.post('/api/auth/refresh').set('Cookie', cookie); // rotate once
+    // past the 5 s two-tab grace window (refresh-grace.test.ts covers the duplicate inside it)
+    await db.session.updateMany({ where: { replacedById: { not: null } }, data: { revokedAt: new Date(Date.now() - 6000) } });
     const reuse = await api.post('/api/auth/refresh').set('Cookie', cookie); // old token replayed
     expect(reuse.status).toBe(401);
   });

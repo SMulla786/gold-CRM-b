@@ -135,10 +135,10 @@ describe('buy-sell', () => {
     expect(Number(m[0]!.fine)).toBe(10);
   });
 
-  it('booking: advance credit; wrong rate → 400; over-delivery → 409; last delivery → DELIVERED; delete restores pending; cancel keeps credit', async () => {
+  it('booking: advance given; wrong rate → 400; over-delivery → 409; last delivery → DELIVERED; delete restores pending; cancel keeps the advance', async () => {
     const s = await setup();
     const book = await bhav.createBhav(s.ctx, bhavBookingBody.parse({ partyId: s.party.id, metal: 'GOLD', side: 'BUY', weight: 10, rate: 60000, cash: 5000 }));
-    expect(Number((await db.udharEntry.findMany({ where: { source: 'BHAV_BOOKING' } }))[0]!.amount)).toBe(-5000); // party credit
+    expect(Number((await db.udharEntry.findMany({ where: { source: 'BHAV_BOOKING' } }))[0]!.amount)).toBe(5000); // BUY advance given = party debit (TRD-04)
 
     await expect(buysell.createBuySell(s.ctx, bs({ partyId: s.party.id, side: 'BUY', lines: [{ weight: 5, rate: 61000 }], bhavBookingId: book.id, cash: 30500 }))).rejects.toMatchObject({ status: 400 });
     await expect(buysell.createBuySell(s.ctx, bs({ partyId: s.party.id, side: 'BUY', lines: [{ weight: 20, rate: 60000 }], bhavBookingId: book.id, cash: 120000 }))).rejects.toMatchObject({ status: 409 });
@@ -151,7 +151,7 @@ describe('buy-sell', () => {
 
     await bhav.cancelBhav(s.ctx, book.id);
     expect((await bhav.getBhav(s.ctx, book.id)).status).toBe('CANCELLED');
-    expect(await db.udharEntry.findMany({ where: { source: 'BHAV_BOOKING', reversalOfId: { not: null } } })).toHaveLength(0); // advance credit untouched
+    expect(await db.udharEntry.findMany({ where: { source: 'BHAV_BOOKING', reversalOfId: { not: null } } })).toHaveLength(0); // advance untouched
   });
 
   it('two concurrent deletes restore the booking without a lost update (BUG-11)', async () => {

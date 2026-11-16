@@ -5,6 +5,7 @@ import { assertMpin, requireMpin, requirePermission } from '../../middleware/gua
 import {
   HEADERS,
   bankAccountBody,
+  deletePartyQuery,
   hsnListQuery,
   hsnToggleBody,
   id as idSchema,
@@ -17,6 +18,7 @@ import {
   putSettingBody,
   rateHistoryQuery,
   rateLimitsBody,
+  setRatesBatchBody,
   setRatesBody,
   updateKaratBody,
   updatePartyBody,
@@ -77,10 +79,8 @@ appRouter.post('/parties', requirePermission(PARTIES, 'edit'), async (req, res) 
   res.status(201).json(dto);
 });
 appRouter.patch('/parties/:id', requirePermission(PARTIES, 'edit'), async (req, res) => res.json(await svc.updateParty(req.ctx!, idSchema.parse(req.params.id), updatePartyBody.parse(req.body))));
-appRouter.delete('/parties/:id', requirePermission(PARTIES, 'delete'), async (req, res) => {
-  await svc.deleteParty(req.ctx!, idSchema.parse(req.params.id));
-  res.status(204).end();
-});
+appRouter.delete('/parties/:id', requirePermission(PARTIES, 'delete'), async (req, res) =>
+  res.json(await svc.deleteParty(req.ctx!, idSchema.parse(req.params.id), deletePartyQuery.parse(req.query).confirm)));
 const FIELD: Record<'photo' | 'shop-logo', PartyImageField> = { photo: 'photoUrl', 'shop-logo': 'shopLogoUrl' };
 const CONTENT_TYPE: Record<string, string> = { '.jpg': 'image/jpeg', '.png': 'image/png', '.webp': 'image/webp' };
 for (const kind of ['photo', 'shop-logo'] as const) {
@@ -103,6 +103,16 @@ for (const kind of ['logo', 'signature', 'watermark'] as const) {
     if (!req.file) throw new HttpError(400, 'VALIDATION', 'No file uploaded (field "file")');
     const rel = await saveInvoiceImage(req.ctx!, INVOICE_FIELD[kind], req.file.buffer);
     res.status(201).json({ url: `/api/app/files/invoice/${kind}`, path: rel });
+  });
+  // TASK-98 Remove: same guard as upload; nulls the invoice.media field, then deletes its file (uuid-named and referenced
+  // only by this field — the same thing upload does to a replaced file). No file / no row → still 204.
+  appRouter.delete(`/settings/invoice/${kind}`, requirePermission(MISC, 'edit'), requireMpin, async (req, res) => {
+    const field = INVOICE_FIELD[kind];
+    const abs = await invoiceImagePath(req.ctx!, field).catch(() => null); // traversal-guarded absolute path, null when unset
+    const media = (await svc.getSettings(req.ctx!))['invoice.media'];
+    await svc.putSetting(req.ctx!, 'invoice.media', undefined, { ...media, [field]: null });
+    if (abs) await (await import('node:fs/promises')).rm(abs, { force: true }).catch(() => {});
+    res.status(204).end();
   });
   appRouter.get(`/files/invoice/${kind}`, async (req, res) => {
     const abs = await invoiceImagePath(req.ctx!, INVOICE_FIELD[kind]);
@@ -155,6 +165,21 @@ appRouter.post('/rates', requirePermission(MISC, 'edit'), async (req, res) => {
     await assertMpin(req.ctx!.userId, req.header(HEADERS.MPIN)); // override requires MPIN
   }
   res.json(await svc.setRates(req.ctx!, body));
+});
+// Atomic multi-metal save (dashboard Edit rates dialog): same permission + per-metal limit check as POST /rates; one MPIN covers every override.
+appRouter.post('/rates/batch', requirePermission(MISC, 'edit'), async (req, res) => {
+  const { metals } = setRatesBatchBody.parse(req.body);
+  let needsMpin = false;
+  const offending: Array<{ metal: Metal; karatCode: string; sellRate: number; buyRate: number }> = [];
+  for (const body of metals) {
+    const off = await svc.checkRateLimits(req.ctx!, body);
+    if (!off.length) continue;
+    if (!body.overrideLimits) offending.push(...off.map((o) => ({ metal: body.metal, ...o })));
+    else needsMpin = true;
+  }
+  if (offending.length) throw new HttpError(400, 'VALIDATION', 'Rates outside allowed limits', { offending });
+  if (needsMpin) await assertMpin(req.ctx!.userId, req.header(HEADERS.MPIN)); // override requires MPIN
+  res.json(await svc.setRatesBatch(req.ctx!, metals));
 });
 appRouter.get('/rates/history', requirePermission(MISC, 'view'), async (req, res) => res.json(await svc.rateHistory(req.ctx!, rateHistoryQuery.parse(req.query))));
 appRouter.get('/rate-limits', requirePermission(MISC, 'view'), async (req, res) => res.json(await svc.listRateLimits(req.ctx!)));

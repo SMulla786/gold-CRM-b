@@ -12,8 +12,12 @@ export const ERROR_CODES = [
   'PLAN_LIMIT', // 403 branch/user limit reached
   'MPIN_REQUIRED', // 403 sensitive action without valid X-MPIN header
   'DAY_CLOSED', // 403 posting onto a branch-day that has been closed in the Day-Book (TASK-80)
+  'BRANCH_INACTIVE', // 403 a write onto a branch switched off in Settings → Branches (reads stay open)
   'NOT_FOUND', // 404 also used for rows outside caller's tenant/subtree
   'CONFLICT', // 409 unique violations
+  'PARTY_HAS_DUES', // 409 party delete: udhar balance ≠ 0 (money, gold or silver)
+  'PARTY_HAS_PENDING_BILLS', // 409 party delete: an ACTIVE bill with final ≠ paid
+  'CONFIRM_REQUIRED', // 409 party delete: unused party, hard delete needs ?confirm=true
   'INTERNAL', // 500
 ] as const;
 export type ErrorCode = (typeof ERROR_CODES)[number];

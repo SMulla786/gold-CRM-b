@@ -184,7 +184,7 @@ export async function dashboard(ctx: TenantContext): Promise<DashboardDto> {
 
 // ───────────── Activity ─────────────
 
-export async function activity(ctx: TenantContext, q: { page: number; pageSize: number; q?: string; from?: Date; to?: Date; module?: string; action?: (typeof ACTIVITY_ACTIONS)[number]; userId?: number }): Promise<Paged<ActivityDto>> {
+export async function activity(ctx: TenantContext, q: { page: number; pageSize: number; q?: string; from?: Date; to?: Date; module?: string; action?: (typeof ACTIVITY_ACTIONS)[number]; userId?: number; entity?: string; entityId?: string }): Promise<Paged<ActivityDto>> {
   const sdb = scopedDb(ctx);
   const branches = branchFilter(ctx);
   const where: any = {
@@ -194,6 +194,8 @@ export async function activity(ctx: TenantContext, q: { page: number; pageSize: 
     ...(q.module ? { module: q.module } : {}),
     ...(q.action ? { action: q.action } : {}),
     ...(q.userId ? { userId: q.userId } : {}),
+    ...(q.entity ? { entity: q.entity } : {}),
+    ...(q.entityId ? { entityId: q.entityId } : {}),
     ...(q.from || q.to ? { createdAt: { ...(q.from ? { gte: q.from } : {}), ...(q.to ? { lte: q.to } : {}) } } : {}),
   };
   const [rows, total] = await Promise.all([

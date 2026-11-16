@@ -1,6 +1,7 @@
 import argon2 from 'argon2';
 import type { Prisma } from '@prisma/client';
 import { prisma } from '../../lib/prisma';
+import { checkedGeo } from '../../lib/geo';
 import { signAccessToken } from '../../middleware/auth';
 import { HttpError } from '../../middleware/error';
 import { buildMe } from '../auth/service';
@@ -58,6 +59,7 @@ const planDto = (p: any): PlanDto => ({
   maxUsers: p.maxUsers,
   modules: p.modules,
   isActive: p.isActive,
+  adSupported: p.adSupported,
   activeSubscriptions: p._count?.subscriptions ?? 0,
 });
 const subDto = (s: any): SubscriptionDto => ({
@@ -89,6 +91,7 @@ const paymentDto = (p: any): PaymentDto => ({
   hasProof: p.screenshotUrl != null,
   // the plan the business asked for, else the linked subscription's plan
   planName: p.plan?.name ?? p.subscription?.plan?.name ?? null,
+  renewOnConfirm: p.renewOnConfirm,
 });
 const signupDto = (s: any, stateName: string, districtName: string | null): SignupRequestDto => ({
   id: s.id,
@@ -290,8 +293,10 @@ export async function businessDetail(businessId: number): Promise<BusinessDetail
   };
 }
 
-export async function updateBusiness(businessId: number, body: Record<string, unknown>): Promise<BusinessDetailDto> {
-  await prisma.business.update({ where: { id: businessId }, data: body });
+export async function updateBusiness(businessId: number, body: Record<string, unknown> & { stateId?: number | null; districtId?: number | null }): Promise<BusinessDetailDto> {
+  const current = await prisma.business.findUnique({ where: { id: businessId }, select: { stateId: true, districtId: true } });
+  if (!current) throw new HttpError(404, 'NOT_FOUND', 'Business not found');
+  await prisma.business.update({ where: { id: businessId }, data: { ...body, ...(await checkedGeo(body, current)) } });
   return businessDetail(businessId);
 }
 
@@ -322,12 +327,17 @@ export async function updatePlan(planId: number, body: Partial<PlanInput>): Prom
 export async function assignSubscription(superAdminId: number, businessId: number, body: AssignSubscriptionInput): Promise<SubscriptionDto> {
   const plan = await prisma.plan.findUnique({ where: { id: body.planId } });
   if (!plan) throw new HttpError(404, 'NOT_FOUND', 'Plan not found');
-  const latest = await prisma.subscription.findFirst({ where: { businessId }, orderBy: { endsAt: 'desc' } });
+  return subDto(await createTerm(prisma, superAdminId, businessId, plan, body));
+}
+
+/** A new subscription term on `plan`; shared by assign and payment confirmation. */
+async function createTerm(client: Prisma.TransactionClient, superAdminId: number, businessId: number, plan: { id: number; durationDays: number; maxBranches: number; maxUsers: number; modules: string[]; adSupported: boolean }, body: Partial<AssignSubscriptionInput>) {
+  const latest = await client.subscription.findFirst({ where: { businessId }, orderBy: { endsAt: 'desc' } });
   const now = new Date();
   // New term starts at the given date, or at the current end if still active, else now.
   const startsAt = body.startsAt ?? (latest && latest.endsAt > now ? latest.endsAt : now);
   const durationDays = body.durationDays ?? plan.durationDays;
-  const sub = await prisma.subscription.create({
+  return client.subscription.create({
     data: {
       businessId,
       planId: plan.id,
@@ -337,11 +347,11 @@ export async function assignSubscription(superAdminId: number, businessId: numbe
       maxUsers: body.maxUsers ?? plan.maxUsers,
       modules: body.modules ?? plan.modules,
       notes: body.notes ?? null,
+      adSupported: plan.adSupported, // snapshot: a later plan edit never changes this term
       createdById: superAdminId,
     },
     include: { plan: true },
   });
-  return subDto(sub);
 }
 
 export async function updateSubscription(subscriptionId: number, body: UpdateSubscriptionInput): Promise<SubscriptionDto> {
@@ -367,16 +377,39 @@ export async function recordPayment(businessId: number, body: RecordPaymentInput
   return paymentDto(p);
 }
 
-/** TASK-95: confirm or reject a PENDING payment exactly once (guarded update — a second decision is a 409). */
-export async function reviewPayment(paymentId: number, status: 'CONFIRMED' | 'REJECTED'): Promise<PaymentDto> {
-  const { count } = await prisma.subscriptionPayment.updateMany({
-    where: { id: paymentId, status: 'PENDING' },
-    data: { status, ...(status === 'CONFIRMED' ? { paidAt: new Date() } : {}) },
+/**
+ * TASK-95: confirm or reject a PENDING payment exactly once (guarded update — a second decision is a 409).
+ * G2b: confirming renews once, in the same transaction (a new term on the payment's plan; the payment then points at it)
+ * when the payment says so (renewOnConfirm: submitted by the business after the flag existed) or the Super Admin decides
+ * it explicitly (`renew`). Older payments never renew on their own — their term may already have been assigned by hand.
+ */
+export async function reviewPayment(superAdminId: number, paymentId: number, status: 'CONFIRMED' | 'REJECTED', renew?: boolean): Promise<PaymentDto> {
+  await prisma.$transaction(async (tx) => {
+    const { count } = await tx.subscriptionPayment.updateMany({
+      where: { id: paymentId, status: 'PENDING' },
+      data: { status, ...(status === 'CONFIRMED' ? { paidAt: new Date() } : {}) },
+    });
+    if (count === 0) {
+      const exists = await tx.subscriptionPayment.findUnique({ where: { id: paymentId }, select: { id: true } });
+      throw exists ? new HttpError(409, 'CONFLICT', 'Payment already reviewed') : new HttpError(404, 'NOT_FOUND', 'Payment not found');
+    }
+    if (status !== 'CONFIRMED') return;
+    const p = await tx.subscriptionPayment.findUniqueOrThrow({ where: { id: paymentId } });
+    if (!(renew ?? p.renewOnConfirm)) return;
+    if (p.planId == null) throw new HttpError(400, 'VALIDATION', 'This payment names no plan to renew — assign one by hand');
+    // one renewal at a time per business, so two confirmations stack their terms instead of both starting at the same end
+    await tx.$executeRaw`SELECT 1 FROM "Business" WHERE id = ${p.businessId} FOR UPDATE`;
+    const plan = await tx.plan.findUniqueOrThrow({ where: { id: p.planId } });
+    const sub = await createTerm(tx, superAdminId, p.businessId, plan, { notes: `Renewed on payment #${p.id}${renew ? ' (explicit decision)' : ''}` });
+    await tx.subscriptionPayment.update({ where: { id: paymentId }, data: { subscriptionId: sub.id } });
+    await tx.activityLog.create({
+      data: {
+        businessId: p.businessId, userId: superAdminId, module: 'PLATFORM', action: 'CREATED', entity: 'Subscription', entityId: String(sub.id),
+        summary: `Subscription renewed on payment #${p.id}${renew ? ' (explicit Super Admin decision)' : ''}`,
+        meta: { paymentId: p.id, planId: plan.id, explicit: renew === true, startsAt: sub.startsAt.toISOString(), endsAt: sub.endsAt.toISOString() },
+      },
+    });
   });
-  if (count === 0) {
-    const exists = await prisma.subscriptionPayment.findUnique({ where: { id: paymentId }, select: { id: true } });
-    throw exists ? new HttpError(409, 'CONFLICT', 'Payment already reviewed') : new HttpError(404, 'NOT_FOUND', 'Payment not found');
-  }
   return paymentDto(await prisma.subscriptionPayment.findUniqueOrThrow({ where: { id: paymentId }, include: PAYMENT_INCLUDE }));
 }
 
@@ -397,7 +430,12 @@ export async function impersonate(superAdminId: number, businessId: number, reas
 }
 
 export async function endImpersonation(superAdminId: number): Promise<void> {
-  await prisma.impersonationLog.updateMany({ where: { superAdminId, endedAt: null }, data: { endedAt: new Date() } });
+  const now = new Date();
+  await prisma.$transaction([
+    prisma.impersonationLog.updateMany({ where: { superAdminId, endedAt: null }, data: { endedAt: now } }),
+    // its tokens die with it (loadContext re-checks the session on every request); the reason keeps a replayed refresh off the theft path
+    prisma.session.updateMany({ where: { impersonatorId: superAdminId, revokedAt: null }, data: { revokedAt: now, revokeReason: 'IMPERSONATION_ENDED' } }),
+  ]);
 }
 
 // ───────────── Shared provisioning ─────────────
@@ -432,6 +470,7 @@ interface PlanInput {
   maxUsers: number;
   modules: string[];
   isActive: boolean;
+  adSupported: boolean;
 }
 interface AssignSubscriptionInput {
   planId: number;
@@ -480,6 +519,7 @@ async function provisionBusiness(
   },
 ): Promise<{ id: number }> {
   const plan = await tx.plan.findUniqueOrThrow({ where: { id: data.planId } });
+  await checkedGeo({ stateId: data.stateId, districtId: data.districtId }); // create + signup approval
   const business = await tx.business.create({
     data: { name: data.name, ownerName: data.ownerName, mobile: data.mobile, alternateMobile: data.alternateMobile ?? null, email: data.email ?? null, gstin: data.gstin ?? null, address: data.address ?? null, stateId: data.stateId ?? null, districtId: data.districtId ?? null },
   });
@@ -501,7 +541,7 @@ async function provisionBusiness(
   });
   const now = new Date();
   await tx.subscription.create({
-    data: { businessId: business.id, planId: plan.id, startsAt: now, endsAt: new Date(now.getTime() + plan.durationDays * DAY), maxBranches: plan.maxBranches, maxUsers: plan.maxUsers, modules: plan.modules, createdById: data.createdById },
+    data: { businessId: business.id, planId: plan.id, startsAt: now, endsAt: new Date(now.getTime() + plan.durationDays * DAY), maxBranches: plan.maxBranches, maxUsers: plan.maxUsers, modules: plan.modules, adSupported: plan.adSupported, createdById: data.createdById },
   });
   // Creation hook (docs/api-phase1.md): seed default karat mappings + rate limits.
   await ensureBusinessDefaults(tx, business.id);

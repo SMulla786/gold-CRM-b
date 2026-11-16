@@ -2,6 +2,7 @@ import type { LedgerEntry, Prisma } from '@prisma/client';
 import { LEDGER_SOURCES } from '../shared';
 import type { LedgerAsset, LedgerSource, StockClass } from '../shared';
 import { HttpError } from '../middleware/error';
+import { assertBranchesActive } from '../middleware/context';
 
 /**
  * Ledger posting core (rebuild-notes §5 / docs/api-phase2.md). The ONLY writer of LedgerEntry.
@@ -50,6 +51,7 @@ export function businessDate(d: Date = new Date()): Date {
 
 /** TASK-80: 403 DAY_CLOSED when any (branch, business day) is CLOSED. post() runs it; callers that move no shop asset call it directly. */
 export async function assertDaysOpen(tx: Prisma.TransactionClient, ctx: LedgerContext, entries: Array<{ branchId: number; txnDate?: Date }>): Promise<void> {
+  await assertBranchesActive(tx, ctx.businessId, entries.map((e) => e.branchId)); // G7: an inactive branch takes no new postings
   const today = businessDate();
   const dayKeys = [...new Map(entries.map((e) => [`${e.branchId}|${businessDate(e.txnDate ?? today).getTime()}`, { branchId: e.branchId, date: businessDate(e.txnDate ?? today) }])).values()];
   if (dayKeys.length) {
@@ -129,6 +131,7 @@ async function writeReversals(tx: Prisma.TransactionClient, ctx: LedgerContext, 
       reversalOfId: r.id,
       createdById: ctx.userId,
     }));
+  await assertBranchesActive(tx, ctx.businessId, data.map((r) => r.branchId)); // G7: nor reversals — its history stays as it was
   if (data.length) await tx.ledgerEntry.createMany({ data });
 }
 

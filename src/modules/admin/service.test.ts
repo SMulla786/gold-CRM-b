@@ -110,6 +110,14 @@ describe('TASK-5b(4) role management is owner/root-only', () => {
     const role = await svc.createRole(s.ownerCtx, 'Floor Staff');
     expect(role.name).toBe('Floor Staff');
   });
+  it("a system role's user count covers this business only (G7 audit L8)", async () => {
+    const s = await setup();
+    const sys = await db.role.create({ data: { name: 'G7 Shared', isSystem: true, businessId: null } });
+    const b = await createBusiness({ name: 'B' });
+    await createUser({ businessId: s.business.id, branchId: s.root.id, level: 'BRANCH_USER', roleId: sys.id });
+    await createUser({ businessId: b.business.id, branchId: b.root.id, level: 'BRANCH_USER', roleId: sys.id });
+    expect((await svc.listRoles(s.ownerCtx)).find((r) => r.id === sys.id)?.userCount).toBe(1);
+  });
 });
 
 describe('Business alternateMobile (Shop Settings "Alternate No")', () => {

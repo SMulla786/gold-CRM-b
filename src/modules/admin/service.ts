@@ -1,6 +1,7 @@
 import argon2 from 'argon2';
 import { prisma } from '../../lib/prisma';
 import { scopedDb } from '../../lib/db';
+import { checkedGeo } from '../../lib/geo';
 import { HttpError } from '../../middleware/error';
 import { assertWithinLimit } from '../../middleware/guards';
 import type { TenantContext } from '../../middleware/context';
@@ -109,6 +110,7 @@ export async function createBranch(ctx: TenantContext, body: {
   if (!parent) throw new HttpError(404, 'NOT_FOUND', 'Parent branch not found');
   const total = await prisma.branch.count({ where: { businessId: ctx.businessId! } });
   assertWithinLimit(total, ctx.limits?.maxBranches, 'branches');
+  await checkedGeo(body);
 
   const created = await prisma.$transaction(async (tx) => {
     const b = await tx.branch.create({
@@ -143,11 +145,13 @@ export async function updateBranch(ctx: TenantContext, branchId: number, body: R
   if (protectedNode && (body.isAdminNode !== undefined || body.isActive !== undefined)) {
     throw new HttpError(400, 'VALIDATION', 'Cannot change admin-node/active status of your own node or the root branch');
   }
-  const updated = await sdb.branch.update({ where: { id: branchId }, data: body });
+  const geo = await checkedGeo(body as { stateId?: number | null; districtId?: number | null }, branch);
+  const updated = await sdb.branch.update({ where: { id: branchId }, data: { ...body, ...geo } });
   return branchNode(updated);
 }
 
 export async function moveBranch(ctx: TenantContext, branchId: number, newParentId: number): Promise<void> {
+  assertNotImpersonating(ctx, 'moving a branch (it changes which admins can reach it)');
   const sdb = scopedDb(ctx);
   const [branch, newParent] = await Promise.all([
     sdb.branch.findUnique({ where: { id: branchId } }),
@@ -235,6 +239,7 @@ export async function createUser(ctx: TenantContext, body: {
   extraBranchIds: number[];
   viewDaysLimit?: number | null;
 }): Promise<UserDto> {
+  assertNotImpersonating(ctx, 'creating a user');
   const sdb = scopedDb(ctx);
   const branch = await sdb.branch.findUnique({ where: { id: body.branchId } });
   if (!branch) throw new HttpError(404, 'NOT_FOUND', 'Branch not found');
@@ -280,6 +285,7 @@ export async function updateUser(ctx: TenantContext, userId: number, body: {
   extraBranchIds?: number[];
   viewDaysLimit?: number | null;
 }): Promise<UserDto> {
+  assertNotImpersonating(ctx, "changing a user's profile, branch, role or access");
   const sdb = scopedDb(ctx);
   const target = await sdb.user.findUnique({ where: { id: userId }, include: { branch: true } });
   if (!target) throw new HttpError(404, 'NOT_FOUND', 'User not found');
@@ -322,25 +328,37 @@ export async function updateUser(ctx: TenantContext, userId: number, body: {
 
 /** BLOCKED / DELETED (trash, soft) both revoke sessions; ACTIVE = unblock or restore from trash. */
 export async function setUserStatus(ctx: TenantContext, userId: number, status: 'ACTIVE' | 'BLOCKED' | 'DELETED'): Promise<void> {
+  assertNotImpersonating(ctx, 'blocking, unblocking, deleting or restoring a user');
   const target = await scopedDb(ctx).user.findUnique({ where: { id: userId } });
   if (!target) throw new HttpError(404, 'NOT_FOUND', 'User not found');
   if (status === 'DELETED' && target.isOwner) throw new HttpError(403, 'FORBIDDEN', 'The owner cannot be deleted');
   if (target.isOwner && !ctx.isOwner) throw new HttpError(403, 'FORBIDDEN', 'Only the owner can block the owner');
   if (status !== 'ACTIVE' && target.id === ctx.userId) throw new HttpError(403, 'FORBIDDEN', 'You cannot block or delete yourself');
   await scopedDb(ctx).user.update({ where: { id: userId }, data: { status } });
-  if (status !== 'ACTIVE') await prisma.session.updateMany({ where: { userId, revokedAt: null }, data: { revokedAt: new Date() } });
+  if (status !== 'ACTIVE') await prisma.session.updateMany({ where: { userId, revokedAt: null }, data: { revokedAt: new Date(), revokeReason: status } });
+}
+
+/**
+ * G7 review 4 + closure: an impersonating Super Admin acts as the owner but must never change who can sign in or what they
+ * can reach — no user account (any user, any field), credentials, MPIN or status, no permission grant, role deletion or role
+ * permissions, no branch move, nor the owner's contacts — since such a change outlives the impersonation. Enforced here, not only in the UI.
+ */
+export function assertNotImpersonating(ctx: TenantContext, what: string): void {
+  if (ctx.impersonatorId != null) throw new HttpError(403, 'FORBIDDEN', `Not allowed while impersonating: ${what}`);
 }
 
 export async function resetUserPassword(ctx: TenantContext, userId: number, password: string): Promise<void> {
+  assertNotImpersonating(ctx, "resetting a user's password");
   const target = await scopedDb(ctx).user.findUnique({ where: { id: userId } });
   if (!target) throw new HttpError(404, 'NOT_FOUND', 'User not found');
   if (target.isOwner && !ctx.isOwner) throw new HttpError(403, 'FORBIDDEN', 'Only the owner can reset the owner');
   await scopedDb(ctx).user.update({ where: { id: userId }, data: { passwordHash: await argon2.hash(password) } });
-  await prisma.session.updateMany({ where: { userId, revokedAt: null }, data: { revokedAt: new Date() } });
+  await prisma.session.updateMany({ where: { userId, revokedAt: null }, data: { revokedAt: new Date(), revokeReason: 'ADMIN_RESET' } });
 }
 
 /** Admin sets/resets a user's MPIN (staff otherwise can't pass MPIN-gated actions until they set one themselves). */
 export async function resetUserMpin(ctx: TenantContext, userId: number, mpin: string): Promise<void> {
+  assertNotImpersonating(ctx, "resetting a user's MPIN");
   const target = await scopedDb(ctx).user.findUnique({ where: { id: userId } });
   if (!target) throw new HttpError(404, 'NOT_FOUND', 'User not found');
   if (target.isOwner && !ctx.isOwner) throw new HttpError(403, 'FORBIDDEN', 'Only the owner can reset the owner');
@@ -371,6 +389,7 @@ export async function getUserPermissions(ctx: TenantContext, userId: number): Pr
 }
 
 export async function putUserPermissions(ctx: TenantContext, userId: number, grants: PermissionGrantDto[]): Promise<UserPermissionsDto> {
+  assertNotImpersonating(ctx, 'changing access permissions');
   if (!(await scopedDb(ctx).user.findUnique({ where: { id: userId } }))) throw new HttpError(404, 'NOT_FOUND', 'User not found');
   const norm = grants.map(normalizeGrant);
   const perms = await prisma.permission.findMany({ where: { key: { in: norm.map((g) => g.key) } } });
@@ -385,7 +404,7 @@ export async function putUserPermissions(ctx: TenantContext, userId: number, gra
 export async function listRoles(ctx: TenantContext): Promise<RoleDto[]> {
   const roles = await prisma.role.findMany({
     where: { OR: [{ businessId: null }, { businessId: ctx.businessId! }] },
-    include: { permissions: { include: { permission: true } }, _count: { select: { users: true } } },
+    include: { permissions: { include: { permission: true } }, _count: { select: { users: { where: { businessId: ctx.businessId! } } } } }, // system roles are shared: count this business's users only (G7 audit L8)
     orderBy: [{ isSystem: 'desc' }, { name: 'asc' }],
   });
   return roles.map((r) => ({
@@ -421,6 +440,7 @@ export async function renameRole(ctx: TenantContext, roleId: number, name: strin
 }
 
 export async function deleteRole(ctx: TenantContext, roleId: number): Promise<void> {
+  assertNotImpersonating(ctx, 'deleting a role');
   await ownRole(ctx, roleId);
   const users = await prisma.user.count({ where: { roleId } });
   if (users) throw new HttpError(409, 'CONFLICT', `Role is assigned to ${users} user(s); move them to another role first`);
@@ -428,6 +448,7 @@ export async function deleteRole(ctx: TenantContext, roleId: number): Promise<vo
 }
 
 export async function putRolePermissions(ctx: TenantContext, roleId: number, grants: PermissionGrantDto[]): Promise<RoleDto> {
+  assertNotImpersonating(ctx, 'changing access permissions');
   await assertRoleManager(ctx);
   const role = await prisma.role.findFirst({ where: { id: roleId, OR: [{ businessId: null }, { businessId: ctx.businessId! }] } });
   if (!role) throw new HttpError(404, 'NOT_FOUND', 'Role not found');
@@ -455,8 +476,12 @@ export async function getBusiness(ctx: TenantContext): Promise<BusinessProfileDt
   return { id: b.id, name: b.name, ownerName: b.ownerName, mobile: b.mobile, alternateMobile: b.alternateMobile, email: b.email, gstin: b.gstin, address: b.address, stateId: b.stateId, districtId: b.districtId };
 }
 
-export async function updateBusiness(ctx: TenantContext, body: Record<string, unknown>): Promise<BusinessProfileDto> {
-  await prisma.business.update({ where: { id: ctx.businessId! }, data: body });
+export async function updateBusiness(ctx: TenantContext, body: Record<string, unknown> & { stateId?: number | null; districtId?: number | null }): Promise<BusinessProfileDto> {
+  const current = await prisma.business.findUniqueOrThrow({ where: { id: ctx.businessId! }, select: { stateId: true, districtId: true, email: true, mobile: true, alternateMobile: true } });
+  // the profile form re-sends unchanged contacts; only an actual change is the owner's to make
+  const contactChanged = (['email', 'mobile', 'alternateMobile'] as const).some((k) => body[k] !== undefined && (body[k] ?? null) !== current[k]);
+  if (contactChanged) assertNotImpersonating(ctx, "the owner's email or mobile");
+  await prisma.business.update({ where: { id: ctx.businessId! }, data: { ...body, ...(await checkedGeo(body, current)) } });
   return getBusiness(ctx);
 }
 
@@ -541,6 +566,7 @@ export async function recordSubscriptionPayment(ctx: TenantContext, body: { amou
       paidAt: body.paidAt ?? null,
       recordedById: ctx.userId,
       planId: body.planId ?? null,
+      renewOnConfirm: body.planId != null, // G2b: the business chose a plan → confirming renews it
     },
   });
   return { id: p.id };

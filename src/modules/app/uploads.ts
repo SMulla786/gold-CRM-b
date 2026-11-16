@@ -3,10 +3,13 @@ import { mkdir, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { scopedDb } from '../../lib/db';
 import { prisma } from '../../lib/prisma';
+import { env } from '../../config/env';
+import { logger } from '../../config/logger';
 import { HttpError } from '../../middleware/error';
+import { assertDocBranchActive } from '../../middleware/context';
 import type { TenantContext } from '../../middleware/context';
 
-const UPLOAD_ROOT = path.join(process.cwd(), 'uploads');
+export const UPLOAD_ROOT = path.resolve(env.UPLOAD_DIR ?? path.join(process.cwd(), 'uploads'));
 export type PartyImageField = 'photoUrl' | 'shopLogoUrl';
 
 type FindRow = () => Promise<Record<string, unknown> | null>; // scopedDb findUnique — tenant/branch filter already applied
@@ -24,6 +27,7 @@ function detectImage(buf: Buffer): 'jpg' | 'png' | 'webp' | null {
 async function saveImage(ctx: TenantContext, find: FindRow, save: SaveRel, subdir: string, field: string, buffer: Buffer, notFound: string): Promise<string> {
   const row = await find();
   if (!row) throw new HttpError(404, 'NOT_FOUND', notFound);
+  if (typeof row.branchId === 'number') await assertDocBranchActive(ctx, { branchId: row.branchId }); // G7: no new writes on an inactive branch
   const ext = detectImage(buffer);
   if (!ext) throw new HttpError(400, 'VALIDATION', 'Only JPEG, PNG or WebP images are allowed');
 
@@ -52,6 +56,16 @@ export const savePartyImage = (ctx: TenantContext, partyId: number, field: Party
   saveImage(ctx, () => scopedDb(ctx).party.findUnique({ where: { id: partyId } }), (rel) => scopedDb(ctx).party.update({ where: { id: partyId }, data: { [field]: rel } }), 'parties', field, buffer, 'Party not found');
 export const partyImagePath = (ctx: TenantContext, partyId: number, field: PartyImageField): Promise<string> =>
   imagePath(() => scopedDb(ctx).party.findUnique({ where: { id: partyId } }), field);
+
+/** After a party hard delete commits: removes its images, but only files savePartyImage wrote for this business and no other party still uses. */
+export async function removePartyImages(businessId: number, stored: (string | null)[]): Promise<void> {
+  const own = path.join(UPLOAD_ROOT, String(businessId), 'parties') + path.sep;
+  for (const rel of new Set(stored)) {
+    if (!rel || !path.resolve(UPLOAD_ROOT, rel).startsWith(own)) continue; // traversal, or not a party upload of this business
+    if (await prisma.party.count({ where: { OR: [{ photoUrl: rel }, { shopLogoUrl: rel }] } })) continue; // shared: never delete
+    await rm(path.resolve(UPLOAD_ROOT, rel), { force: true }).catch((e: unknown) => logger.warn(`party image not removed (orphan file): ${rel}  ${String(e)}`));
+  }
+}
 export const saveStockImage = (ctx: TenantContext, stockId: number, buffer: Buffer): Promise<string> =>
   saveImage(ctx, () => scopedDb(ctx).stockItem.findUnique({ where: { id: stockId } }), (rel) => scopedDb(ctx).stockItem.update({ where: { id: stockId }, data: { photoUrl: rel } }), 'stock', 'photoUrl', buffer, 'Stock item not found');
 export const stockImagePath = (ctx: TenantContext, stockId: number): Promise<string> =>
@@ -102,7 +116,8 @@ export const platformPaymentProofPath = (paymentId: number): Promise<string> =>
 // Girvi item photo — GirviItem has no tenant columns, so it is visible only when its batch is in the caller's scope.
 async function scopedGirviItem(ctx: TenantContext, itemId: number) {
   const item = await prisma.girviItem.findUnique({ where: { id: itemId } });
-  return item && (await scopedDb(ctx).girviBatch.findFirst({ where: { id: item.batchId }, select: { id: true } })) ? item : null;
+  const batch = item && (await scopedDb(ctx).girviBatch.findFirst({ where: { id: item.batchId }, select: { branchId: true } }));
+  return item && batch ? { ...item, branchId: batch.branchId } : null;
 }
 export const saveGirviItemPhoto = (ctx: TenantContext, itemId: number, buffer: Buffer): Promise<string> =>
   saveImage(ctx, () => scopedGirviItem(ctx, itemId), (rel) => prisma.girviItem.update({ where: { id: itemId }, data: { photoUrl: rel } }), 'girvi', 'photoUrl', buffer, 'Girvi item not found');
@@ -113,6 +128,7 @@ const scopedGirviBatch = (ctx: TenantContext, batchId: number) => scopedDb(ctx).
 export async function saveGirviDoc(ctx: TenantContext, batchId: number, buffer: Buffer): Promise<string> {
   const row = await scopedGirviBatch(ctx, batchId);
   if (!row) throw new HttpError(404, 'NOT_FOUND', 'Girvi not found');
+  await assertDocBranchActive(ctx, row); // G7: an inactive branch takes no new writes, whatever X-Branch-Id says
   const ext = detectImage(buffer) ?? (buffer.length >= 5 && buffer.toString('ascii', 0, 5) === '%PDF-' ? 'pdf' : null);
   if (!ext) throw new HttpError(400, 'VALIDATION', 'Only JPEG, PNG, WebP or PDF files are allowed');
   const rel = `${ctx.businessId}/girvi-docs/${randomUUID()}.${ext}`;
@@ -124,3 +140,13 @@ export async function saveGirviDoc(ctx: TenantContext, batchId: number, buffer: 
   return rel;
 }
 export const girviDocPath = (ctx: TenantContext, batchId: number): Promise<string> => imagePath(() => scopedGirviBatch(ctx, batchId), 'docUrl');
+
+// Just Bill line photo — JustBillItem has no tenant columns, so it is visible only when its just bill is in the caller's scope.
+async function scopedJustBillItem(ctx: TenantContext, itemId: number) {
+  const item = await prisma.justBillItem.findUnique({ where: { id: itemId } });
+  const bill = item && (await scopedDb(ctx).justBill.findFirst({ where: { id: item.justBillId }, select: { branchId: true } }));
+  return item && bill ? { ...item, branchId: bill.branchId } : null;
+}
+export const saveJustBillItemPhoto = (ctx: TenantContext, itemId: number, buffer: Buffer): Promise<string> =>
+  saveImage(ctx, () => scopedJustBillItem(ctx, itemId), (rel) => prisma.justBillItem.update({ where: { id: itemId }, data: { photoUrl: rel } }), 'justbill', 'photoUrl', buffer, 'Just bill item not found');
+export const justBillItemPhotoPath = (ctx: TenantContext, itemId: number): Promise<string> => imagePath(() => scopedJustBillItem(ctx, itemId), 'photoUrl');

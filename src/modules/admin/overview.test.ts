@@ -27,6 +27,8 @@ async function addStock(businessId: number, branchId: number, stockClass: 'GOLD'
 }
 async function addUdhar(businessId: number, branchId: number, partyId: number, amount: number, gold = 0, silver = 0) {
   seq++;
+  // partyId is a label here, but the party must exist (real FK since G7 Phase 4)
+  await db.party.upsert({ where: { id: partyId }, update: {}, create: { id: partyId, businessId, type: 'CUSTOMER', name: `P${partyId}`, mobile: '9000000000', countryCode: '+91' } });
   await db.udharEntry.create({ data: { businessId, branchId, partyId, txnDate: new Date(), amount, gold, silver, source: 'UDHAR', sourceId: `u${seq}` } });
 }
 

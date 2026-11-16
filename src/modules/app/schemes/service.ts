@@ -6,7 +6,7 @@ import * as udhar from '../../../lib/udhar';
 import { logActivity } from '../../../lib/activity';
 import { HttpError } from '../../../middleware/error';
 import type { TenantContext } from '../../../middleware/context';
-import { moneyToMetal, schemeMaturity, SCHEME_BANK_MEDIUMS } from '../../../shared';
+import { moneyToMetal, RATE_UNIT_GRAMS, schemeMaturity, SCHEME_BANK_MEDIUMS } from '../../../shared';
 import type { SchemeDto, SchemeGroupDto, EnrollmentDto, EnrollmentDetailDto, SchemePaymentDto, SchemeDueRowDto, SchemeDueMonthRowDto, SchemeTxnRowDto, SchemeDayBookDto, SchemeDayBookDayDto } from '../../../shared';
 import { currentRates } from '../service';
 
@@ -15,7 +15,7 @@ import { currentRates } from '../service';
 const D = (v: unknown) => new Prisma.Decimal((v as Prisma.Decimal.Value) ?? 0);
 const money = (v: unknown) => D(v).toFixed(2);
 const wt = (v: unknown) => D(v).toFixed(3);
-const GOLD_UNIT = 10; // gold scheme rates are per 10 g
+const GOLD_UNIT = 10; // gold scheme rates are per 10 g (the UI labels them /10g); today's rate is converted from the shop's rate unit
 const lctxOf = (ctx: TenantContext) => ({ businessId: ctx.businessId!, branchIds: ctx.branchIds, userId: ctx.userId });
 
 function activeBranch(ctx: TenantContext): number {
@@ -59,7 +59,13 @@ const istDayRange = (from?: Date, to?: Date) => ({
 });
 /** Inclusive range on a @db.Date column. */
 const dateColRange = (from?: Date, to?: Date) => ({ ...(from ? { gte: dateOnly(from) } : {}), ...(to ? { lte: dateOnly(to) } : {}) });
-const todayGoldRate = async (ctx: TenantContext) => Number((await currentRates(ctx)).gold.rows[0]?.sellRate ?? 0);
+/** Today's GOLD scheme rate per 10 g (0 = none set). G7 D-h rule: the highest-touch karat with a rate > 0 — the purest rated karat, matching the payments' `fine` (a karat saved at 0, e.g. one the shop doesn't deal in, is skipped). */
+const todayGoldRate = async (ctx: TenantContext) => {
+  const g = (await currentRates(ctx)).gold;
+  const top = g.rows.filter((r) => Number(r.sellRate) > 0).sort((a, b) => Number(b.touch) - Number(a.touch) || Number(b.sellRate) - Number(a.sellRate))[0];
+  return top ? (Number(top.sellRate) * GOLD_UNIT) / RATE_UNIT_GRAMS[g.rateUnit] : 0;
+};
+const NO_GOLD_RATE = "Set today's gold rate first";
 const isP2002 = (e: unknown) => e instanceof Prisma.PrismaClientKnownRequestError && e.code === 'P2002';
 
 /** Row-lock the enrollment inside a tx (serializes a concurrent payment against a redeem — BUG-13) and return its live status. */
@@ -127,7 +133,8 @@ export async function createGroup(ctx: TenantContext, body: any): Promise<Scheme
 
 export async function listGroups(ctx: TenantContext, q: any): Promise<SchemeGroupDto[]> {
   const sdb = scopedDb(ctx);
-  const schemeIds = q.schemeId ? [q.schemeId] : (await sdb.scheme.findMany({ select: { id: true } })).map((s) => s.id);
+  // a requested schemeId is resolved through scopedDb too, so another business's groups are never listed (G7 audit M1)
+  const schemeIds = (await sdb.scheme.findMany({ where: q.schemeId ? { id: q.schemeId } : {}, select: { id: true } })).map((s) => s.id);
   if (schemeIds.length === 0) return [];
   const groups = await prisma.schemeGroup.findMany({ where: { schemeId: { in: schemeIds } }, orderBy: { id: 'asc' } });
   const counts = await prisma.schemeEnrollment.groupBy({ by: ['groupId'], where: { groupId: { in: groups.map((g) => g.id) } }, _count: { _all: true } });
@@ -206,6 +213,7 @@ async function postPayment(tx: Prisma.TransactionClient, ctx: TenantContext, enr
   const txnDate = input.txnDate ? dateOnly(input.txnDate) : ledger.businessDate();
   const gold = scheme.type === 'GOLD';
   const rate = gold ? (input.rate != null ? Number(input.rate) : goldRate) : null;
+  if (gold && !(rate! > 0)) throw new HttpError(409, 'CONFLICT', NO_GOLD_RATE); // G7 D-h: never credit 0 g for real money
   const fine = gold ? moneyToMetal(input.amount, rate ?? 0, GOLD_UNIT) : null;
   if (SCHEME_BANK_MEDIUMS.includes(medium) && input.bankAccountId != null && !(await scopedDb(ctx).bankAccount.findUnique({ where: { id: input.bankAccountId } }))) throw new HttpError(404, 'NOT_FOUND', 'Bank account not found');
 
@@ -287,11 +295,12 @@ export const redeemRateFor = async (ctx: TenantContext, scheme: { type: string }
 
 /**
  * The redeem tx body (scheme page + TASK-98 bill SCHEME payments): lock, maturity, close, credit the party's udhar with the maturity value.
- * early 'auto' (bills) = withdraw when not matured yet. billId (bills) is stored with the pre-redeem status so the bill can reopen it.
+ * early 'auto' (bills) = withdraw when not matured yet. billId (bills) / justBillId (Just Bills) is stored with the pre-redeem status so the bill can reopen it.
  */
-export async function redeemInTx(tx: Prisma.TransactionClient, ctx: TenantContext, e: any, scheme: any, opts: { early: boolean | 'auto'; redeemRate: number; billId?: number }): Promise<Prisma.Decimal> {
+export async function redeemInTx(tx: Prisma.TransactionClient, ctx: TenantContext, e: any, scheme: any, opts: { early: boolean | 'auto'; redeemRate: number; billId?: number; justBillId?: number }): Promise<Prisma.Decimal> {
   const id = e.id;
   const gold = scheme.type === 'GOLD';
+  if (gold && !(opts.redeemRate > 0)) throw new HttpError(409, 'CONFLICT', `${NO_GOLD_RATE}, then redeem`); // G7 D-h: not closed at ₹0
   // lock the row BEFORE reading payments, so a concurrent addPayment is either included here or blocked out (BUG-13)
   const status = await lockEnrollment(tx, id);
   if (status !== 'ACTIVE' && status !== 'WON') throw new HttpError(409, 'CONFLICT', 'Enrollment was just closed');
@@ -302,7 +311,7 @@ export async function redeemInTx(tx: Prisma.TransactionClient, ctx: TenantContex
   const m = schemeMaturity({ type: scheme.type, payments: payments.map((p) => ({ amount: p.amount, fine: p.fine })), bonusType: scheme.bonusType, bonusValue: scheme.bonusValue, emiAmount: e.emiAmount, redeemRate: opts.redeemRate, rateUnitGrams: GOLD_UNIT, early });
   const r = await tx.schemeEnrollment.updateMany({
     where: { id, status: { in: ['ACTIVE', 'WON'] } },
-    data: { status: early ? 'WITHDRAWN' : 'CLOSED', redeemValue: m.maturityValue, redeemFine: gold ? m.maturity : null, redeemRate: gold ? opts.redeemRate : null, closedAt: new Date(), ...(opts.billId != null ? { redeemBillId: opts.billId, statusBeforeRedeem: status as any } : {}) },
+    data: { status: early ? 'WITHDRAWN' : 'CLOSED', redeemValue: m.maturityValue, redeemFine: gold ? m.maturity : null, redeemRate: gold ? opts.redeemRate : null, closedAt: new Date(), ...(opts.billId != null ? { redeemBillId: opts.billId, statusBeforeRedeem: status as any } : {}), ...(opts.justBillId != null ? { redeemJustBillId: opts.justBillId, statusBeforeRedeem: status as any } : {}) },
   });
   if (r.count !== 1) throw new HttpError(409, 'CONFLICT', 'Enrollment was just closed');
   // credit the customer (shop owes them the maturity value); a Sell Bill nets it like an order advance
@@ -319,6 +328,16 @@ export async function reopenForBill(tx: Prisma.TransactionClient, ctx: TenantCon
   await udhar.reverse(tx, lctxOf(ctx), { source: 'SCHEME', sourceId: String(enrollmentId) });
   await tx.schemeEnrollment.update({ where: { id: enrollmentId }, data: { status: e.statusBeforeRedeem, redeemValue: null, redeemFine: null, redeemRate: null, closedAt: null, redeemBillId: null, statusBeforeRedeem: null } });
   await logActivity(tx, ctx, { module: 'SCHEME', action: 'EDITED', entity: 'SchemeEnrollment', entityId: String(enrollmentId), summary: `Enrollment ${e.assignId} reopened (bill #${billId} undone)` });
+}
+
+/** Just Bill SCHEME payment undo (just bill delete) — mirrors reopenForBill but checks/clears redeemJustBillId. */
+export async function reopenForJustBill(tx: Prisma.TransactionClient, ctx: TenantContext, enrollmentId: number, justBillId: number): Promise<void> {
+  await lockEnrollment(tx, enrollmentId);
+  const e = await tx.schemeEnrollment.findUniqueOrThrow({ where: { id: enrollmentId } });
+  if (e.redeemJustBillId !== justBillId || e.statusBeforeRedeem == null) throw new HttpError(409, 'CONFLICT', 'Scheme enrollment was not redeemed by this just bill');
+  await udhar.reverse(tx, lctxOf(ctx), { source: 'SCHEME', sourceId: String(enrollmentId) });
+  await tx.schemeEnrollment.update({ where: { id: enrollmentId }, data: { status: e.statusBeforeRedeem, redeemValue: null, redeemFine: null, redeemRate: null, closedAt: null, redeemJustBillId: null, statusBeforeRedeem: null } });
+  await logActivity(tx, ctx, { module: 'SCHEME', action: 'EDITED', entity: 'SchemeEnrollment', entityId: String(enrollmentId), summary: `Enrollment ${e.assignId} reopened (just bill #${justBillId} deleted)` });
 }
 
 export async function listEnrollments(ctx: TenantContext, q: any): Promise<{ items: EnrollmentDto[]; total: number; page: number; pageSize: number }> {
@@ -428,6 +447,12 @@ async function buildSchemes(ctx: TenantContext, ids: number[]): Promise<SchemeDt
   const schemes = await sdb.scheme.findMany({ where: { id: { in: ids } } });
   const branches = await sdb.branch.findMany({ where: { id: { in: [...new Set(schemes.map((s) => s.branchId))] } }, select: { id: true, name: true } });
   const counts = await prisma.schemeEnrollment.groupBy({ by: ['schemeId'], where: { schemeId: { in: ids } }, _count: { _all: true } });
+  // money collected per scheme: same media that post a SCHEME money-in ledger row (postPayment); ids are already business-scoped above
+  const collectedRows = await prisma.$queryRaw<{ schemeId: number; s: Prisma.Decimal | null }[]>(Prisma.sql`
+    SELECT e."schemeId" AS "schemeId", COALESCE(SUM(p.amount),0)::numeric AS s FROM "SchemePayment" p JOIN "SchemeEnrollment" e ON e.id = p."enrollmentId"
+    WHERE e."schemeId" IN (${Prisma.join(schemes.map((x) => x.id).concat(0))}) AND NOT p."isReversed" AND p.medium::text IN ('CASH', 'ONLINE', 'TOKEN', 'CHEQUE')
+    GROUP BY 1`);
+  const collectedMap = new Map(collectedRows.map((r) => [r.schemeId, D(r.s)]));
   const branchMap = new Map(branches.map((b) => [b.id, b.name]));
   const countMap = new Map(counts.map((c) => [c.schemeId, c._count._all]));
   const byId = new Map(schemes.map((s) => [s.id, s]));
@@ -435,7 +460,7 @@ async function buildSchemes(ctx: TenantContext, ids: number[]): Promise<SchemeDt
     id: s.id, kind: s.kind, type: s.type, name: s.name, title: s.title, description: s.description, emiAmount: money(s.emiAmount), tenureMonths: s.tenureMonths,
     bonusType: s.bonusType, bonusValue: s.type === 'GOLD' ? wt(s.bonusValue) : money(s.bonusValue), startDate: s.startDate.toISOString().slice(0, 10),
     validityDate: s.validityDate?.toISOString().slice(0, 10) ?? null, isActive: s.isActive, branch: { id: s.branchId, name: branchMap.get(s.branchId) ?? '' },
-    memberCount: countMap.get(s.id) ?? 0, createdAt: s.createdAt.toISOString(),
+    memberCount: countMap.get(s.id) ?? 0, createdAt: s.createdAt.toISOString(), collected: money(collectedMap.get(s.id) ?? 0),
   }));
 }
 

@@ -5,6 +5,7 @@ import { scopedDb } from '../../lib/db';
 import * as ledger from '../../lib/ledger';
 import * as udhar from '../../lib/udhar';
 import { logActivity } from '../../lib/activity';
+import { poolGuard, poolsOf } from '../../lib/kacha';
 import { HttpError } from '../../middleware/error';
 import type { TenantContext } from '../../middleware/context';
 import type { OpeningBatchDto, OpeningEntryInput } from '../../shared';
@@ -67,8 +68,26 @@ export async function deleteOpeningBalances(ctx: TenantContext, sourceId: string
   if (led + ud === 0) throw new HttpError(404, 'NOT_FOUND', 'Opening balance not found');
   const lctx = lctxOf(ctx);
   await prisma.$transaction(async (tx) => {
+    // G5 lock order: a batch has no document row, so its own standing rows are locked first; a concurrent delete waits, then finds nothing left
+    const rows = await tx.$queryRaw<{ id: bigint; branchId: number; asset: string; metalForm: string | null }[]>(Prisma.sql`
+      SELECT e.id, e."branchId", e.asset::text AS asset, e."metalForm"::text AS "metalForm" FROM "LedgerEntry" e
+      WHERE e."businessId" = ${ctx.businessId!} AND e.source = 'OPENING_BALANCE' AND e."sourceId" = ${sourceId} AND e."reversalOfId" IS NULL
+        AND NOT EXISTS (SELECT 1 FROM "LedgerEntry" r WHERE r."reversalOfId" = e.id)
+      ORDER BY e.id FOR UPDATE OF e`);
+    // G7 audit M4: lock the party rows too — a party-only batch has no ledger rows, so without this two deletes both reverse it
+    const udIds = (await tx.$queryRaw<{ id: bigint }[]>(Prisma.sql`
+      SELECT id FROM "UdharEntry" WHERE "businessId" = ${ctx.businessId!} AND source = 'OPENING_BALANCE' AND "sourceId" = ${sourceId} AND "reversalOfId" IS NULL
+      ORDER BY id FOR UPDATE`)).map((u) => u.id);
+    const udReversed = await tx.udharEntry.count({ where: { reversalOfId: { in: udIds } } });
+    if (rows.length + udIds.length - udReversed === 0) throw new HttpError(404, 'NOT_FOUND', 'Opening balance not found');
+    // removing an opening KACHA / BULLION row takes that metal out of the pool: 409 if it has since been melted / sold
+    const guards = [];
+    for (const branchId of [...new Set(rows.map((r) => r.branchId))]) {
+      guards.push(await poolGuard(tx, branchId, poolsOf(rows.filter((r) => r.branchId === branchId).map((r) => ({ metal: r.asset, metalForm: r.metalForm })))));
+    }
     await ledger.reverse(tx, lctx, { source: 'OPENING_BALANCE', sourceId });
     await udhar.reverse(tx, lctx, { source: 'OPENING_BALANCE', sourceId });
+    for (const check of guards) await check();
     await logActivity(tx, ctx, { module: 'OPENING_BALANCE', action: 'DELETED', entity: 'OPENING', entityId: sourceId, summary: 'Deleted opening balances' });
   });
 }

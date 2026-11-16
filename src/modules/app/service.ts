@@ -1,3 +1,4 @@
+import { Prisma } from '@prisma/client';
 import { prisma } from '../../lib/prisma';
 import { scopedDb } from '../../lib/db';
 import { HttpError } from '../../middleware/error';
@@ -6,6 +7,7 @@ import { SETTING_SCHEMAS } from '../../shared';
 import type {
   BankAccountDto,
   CurrentRatesDto,
+  DeletePartyResultDto,
   HsnDto,
   KaratDto,
   Metal,
@@ -21,7 +23,9 @@ import type {
   SettingKey,
   SettingsDto,
 } from '../../shared';
-import { SETTING_KEYS } from '../../shared';
+import { RATE_UNIT_GRAMS, SETTING_KEYS } from '../../shared';
+import { logger } from '../../config/logger';
+import { removePartyImages } from './uploads';
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 const partyRef = (p: any): PartyRefDto => ({ id: p.id, type: p.type, name: p.name, mobile: p.mobile, shopName: p.shopName });
@@ -156,10 +160,49 @@ export async function updateParty(ctx: TenantContext, partyId: number, body: Rec
   return getParty(ctx, partyId);
 }
 
-export async function deleteParty(ctx: TenantContext, partyId: number): Promise<void> {
-  const target = await scopedDb(ctx).party.findUnique({ where: { id: partyId } });
-  if (!target) throw new HttpError(404, 'NOT_FOUND', 'Party not found');
-  await scopedDb(ctx).party.update({ where: { id: partyId }, data: { isActive: false } });
+/** Every column holding a party id. All are real FKs (ON DELETE NO ACTION; parentId SET NULL); the history check reads them (guarded by party-delete.test). */
+export const PARTY_REFS = [
+  ['LedgerEntry', 'partyId'], ['Bill', 'partyId'], ['UdharEntry', 'partyId'], ['UdharTxn', 'partyId'], ['JustBill', 'partyId'],
+  ['SalesDraft', 'partyId'], ['Order', 'partyId'], ['KarigarIssue', 'karigarId'], ['RepairTicket', 'partyId'], ['RepairTicket', 'karigarId'],
+  ['GirviBatch', 'partyId'], ['GirviTransfer', 'lenderPartyId'], ['Exchange', 'partyId'], ['BuySell', 'partyId'], ['BhavBooking', 'partyId'],
+  ['SchemeEnrollment', 'partyId'], ['Sample', 'partyId'], ['Sample', 'karigarId'], ['SampleMovement', 'partyId'], ['SampleMovement', 'karigarId'],
+  ['Party', 'parentId'],
+] as const;
+
+/** `referenced` (internal): the FK refused a hard delete, so this run archives regardless of the history check. */
+export async function deleteParty(ctx: TenantContext, partyId: number, confirm = false, referenced = false): Promise<DeletePartyResultDto> {
+  const businessId = ctx.businessId!;
+  let images: (string | null)[] = []; // set only once the row is deleted; the files go after the commit
+  const out = await prisma.$transaction(async (tx) => {
+    // row lock: concurrent deletes of the same party run one after the other
+    const [party] = await tx.$queryRaw<{ id: number; photoUrl: string | null; shopLogoUrl: string | null }[]>`SELECT id, "photoUrl", "shopLogoUrl" FROM "Party" WHERE id = ${partyId} AND "businessId" = ${businessId} FOR UPDATE`;
+    if (!party) throw new HttpError(404, 'NOT_FOUND', 'Party not found');
+    // business-wide on purpose (not the caller's branches): dues or bills in another branch still block
+    const due = await tx.udharEntry.aggregate({ where: { businessId, partyId }, _sum: { amount: true, gold: true, silver: true } });
+    if ([due._sum.amount, due._sum.gold, due._sum.silver].some((v) => v != null && !v.isZero())) {
+      throw new HttpError(409, 'PARTY_HAS_DUES', 'This party has outstanding dues (money, gold or silver). Settle them before removing the party.');
+    }
+    // same rule as the Pending Bills list (udhar.pendingBills): an ACTIVE bill with final ≠ paid
+    const [{ pending } = { pending: 0 }] = await tx.$queryRaw<{ pending: number }[]>`SELECT count(*)::int AS pending FROM "Bill" WHERE "businessId" = ${businessId} AND "partyId" = ${partyId} AND status::text = 'ACTIVE' AND final <> paid`;
+    if (pending > 0) throw new HttpError(409, 'PARTY_HAS_PENDING_BILLS', `This party has ${pending} pending bill(s). Settle them before removing the party.`);
+    const used = PARTY_REFS.map(([t, c]) => Prisma.sql`EXISTS (SELECT 1 FROM ${Prisma.raw(`"${t}"`)} WHERE ${Prisma.raw(`"${c}"`)} = ${partyId})`);
+    const [{ hasHistory } = { hasHistory: true }] = await tx.$queryRaw<{ hasHistory: boolean }[]>(Prisma.sql`SELECT (${Prisma.join(used, ' OR ')}) AS "hasHistory"`);
+    if (hasHistory || referenced) {
+      await tx.party.update({ where: { id: partyId }, data: { isActive: false } });
+      return { result: 'ARCHIVED' as const };
+    }
+    if (!confirm) throw new HttpError(409, 'CONFIRM_REQUIRED', 'This party has no history and will be permanently deleted. Confirm to continue.');
+    await tx.party.delete({ where: { id: partyId } });
+    images = [party.photoUrl, party.shopLogoUrl];
+    return { result: 'DELETED' as const };
+  }).catch((e: unknown) => {
+    // P2003: an FK refused the delete (a reference the history check did not see) → run once more as referenced: dues/bill checks, then archive
+    if (!referenced && e instanceof Prisma.PrismaClientKnownRequestError && e.code === 'P2003') return deleteParty(ctx, partyId, confirm, true);
+    throw e;
+  });
+  // best effort: the party is already gone; a leftover file is only logged
+  if (out.result === 'DELETED') await removePartyImages(businessId, images).catch((e: unknown) => logger.warn(`party #${partyId} images not cleaned up: ${String(e)}`));
+  return out;
 }
 
 // ───────────── Bank accounts ─────────────
@@ -255,18 +298,34 @@ async function metalRates(ctx: TenantContext, metal: Metal): Promise<CurrentRate
   let head = ctx.activeBranchId != null ? await pick(ctx.activeBranchId) : null;
   if (!head) head = await pick(0);
   if (!head) return { rateUnit: DEFAULT_UNIT[metal], updatedAt: null, rows: [] };
-  const [rows, karats] = await Promise.all([
+  const [rows, karats, prevRows] = await Promise.all([
     sdb.metalRate.findMany({ where: { metal, branchId: head.branchId, rateUnit: head.rateUnit, effectiveAt: head.effectiveAt } }),
     sdb.karatMapping.findMany({ where: { metal } }),
+    // newest earlier row per karat (same branch) — the trend arrow's "previous rate"
+    sdb.metalRate.findMany({ where: { metal, branchId: head.branchId, effectiveAt: { lt: head.effectiveAt } }, orderBy: { effectiveAt: 'desc' }, distinct: ['karatCode'] }),
   ]);
   const byCode = new Map(karats.map((k) => [k.code, k]));
-  const rateRows: RateRowDto[] = rows.map((r) => ({ karatCode: r.karatCode, title: byCode.get(r.karatCode)?.title ?? r.karatCode, touch: String(byCode.get(r.karatCode)?.touch ?? ''), sellRate: r.sellRate.toString(), buyRate: r.buyRate.toString() }));
+  const headGrams = RATE_UNIT_GRAMS[head.rateUnit as RateUnitKey];
+  // previous sell rate re-expressed in the current unit (a unit switch between saves must not read as a price jump)
+  const prevByCode = new Map(prevRows.map((p) => [p.karatCode, (Number(p.sellRate) * headGrams) / RATE_UNIT_GRAMS[p.rateUnit as RateUnitKey]]));
+  const rateRows: RateRowDto[] = rows.map((r) => {
+    const prev = prevByCode.get(r.karatCode);
+    return { karatCode: r.karatCode, title: byCode.get(r.karatCode)?.title ?? r.karatCode, touch: String(byCode.get(r.karatCode)?.touch ?? ''), sellRate: r.sellRate.toString(), buyRate: r.buyRate.toString(), prevSellRate: prev != null && Number.isFinite(prev) ? prev.toFixed(2) : null };
+  });
   return { rateUnit: head.rateUnit as RateUnitKey, updatedAt: head.effectiveAt.toISOString(), rows: rateRows };
 }
 
 export async function currentRates(ctx: TenantContext): Promise<CurrentRatesDto> {
-  const [gold, silver] = await Promise.all([metalRates(ctx, 'GOLD'), metalRates(ctx, 'SILVER')]);
-  return { branchId: ctx.activeBranchId, gold, silver };
+  const [gold, silver, display] = await Promise.all([metalRates(ctx, 'GOLD'), metalRates(ctx, 'SILVER'), rateDisplay(ctx)]);
+  return { branchId: ctx.activeBranchId, gold, silver, display };
+}
+
+/** 'rates.display' resolved like getSettings (branch row > business row > defaults), without loading every key. */
+async function rateDisplay(ctx: TenantContext): Promise<{ showBuy: boolean }> {
+  const rows = await scopedDb(ctx).setting.findMany({ where: { key: 'rates.display', branchId: { in: [0, ...(ctx.activeBranchId != null ? [ctx.activeBranchId] : [])] } } });
+  const raw = rows.find((r) => r.branchId !== 0)?.value ?? rows.find((r) => r.branchId === 0)?.value ?? {};
+  const parsed = SETTING_SCHEMAS['rates.display'].safeParse(raw);
+  return parsed.success ? parsed.data : { showBuy: true };
 }
 
 /** Returns offending rows if any rate is outside its limit; caller decides whether an override (with MPIN) is allowed. */
@@ -278,16 +337,33 @@ export async function checkRateLimits(ctx: TenantContext, body: { metal: Metal; 
   return body.rates.filter((r) => r.sellRate < min || r.sellRate > max || r.buyRate < min || r.buyRate > max);
 }
 
-export async function setRates(ctx: TenantContext, body: { metal: Metal; rateUnit: RateUnitKey; branchId?: number; rates: { karatCode: string; sellRate: number; buyRate: number }[] }): Promise<CurrentRatesDto> {
+type SetRatesInput = { metal: Metal; rateUnit: RateUnitKey; branchId?: number; rates: { karatCode: string; sellRate: number; buyRate: number }[] };
+
+/** Branch override rule shared by setRates + setRatesBatch: only admins, and the branch must exist. Returns the target branchId (0 = business-wide). */
+async function rateBranch(ctx: TenantContext, body: SetRatesInput): Promise<number> {
   const branchId = body.branchId ?? 0;
   if (branchId !== 0) {
     if (ctx.level !== 'ADMIN') throw new HttpError(403, 'FORBIDDEN', 'Only admins can set branch rate overrides');
     if (!(await scopedDb(ctx).branch.findUnique({ where: { id: branchId } }))) throw new HttpError(404, 'NOT_FOUND', 'Branch not found');
   }
+  return branchId;
+}
+const rateRowsData = (ctx: TenantContext, body: SetRatesInput, branchId: number, effectiveAt: Date) =>
+  body.rates.map((r) => ({ branchId, metal: body.metal, karatCode: r.karatCode, rateUnit: body.rateUnit, sellRate: r.sellRate, buyRate: r.buyRate, effectiveAt, createdById: ctx.userId })) as never;
+
+export async function setRates(ctx: TenantContext, body: SetRatesInput): Promise<CurrentRatesDto> {
+  const branchId = await rateBranch(ctx, body);
+  await scopedDb(ctx).metalRate.createMany({ data: rateRowsData(ctx, body, branchId, new Date()) });
+  return currentRates(ctx);
+}
+
+/** POST /rates/batch: every metal's rows in ONE transaction with one effectiveAt (all saved or none). Limits/MPIN are checked by the route. */
+export async function setRatesBatch(ctx: TenantContext, bodies: SetRatesInput[]): Promise<CurrentRatesDto> {
+  const branchIds: Awaited<ReturnType<typeof rateBranch>>[] = [];
+  for (const b of bodies) branchIds.push(await rateBranch(ctx, b));
+  const sdb = scopedDb(ctx);
   const effectiveAt = new Date();
-  await scopedDb(ctx).metalRate.createMany({
-    data: body.rates.map((r) => ({ branchId, metal: body.metal, karatCode: r.karatCode, rateUnit: body.rateUnit, sellRate: r.sellRate, buyRate: r.buyRate, effectiveAt, createdById: ctx.userId })) as never,
-  });
+  await sdb.$transaction(bodies.map((b, i) => sdb.metalRate.createMany({ data: rateRowsData(ctx, b, branchIds[i]!, effectiveAt) })));
   return currentRates(ctx);
 }
 
