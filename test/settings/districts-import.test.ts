@@ -49,6 +49,53 @@ describe('LGD district import', () => {
     expect(await db.district.findUnique({ where: { id: legacy.id } })).not.toBeNull();
   });
 
+  // G7 closure (A3) peer-review notes: a code match and a name match on one district; a district whose LGD code moved state
+  const lgd = (rows: [stateName: string, code: number, name: string][]) =>
+    ['S.No.,State Code,State Name (In English),District Code,District Name(In English),Census 2001 Code,Census 2011 Code', ...rows.map(([st, code, name], i) => `${i + 1},0,${st},${code},${name},0,0`)].join('\n');
+
+  it('two source rows on one district — one by LGD code, one by name: the code keeps it, the other becomes a district of its own (either order), nothing overwritten', async () => {
+    for (const order of [0, 1]) {
+      await db.district.deleteMany();
+      const old = await db.district.create({ data: { stateId: MH, name: 'Aurangabad', lgdCode: 466 } });
+      const rows: [string, number, string][] = [['Maharashtra', 466, 'Chhatrapati Sambhajinagar'], ['Maharashtra', 9466, 'Aurangabad']];
+      const csv = lgd(order ? rows.reverse() : rows);
+
+      const dry = await importDistricts(db, { apply: false, csv });
+      expect([dry.created, dry.updated, dry.nameTaken]).toEqual([1, [{ id: old.id, from: `${MH}:Aurangabad`, to: `${MH}:Chhatrapati Sambhajinagar` }], [{ lgdCode: 9466, stateId: MH, name: 'Aurangabad', districtId: old.id, created: true }]]);
+      expect(await db.district.count()).toBe(1); // a dry run writes nothing
+
+      await importDistricts(db, { apply: true, csv });
+      const all = (await db.district.findMany({ orderBy: { id: 'asc' } })).map((d) => [d.id === old.id, d.stateId, d.name, d.lgdCode]);
+      expect(all).toEqual([[true, MH, 'Chhatrapati Sambhajinagar', 466], [false, MH, 'Aurangabad', 9466]]);
+    }
+  });
+
+  it('a name match whose name another district keeps is reported, not created (no unique-name clash), and that district is untouched', async () => {
+    const old = await db.district.create({ data: { stateId: MH, name: 'Pune', lgdCode: 490 } });
+    const r = await importDistricts(db, { apply: true, csv: lgd([['Maharashtra', 9490, 'Pune'], ['Maharashtra', 490, 'Pune']]) });
+    expect([r.created, r.updated, r.unchanged, r.nameTaken]).toEqual([0, [], 1, [{ lgdCode: 9490, stateId: MH, name: 'Pune', districtId: old.id, created: false }]]);
+    expect((await db.district.findMany()).map((d) => [d.id, d.name, d.lgdCode])).toEqual([[old.id, 'Pune', 490]]);
+  });
+
+  it('a district whose LGD code moved to another state: updated in place, reported as moved with its references — which keep their state (never rewritten)', async () => {
+    const d = await db.district.create({ data: { stateId: GOA, name: 'Kushavati', lgdCode: 9999 } });
+    const { business, root } = await createBusiness();
+    await db.branch.update({ where: { id: root.id }, data: { stateId: GOA, districtId: d.id } });
+    await db.party.create({ data: { businessId: business.id, type: 'CUSTOMER', name: 'P', mobile: '9000000009', countryCode: '+91', stateId: GOA, districtId: d.id } });
+    const csv = lgd([['Maharashtra', 9999, 'Kushavati']]);
+
+    const dry = await importDistricts(db, { apply: false, csv });
+    expect(dry.movedState).toEqual([{ id: d.id, name: 'Kushavati', lgdCode: 9999, fromStateId: GOA, toStateId: MH, references: 2 }]);
+    expect((await db.district.findUniqueOrThrow({ where: { id: d.id } })).stateId).toBe(GOA);
+
+    const r = await importDistricts(db, { apply: true, csv });
+    expect(r.movedState).toEqual(dry.movedState);
+    expect((await db.district.findUniqueOrThrow({ where: { id: d.id } })).stateId).toBe(MH);
+    const branch = await db.branch.findUniqueOrThrow({ where: { id: root.id } });
+    expect([branch.stateId, branch.districtId]).toEqual([GOA, d.id]);
+    expect(await db.party.count({ where: { stateId: GOA, districtId: d.id } })).toBe(1);
+  });
+
   it('state → district filtering, and a branch saves, reloads and refuses a district of another state', async () => {
     await importDistricts(db, { apply: true });
     const mh = await api.get(`/api/public/states/${MH}/districts`);

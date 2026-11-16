@@ -270,6 +270,11 @@ export async function deleteGirvi(ctx: TenantContext, id: number): Promise<void>
     await tx.$queryRaw`SELECT id FROM "GirviBatch" WHERE id = ${id} FOR NO KEY UPDATE`;
     const txns = await tx.girviTxn.findMany({ where: { batchId: id }, select: { type: true } });
     if (txns.length !== 1 || txns[0]!.type !== 'GRANT') throw new HttpError(409, 'CONFLICT', 'Only a girvi with just the grant can be deleted');
+    // G7 closure: an item that ever went to a lender stays on its transfer (FK) — a clear 409, not a raw P2003. Items locked after
+    // the loan, as release does; a transfer starting meanwhile waits on them and then finds them gone.
+    await tx.$queryRaw`SELECT id FROM "GirviItem" WHERE "batchId" = ${id} ORDER BY id FOR UPDATE`;
+    const out = await tx.girviTransferItem.findFirst({ where: { girviItem: { batchId: id } }, select: { transfer: { select: { transferNo: true, lenderParty: { select: { name: true } } } } } });
+    if (out) throw new HttpError(409, 'CONFLICT', `An item went to lender ${out.transfer.lenderParty.name} (girvi transfer #${out.transfer.transferNo}), so this girvi can't be deleted`);
     await ledger.reverse(tx, lctx, { source: 'GIRVI', sourceId: String(id) });
     await tx.girviBatch.delete({ where: { id } }); // cascades items + txns
     await logActivity(tx, ctx, { module: 'GIRVI', action: 'DELETED', entity: 'GIRVI', entityId: String(id), summary: `Deleted girvi #${batch.girviNo}` });

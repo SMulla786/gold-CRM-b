@@ -45,9 +45,17 @@ export const requireAuth: RequestHandler = (req, res, next) => {
   // G7 review 4: every write made while impersonating is audited with BOTH identities, whether it was allowed or refused
   if (impersonatorId != null && req.method !== 'GET') {
     const path = req.originalUrl.split('?')[0]!;
-    res.on('finish', () => {
-      void logImpersonatedWrite({ businessId: req.ctx?.businessId ?? null, branchId: req.ctx ? (req.ctx.activeBranchId ?? req.ctx.scopeBranchId) : null, userId, impersonatorId, method: req.method, path, status: res.statusCode });
-    });
+    // G7 closure: logged when the handler ends the response, with the status it set — not on 'finish', which never fires once
+    // the client has hung up, though the handler still makes its write. Once per request.
+    const end = res.end as (...args: unknown[]) => typeof res;
+    let logged = false;
+    res.end = ((...args: unknown[]) => {
+      if (!logged) {
+        logged = true;
+        void logImpersonatedWrite({ businessId: req.ctx?.businessId ?? null, branchId: req.ctx ? (req.ctx.activeBranchId ?? req.ctx.scopeBranchId) : null, userId, impersonatorId, method: req.method, path, status: res.statusCode });
+      }
+      return end.apply(res, args);
+    }) as typeof res.end;
   }
   next();
 };

@@ -3,7 +3,7 @@ import type { SetStockLog, TagTemplate } from '@prisma/client';
 import type { z } from 'zod';
 import { prisma } from '../../lib/prisma';
 import { scopedDb } from '../../lib/db';
-import { kachaBalance } from '../../lib/kacha';
+import { kachaBalance, poolGuard } from '../../lib/kacha';
 import * as ledger from '../../lib/ledger';
 import { logActivity } from '../../lib/activity';
 import { HttpError } from '../../middleware/error';
@@ -242,6 +242,9 @@ export async function setStock(ctx: TenantContext, body: z.output<typeof setStoc
   const log = await prisma.$transaction(async (tx) => {
     // Serialize concurrent sets on the same branch so the difference is computed from a stable balance.
     await tx.$executeRaw(Prisma.sql`SELECT pg_advisory_xact_lock(${branchId}::int4, 97::int4)`);
+    // G7 closure: a kaccha card is the KACHA pool — lock it before the read (a melt / sale in flight draws it meanwhile) and
+    // refuse ending below what open PROCESS batches reserve: 409 KACHA_SHORT, as every other kacha draw (lib/kacha poolGuard)
+    const pool = spec.metalForm === 'KACHA' ? await poolGuard(tx, branchId, [{ metal: spec.asset as 'GOLD' | 'SILVER', form: 'KACHA' }]) : null;
     const old = await cardBalance(tx, ctx.businessId!, [branchId], body.card);
     const next = new Prisma.Decimal(body.newBalance).toDecimalPlaces(isMoney ? 2 : 3);
     const diff = next.minus(old);
@@ -259,6 +262,7 @@ export async function setStock(ctx: TenantContext, body: z.output<typeof setStoc
         narration: `Set ${CARD_LABEL[body.card].toLowerCase()} to ${next.toString()}${body.remarks ? ` · ${body.remarks}` : ''}`,
       }]);
     }
+    await pool?.();
     await logActivity(tx, ctx, { module: 'SET_STOCK', action: 'EDITED', entity: 'SetStockLog', entityId: String(row.id), summary: `${CARD_LABEL[body.card]} set from ${old.toString()} to ${next.toString()}` });
     return row;
   });

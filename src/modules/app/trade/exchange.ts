@@ -97,9 +97,11 @@ export async function createExchange(ctx: TenantContext, body: ExchangeBody): Pr
 
   const id = await prisma.$transaction(async (tx) => {
     const exchangeNo = await nextNo(tx, ctx.businessId!, branchId, 'EXCHANGE');
+    // a SELL can't sell more kacha than the pool holds. G7 closure: the pool before the inline udhar's UDHAR sequence row, as
+    // updateExchange and buy-sell take them (lib/kacha lock order) — the other way round the two deadlocked (40P01)
+    const pools = await poolGuard(tx, branchId, [{ metal: body.metal, form: 'KACHA' }]);
     const inline = await syncInlineUdhar(tx, ctx, null, body.udhar, { branchId, partyId: body.partyId, txnDate }, `Exchange #${exchangeNo}`); // TRD-02
     const ex = await tx.exchange.create({ data: { businessId: ctx.businessId!, branchId, exchangeNo, txnDate, createdById: ctx.userId, ...docData(body, p), ...inline } });
-    const pools = await poolGuard(tx, branchId, [{ metal: body.metal, form: 'KACHA' }]); // a SELL can't sell more kacha than the pool holds
     if (p.plan.rows) await savePayments(tx, ctx, 'EXCHANGE', ex.id, p.plan);
     await post(tx, ctx, { id: ex.id, exchangeNo, branchId, txnDate }, body, p);
     await pools();

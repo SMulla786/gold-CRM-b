@@ -2,6 +2,7 @@ import { Prisma } from '@prisma/client';
 import { LEDGER_SOURCES } from '../shared';
 import type { BalanceDto, LedgerSource } from '../shared';
 import { HttpError } from '../middleware/error';
+import { assertBranchesActive } from '../middleware/context';
 import { businessDate, type LedgerContext } from './ledger';
 import type { ScopedDb } from './db';
 
@@ -54,6 +55,7 @@ export async function post(tx: Prisma.TransactionClient, ctx: LedgerContext, ent
       createdById: ctx.userId,
     });
   }
+  await assertBranchesActive(tx, ctx.businessId, data.map((r) => r.branchId)); // G7: an inactive branch takes no new party rows (as lib/ledger)
   if (data.length) await tx.udharEntry.createMany({ data });
 }
 
@@ -81,6 +83,7 @@ export async function reverse(tx: Prisma.TransactionClient, ctx: LedgerContext, 
       reversalOfId: r.id,
       createdById: ctx.userId,
     }));
+  await assertBranchesActive(tx, ctx.businessId, data.map((r) => r.branchId)); // G7: nor reversals — its history stays as it was
   if (data.length) await tx.udharEntry.createMany({ data });
 }
 

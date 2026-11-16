@@ -115,7 +115,7 @@ export async function assertBranchesActive(db: Pick<Prisma.TransactionClient, 'b
   const want = [...new Set(ids.filter((i): i is number => Number.isInteger(i) && i! > 0))];
   if (!want.length) return;
   const off = await db.branch.findFirst({ where: { businessId, id: { in: want }, isActive: false }, select: { id: true, name: true } });
-  if (off) throw new HttpError(403, 'BRANCH_INACTIVE', `Branch "${off.name}" is inactive. Reactivate it in Settings → Branches to record new entries.`, { branchId: off.id });
+  if (off) throw new HttpError(403, 'BRANCH_INACTIVE', `Branch "${off.name}" is inactive. Reactivate it in Admin → Branches to record new entries.`, { branchId: off.id });
 }
 
 /** G7: a write on an existing document checks the document's own branch — X-Branch-Id 'all' or another branch doesn't get round it. */

@@ -72,9 +72,15 @@ type RefreshOutcome = { accessToken: string; refreshToken: string } | { fail: st
 export async function refresh(rawToken: string | undefined, meta: SessionMeta): Promise<{ accessToken: string; refreshToken: string }> {
   if (!rawToken) throw new HttpError(401, 'UNAUTHENTICATED', 'No refresh token');
   const nextToken = successorToken(rawToken);
+  const hash = hashToken(rawToken);
   const out = await prisma.$transaction(async (tx): Promise<RefreshOutcome> => {
-    // Row lock first: a simultaneous duplicate waits here until this rotation commits, then reads it below.
-    const hit = await tx.$queryRaw<{ id: string }[]>`SELECT id FROM "Session" WHERE "refreshTokenHash" = ${hashToken(rawToken)} FOR NO KEY UPDATE`;
+    // G7 closure — lock order User → Session, as every revoke (password change / reset, admin reset, block, theft sign-out:
+    // the user row, then its sessions, in one tx): a revoke running meanwhile waits for this rotation and then sees the
+    // successor, instead of taking its snapshot first and leaving the successor live.
+    const [owner] = await tx.$queryRaw<{ userId: number }[]>`SELECT "userId" FROM "Session" WHERE "refreshTokenHash" = ${hash}`;
+    if (owner) await tx.$executeRaw`SELECT 1 FROM "User" WHERE id = ${owner.userId} FOR SHARE`;
+    // Then the session row: a simultaneous duplicate waits here until this rotation commits, then reads it below.
+    const hit = await tx.$queryRaw<{ id: string }[]>`SELECT id FROM "Session" WHERE "refreshTokenHash" = ${hash} FOR NO KEY UPDATE`;
     const session = hit[0] ? await tx.session.findUnique({ where: { id: hit[0].id } }) : null;
     if (!session) return { fail: 'Invalid refresh token' };
     const user = await tx.user.findUnique({ where: { id: session.userId }, select: { status: true } });

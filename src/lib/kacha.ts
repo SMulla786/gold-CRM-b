@@ -98,7 +98,8 @@ export async function poolGuard(tx: Queryer, branchId: number, pools: Pool[], us
 export async function assertKachaAvailable(tx: Queryer, branchId: number, metal: Metal, fine: Prisma.Decimal | string | number): Promise<void> {
   const bal = await lockedKacha(tx, branchId, metal);
   const need = new Prisma.Decimal(fine);
-  if (bal.lessThan(need)) throw new HttpError(409, 'CONFLICT', `Not enough kacha ${metal.toLowerCase()}: have ${bal.toString()}g, need ${need.toString()}g`);
+  // the same 409 shape as poolGuard (details.code KACHA_SHORT), so a client tells a pool shortfall from any other conflict
+  if (bal.lessThan(need)) throw new HttpError(409, 'CONFLICT', `Not enough kacha ${metal.toLowerCase()}: have ${bal.toString()}g, need ${need.toString()}g`, { code: 'KACHA_SHORT', metal, form: 'KACHA', available: bal.toFixed(3), needed: need.toFixed(3), usedBy: [] });
 }
 
 /** Takes the (branch, metal) KACHA pool lock and returns its balance. $transaction only. */

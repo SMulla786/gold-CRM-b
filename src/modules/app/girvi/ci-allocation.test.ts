@@ -54,3 +54,29 @@ it('CI: ₹200 interest-only keeps compounding on ₹10,000; ₹4,000 principal 
     },
   });
 });
+
+it('G7 closure (A3), from the rows: a CI top-up adds to the principal interest compounds on, from the top-up date; a principal repayment needs an item released', async () => {
+  const { business, root } = await createBusiness({ name: 'A' });
+  const ctx: TenantContext = {
+    userId: 1, level: 'ADMIN', isOwner: true, businessId: business.id, scopeBranchId: root.id, branchIds: [root.id], activeBranchId: root.id,
+    readOnly: false, modules: ['girvi'], limits: null, permissions: {}, impersonatorId: null,
+  };
+  const party = await db.party.create({ data: { businessId: business.id, type: 'CUSTOMER', name: 'Cust', mobile: '9000000001', countryCode: '+91' } });
+  const g = await girvi.createGirvi(ctx, girviBody.parse({
+    partyId: party.id, issueDate: new Date('2026-01-01'), items: [{ category: 'Gold', name: 'Chain', gross: 40, net: 35, purity: 91.67, rate: 6000 }],
+    principal: 10000, ratePercent: 2, ratePeriod: 'MONTHLY', interestType: 'CI', ciPeriod: 'MONTHLY', method: 'FULL_MONTH', tenureMonths: 12, cash: 10000, online: 0,
+  }));
+  const on = (d: string) => girvi.getGirvi(ctx, g.id, new Date(d));
+  await girvi.payInterest(ctx, g.id, { txnDate: new Date('2026-03-01'), interest: 404, discount: 0, cash: 404, online: 0 }); // settles the due: accrues from 1 Mar
+  await girvi.topupGirvi(ctx, g.id, { txnDate: new Date('2026-03-01'), principal: 5000, cash: 5000, online: 0 });
+
+  const b = await db.girviBatch.findUniqueOrThrow({ where: { id: g.id }, include: { txns: { orderBy: { id: 'asc' } } } });
+  expect([Number(b.principal), b.interestFrom.toISOString().slice(0, 10)]).toEqual([15000, '2026-03-01']);
+  expect(b.txns.map((t) => [t.type, Number(t.principal), Number(t.interest), Number(t.cash)])).toEqual([['GRANT', 10000, 0, 10000], ['INTEREST', 0, 404, 404], ['TOPUP', 5000, 0, 5000]]);
+  const money = await db.ledgerEntry.findMany({ where: { source: 'GIRVI', sourceId: String(g.id) }, orderBy: { id: 'asc' } });
+  expect(money.map((r) => [r.direction, Number(r.amount)])).toEqual([['OUT', 10000], ['IN', 404], ['OUT', 5000]]);
+  expect([(await on('2026-04-01')).interestDue, (await on('2026-05-01')).interestDue]).toEqual(['300.00', '606.00']); // 15,000 × (1.02ⁿ − 1)
+
+  // limitation (confirmed from the code): principal comes back only with a release of at least one item
+  expect(girviReleaseBody.safeParse({ itemIds: [], principalPaid: 1000, cash: 1000 }).success).toBe(false);
+});

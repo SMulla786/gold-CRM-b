@@ -7,6 +7,7 @@ import { logActivity } from '../../lib/activity';
 import { HttpError } from '../../middleware/error';
 import type { TenantContext } from '../../middleware/context';
 import { moneyToMetal } from '../../shared';
+import { assertPanForLaterCash } from './billing/service';
 import type {
   BalanceDto,
   BillListItemDto,
@@ -153,6 +154,7 @@ async function postTxn(tx: Prisma.TransactionClient, ctx: TenantContext, h: { id
     if (applied.lte(0)) throw new HttpError(400, 'VALIDATION', sell ? 'Enter the amount received to settle the bill' : 'Enter the amount paid to settle the bill');
     // Paying a supplier more than the bill's due has no meaning on the bill (a sell overpay stays the customer's advance).
     if (!sell && applied.gt(due)) throw new HttpError(409, 'CONFLICT', `Paid amount exceeds the bill due (${money(due)})`);
+    await assertPanForLaterCash(tx, b, D(cash)); // G7 closure: the add-payment PAN rule (D-e); a refusal rolls back every row above
     if (cash > 0) await tx.billPayment.create({ data: { billId: b.id, mode: 'CASH', amount: cash, txnDate, udharTxnId: h.id, createdById: ctx.userId } });
     if (online > 0) await tx.billPayment.create({ data: { billId: b.id, mode: 'ONLINE', bankAccountId: bankId!, amount: online, txnDate, udharTxnId: h.id, createdById: ctx.userId } });
     await tx.bill.update({ where: { id: b.id }, data: { paid: { increment: applied } } });

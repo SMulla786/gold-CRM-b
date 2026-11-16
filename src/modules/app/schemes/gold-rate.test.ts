@@ -52,6 +52,19 @@ describe('GOLD scheme rate', () => {
     expect(fineOf(await s.pay((await s.enroll()).id))).toBeCloseTo(1, 3); // the 22K rate, not a 409
   });
 
+  it('G7 owner rule, from the rows: the payment stores the purest positively rated karat\'s rate (per 10 g) and the fine it buys; the MONEY row is the amount', async () => {
+    const s = await setup();
+    await db.karatMapping.create({ data: { businessId: s.ctx.businessId!, metal: 'GOLD', code: '18K', title: '18K', touch: 75 } });
+    await s.rates('GRAM_1', [['18K', 4500], ['22K', 5500], ['24K', 0]]); // 24K is purer but saved at 0: 22K is the purest rated karat
+    const e = await s.enroll();
+    await s.pay(e.id); // ₹6,000
+    const pay = await db.schemePayment.findFirstOrThrow({ where: { enrollmentId: e.id } });
+    expect([Number(pay.rate), Number(pay.amount)]).toEqual([55000, 6000]); // ₹5,500 / g → ₹55,000 / 10 g
+    expect(Number(pay.fine)).toBeCloseTo(1.091, 3); // 6,000 ÷ 55,000 × 10 g
+    const money = await db.ledgerEntry.findFirstOrThrow({ where: { source: 'SCHEME', sourceId: `${e.id}-${pay.id}` } });
+    expect([money.asset, money.direction, Number(money.amount)]).toEqual(['MONEY', 'IN', 6000]);
+  });
+
   it('no gold rate set: a payment, a joining token or a first payment → 409 and nothing is written', async () => {
     const s = await setup();
     await expect(s.enroll({ tokenAmount: 500 })).rejects.toMatchObject({ status: 409 });

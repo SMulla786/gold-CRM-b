@@ -9,11 +9,11 @@ import * as inv from '../modules/app/inventory';
 import type { TenantContext } from './context';
 
 /** G7 item 3: Branch.isActive = false → no new write lands on it (403 BRANCH_INACTIVE), whether the branch comes from X-Branch-Id,
- *  the user's own branch, the request body, or the document being written to (ledger postings, and the writes that post nothing). Reads and reports stay open; Settings → Branches can reactivate. */
+ *  the user's own branch, the request body, or the document being written to (ledger postings, and the writes that post nothing). Reads and reports stay open; Admin → Branches can reactivate. */
 
 beforeEach(truncateAll);
 const MODS = ['udhari', 'inventory', 'settings'];
-const INACTIVE = { code: 'BRANCH_INACTIVE', message: expect.stringMatching(/"Station Road" is inactive\. Reactivate it in Settings → Branches/) };
+const INACTIVE = { code: 'BRANCH_INACTIVE', message: expect.stringMatching(/"Station Road" is inactive\. Reactivate it in Admin → Branches/) };
 
 async function setup() {
   const plan = await createPlan({ modules: MODS });
@@ -28,15 +28,25 @@ async function setup() {
   return { business, root, shop, party, h, off };
 }
 
-it('X-Branch-Id of an inactive branch: writes 403, nothing saved; its history still reads; reactivating in Settings → Branches opens it again', async () => {
+/** md5 of every table's rows (G7 closure): a refused write must leave the whole database as it was — no ledger, udhar, payment,
+ *  stock, transfer, girvi, scheme, kacha or activity row added, changed or removed, anywhere. */
+async function contents(): Promise<Record<string, string>> {
+  const tables = await db.$queryRaw<{ t: string }[]>`SELECT tablename AS t FROM pg_tables WHERE schemaname = 'public' AND tablename NOT LIKE '_prisma%'`;
+  const sql = tables.map(({ t }) => `SELECT '${t}' AS t, md5(coalesce(string_agg(x::text, '|' ORDER BY x::text), '')) AS h FROM "${t}" x`).join(' UNION ALL ');
+  return Object.fromEntries((await db.$queryRawUnsafe<{ t: string; h: string }[]>(sql)).map((r) => [r.t, r.h]));
+}
+
+it('X-Branch-Id of an inactive branch: writes 403, nothing saved; its history still reads; reactivating in Admin → Branches opens it again', async () => {
   const s = await setup();
   const udhar = () => api.post('/api/app/udhar').set(s.h(s.shop.id)).send({ partyId: s.party.id, cashOut: 500 });
   expect((await udhar()).status).toBe(201);
   await s.off();
 
+  const before = await contents();
   const r = await udhar();
   expect([r.status, r.body.error]).toEqual([403, expect.objectContaining(INACTIVE)]);
   expect(await db.udharTxn.count()).toBe(1);
+  expect(await contents()).toEqual(before);
   const read = await api.get('/api/app/udhar/entries').set(s.h(s.shop.id));
   expect([read.status, read.body.total]).toEqual([200, 1]);
 
@@ -56,11 +66,13 @@ it('a branch id in the body: stock entry into, or transfer to, an inactive branc
   const item = await db.stockItem.findFirstOrThrow();
   await s.off();
 
+  const before = await contents();
   const into = await api.post('/api/app/stock/entries').set(s.h(s.root.id)).send(entry({ branchId: s.shop.id }));
   expect([into.status, into.body.error]).toEqual([403, expect.objectContaining(INACTIVE)]);
   const to = await api.post('/api/app/stock/transfers').set(s.h(s.root.id)).send({ fromBranchId: s.root.id, toBranchId: s.shop.id, stockItemIds: [item.id] });
   expect([to.status, to.body.error]).toEqual([403, expect.objectContaining(INACTIVE)]);
   expect([await db.stockItem.count(), (await db.stockItem.findUniqueOrThrow({ where: { id: item.id } })).branchId, await db.stockTransfer.count()]).toEqual([1, s.root.id, 0]);
+  expect(await contents()).toEqual(before);
 
   const other = await createBusiness({ name: 'Other' });
   await db.branch.update({ where: { id: other.root.id }, data: { isActive: false } });
@@ -76,6 +88,7 @@ it("a branch user whose own branch is inactive cannot write; a write onto an exi
   const clerkToken = (await loginAs(clerk.username)).token!;
   await s.off();
 
+  const before = await contents();
   const own = await api.post('/api/app/udhar').set({ Authorization: bearer(clerkToken) }).send({ partyId: s.party.id, cashOut: 100 });
   expect([own.status, own.body.error]).toEqual([403, expect.objectContaining(INACTIVE)]);
 
@@ -84,6 +97,7 @@ it("a branch user whose own branch is inactive cannot write; a write onto an exi
     expect([via, del.status, del.body.error]).toEqual([via, 403, expect.objectContaining(INACTIVE)]);
   }
   expect([await db.udharTxn.count({ where: { isDeleted: false } }), await db.ledgerEntry.count({ where: { reversalOfId: { not: null } } })]).toEqual([1, 0]);
+  expect(await contents()).toEqual(before);
 });
 
 it("writes on an existing document that post nothing to the ledger (order, repair, stock, draft, sample, girvi item, bhav) → 403 via 'all' or another branch; fine once reactivated", async () => {
@@ -117,9 +131,11 @@ it("writes on an existing document that post nothing to the ledger (order, repai
     ['sample melt', 'post', `/api/app/samples/${sample.id}/melt`, {}],
     ['girvi item replace', 'patch', `/api/app/girvi/${loan.id}/items/${loan.items[0]!.id}`, { category: 'Gold', name: 'Chain', gross: 12, net: 9, purity: 91.67, rate: 6000, remark: 'revalued' }],
     ['bhav verify', 'post', `/api/app/bhav-booking/${bhav.id}/verify`],
+    ['girvi top-up (posts to the ledger)', 'post', `/api/app/girvi/${loan.id}/topup`, { principal: 1000, cash: 1000, online: 0 }],
   ];
   const send = (w: (typeof writes)[number], via: number | 'all') => api[w[1]](w[2]).set(s.h(via)).send(w[3] ?? {});
   await s.off();
+  const before = await contents();
   for (const w of writes) {
     for (const via of w[4] ? (['all'] as const) : (['all', s.root.id] as const)) {
       const r = await send(w, via);
@@ -127,6 +143,7 @@ it("writes on an existing document that post nothing to the ledger (order, repai
     }
   }
   expect([(await db.order.findUniqueOrThrow({ where: { id: order.id } })).status, (await db.stockItem.findUniqueOrThrow({ where: { id: stock.id } })).remarks]).toEqual(['PENDING', null]);
+  expect(await contents()).toEqual(before);
 
   await db.branch.update({ where: { id: s.shop.id }, data: { isActive: true } });
   for (const w of writes) expect([w[0], (await send(w, 'all')).status < 300]).toEqual([w[0], true]); // each row is a real, valid write
