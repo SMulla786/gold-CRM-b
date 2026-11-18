@@ -1,0 +1,220 @@
+/**
+ * Idempotent base seed, shared by `npm run db:seed` (prisma/seed.ts) and GET /api/public/seed-superadmin:
+ * states, districts (LGD, prisma/data/README.md), permission catalog, system roles, plans, HSN, super admin.
+ * demo: true also creates a demo business with a small branch tree and users (password = the super admin's).
+ */
+import type { Prisma, PrismaClient } from '@prisma/client';
+import { INDIAN_STATES, MODULES, MODULE_KEYS } from '../src/shared';
+import { ensureBusinessDefaults } from '../src/modules/platform/service';
+import { importDistricts } from './districts';
+
+type Grant = { view: boolean; edit: boolean; delete: boolean };
+const ALL: Grant = { view: true, edit: true, delete: true };
+const VIEW: Grant = { view: true, edit: false, delete: false };
+const EDIT: Grant = { view: true, edit: true, delete: false };
+
+/** Default permission sets per system designation (seen in justudhari's designation list). */
+const SYSTEM_ROLES: Record<string, (pageKey: string) => Grant | null> = {
+  'Partner (Read Only)': () => VIEW,
+  Partners: () => ALL,
+  'Showroom Manager': (k) => (k.startsWith('settings.integration') ? VIEW : EDIT),
+  'Stock Manager': (k) =>
+    k.startsWith('inventory.') || k.startsWith('stock_summary.')
+      ? ALL
+      : k === 'dashboard.home' || k.startsWith('billing.') || k.startsWith('daybook.')
+        ? VIEW
+        : null,
+  'Billing Operator / Cashier': (k) =>
+    ['billing.sell_bill', 'billing.just_bill', 'billing.purchase_bill', 'udhari.entry', 'income_expense.entry', 'settings.parties'].includes(k)
+      ? EDIT
+      : ['dashboard.home', 'billing.gst_report', 'udhari.ledger', 'inventory.all_stock', 'daybook.all_in_one', 'daybook.money', 'income_expense.list'].includes(k)
+        ? VIEW
+        : null,
+  'Sales Executive': (k) =>
+    ['billing.showroom_drafts', 'orders.create', 'settings.parties'].includes(k)
+      ? EDIT
+      : ['dashboard.home', 'inventory.all_stock', 'inventory.dashboard', 'orders.list'].includes(k)
+        ? VIEW
+        : null,
+};
+
+/** HSN master as offered by justudhari (docs/raw crawl). shortcut: only 19 of its 75 product-level rows captured; add the rest when the full list is captured. */
+const HSN_BASE: Array<[string, "GOLD" | "SILVER" | "ARTIFICIAL" | "STONE" | "FRANCHISE" | "FINDINGS", string, number]> = [
+  ["7113", "GOLD", "Gold Jewellery", 3],
+  ["7114", "SILVER", "Silver Jewellery", 3],
+  ["7108", "GOLD", "Bullion", 3],
+  ["7106", "SILVER", "Bullion", 3],
+  ["7102", "STONE", "Loose Stones", 0.25],
+  ["7103", "STONE", "Loose Stones", 0.25],
+  ["7117", "ARTIFICIAL", "Imitation", 3],
+  ["7115", "FINDINGS", "Findings", 3],
+  ["711590", "FINDINGS", "Findings", 3],
+  ["71159010", "FINDINGS", "Findings", 3],
+];
+const GOLD_PRODUCTS = ["Ring","Chain","Necklace","Mangalsutra","Pendant","Locket","Bangle","Kada","Bracelet","Anklet","Toe Ring","Earrings","Tops","Jhumka","Ear Cuff","Nose Pin","Nath","Maang Tikka","Matha Patti"];
+
+async function seedHsn(prisma: PrismaClient) {
+  const rows = [
+    ...HSN_BASE.map(([code, category, productType, gstRate]) => ({ code, category, productType, gstRate })),
+    ...GOLD_PRODUCTS.map((p) => ({ code: "7113", category: "GOLD" as const, productType: `Gold Jewellery - ${p}`, gstRate: 3 })),
+  ];
+  for (const r of rows) {
+    await prisma.hsnCode.upsert({
+      where: { code_category_productType: { code: r.code, category: r.category, productType: r.productType } },
+      update: { gstRate: r.gstRate },
+      create: r,
+    });
+  }
+}
+
+async function seedStates(prisma: PrismaClient) {
+  for (const s of INDIAN_STATES) {
+    await prisma.state.upsert({ where: { id: s.code }, update: { name: s.name }, create: { id: s.code, name: s.name } });
+  }
+}
+
+async function seedPermissions(prisma: PrismaClient) {
+  let sort = 0;
+  for (const m of MODULES) {
+    await prisma.permission.upsert({
+      where: { key: m.key },
+      update: { label: m.label, sort: sort },
+      create: { key: m.key, module: m.key, label: m.label, isModule: true, hasActions: false, sort: sort },
+    });
+    sort++;
+    for (const pg of m.pages) {
+      await prisma.permission.upsert({
+        where: { key: pg.key },
+        update: { label: pg.label, hasActions: pg.actions, sort: sort },
+        create: { key: pg.key, module: m.key, label: pg.label, isModule: false, hasActions: pg.actions, sort: sort },
+      });
+      sort++;
+    }
+  }
+}
+
+async function seedSystemRoles(prisma: PrismaClient) {
+  const perms = await prisma.permission.findMany();
+  const byKey = new Map(perms.map((x) => [x.key, x]));
+  for (const [name, grantFor] of Object.entries(SYSTEM_ROLES)) {
+    const existing = await prisma.role.findFirst({ where: { businessId: null, name } });
+    const role = existing ?? (await prisma.role.create({ data: { name, isSystem: true } }));
+    const rows: Prisma.RolePermissionCreateManyInput[] = [];
+    for (const m of MODULES) {
+      const pageRows = m.pages
+        .map((pg) => ({ pg, g: grantFor(pg.key) }))
+        .filter((x): x is { pg: (typeof m.pages)[number]; g: Grant } => x.g !== null);
+      if (!pageRows.length) continue;
+      rows.push({ roleId: role.id, permissionId: byKey.get(m.key)!.id, canView: true });
+      for (const { pg, g } of pageRows) {
+        rows.push({
+          roleId: role.id,
+          permissionId: byKey.get(pg.key)!.id,
+          canView: g.view,
+          canEdit: pg.actions && g.edit,
+          canDelete: pg.actions && g.delete,
+        });
+      }
+    }
+    await prisma.rolePermission.deleteMany({ where: { roleId: role.id } });
+    await prisma.rolePermission.createMany({ data: rows });
+  }
+}
+
+async function seedPlans(prisma: PrismaClient) {
+  const plans = [
+    { name: 'Trial', description: '14-day free trial, all modules', durationDays: 14, price: 0, maxBranches: 2, maxUsers: 5, modules: MODULE_KEYS },
+    {
+      name: 'Basic (Yearly)',
+      description: 'Billing, inventory, udhari, ledgers',
+      durationDays: 365,
+      price: 9999,
+      maxBranches: 1,
+      maxUsers: 5,
+      modules: ['dashboard', 'settings', 'billing', 'inventory', 'udhari', 'income_expense', 'daybook'],
+    },
+    { name: 'Pro (Yearly)', description: 'All modules', durationDays: 365, price: 24999, maxBranches: 5, maxUsers: 25, modules: MODULE_KEYS },
+  ];
+  for (const p of plans) {
+    await prisma.plan.upsert({ where: { name: p.name }, update: {}, create: p });
+  }
+}
+
+/** Upsert by username, never changes an existing user; returns whoever holds the username. */
+function seedSuperAdmin(prisma: PrismaClient, passwordHash: string) {
+  const username = process.env.SEED_SUPERADMIN_USERNAME || 'superadmin';
+  return prisma.user.upsert({
+    where: { username },
+    update: {},
+    create: {
+      level: 'SUPER_ADMIN',
+      name: 'Platform Owner',
+      username,
+      email: process.env.SEED_SUPERADMIN_EMAIL || null,
+      passwordHash,
+    },
+  });
+}
+
+/** Creates a branch and fills its materialised path (needs the generated id). */
+async function createBranch(prisma: PrismaClient, data: { businessId: number; name: string; parent?: { id: number; path: string; depth: number }; isAdminNode?: boolean }) {
+  const b = await prisma.branch.create({
+    data: {
+      businessId: data.businessId,
+      name: data.name,
+      parentId: data.parent?.id ?? null,
+      depth: data.parent ? data.parent.depth + 1 : 0,
+      isAdminNode: data.isAdminNode ?? false,
+      path: '',
+    },
+  });
+  return prisma.branch.update({ where: { id: b.id }, data: { path: `${data.parent?.path ?? '/'}${b.id}/` } });
+}
+
+async function seedDemo(prisma: PrismaClient, passwordHash: string) {
+  if (await prisma.business.findFirst({ where: { name: 'Demo Jewellers' } })) return;
+  const plan = await prisma.plan.findUniqueOrThrow({ where: { name: 'Pro (Yearly)' } });
+  const biz = await prisma.business.create({
+    data: { name: 'Demo Jewellers', ownerName: 'Demo Owner', mobile: '9000000001', stateId: 27 },
+  });
+  const now = new Date();
+  await prisma.subscription.create({
+    data: {
+      businessId: biz.id,
+      planId: plan.id,
+      startsAt: now,
+      endsAt: new Date(now.getTime() + plan.durationDays * 86400000),
+      maxBranches: plan.maxBranches,
+      maxUsers: plan.maxUsers,
+      modules: plan.modules,
+    },
+  });
+  const root = await createBranch(prisma, { businessId: biz.id, name: 'Demo HQ', isAdminNode: true });
+  const pune = await createBranch(prisma, { businessId: biz.id, name: 'Pune', parent: root, isAdminNode: true });
+  const kothrud = await createBranch(prisma, { businessId: biz.id, name: 'Kothrud', parent: pune });
+  await createBranch(prisma, { businessId: biz.id, name: 'Mumbai', parent: root });
+  const cashierRole = await prisma.role.findFirstOrThrow({ where: { businessId: null, name: 'Billing Operator / Cashier' } });
+  const users = [
+    { username: 'demo.owner', name: 'Demo Owner', level: 'ADMIN' as const, branchId: root.id, isOwner: true },
+    { username: 'demo.pune', name: 'Pune Manager', level: 'ADMIN' as const, branchId: pune.id },
+    { username: 'demo.cashier', name: 'Kothrud Cashier', level: 'BRANCH_USER' as const, branchId: kothrud.id, roleId: cashierRole.id },
+  ];
+  for (const u of users) {
+    await prisma.user.create({ data: { ...u, businessId: biz.id, passwordHash } });
+  }
+}
+
+/** passwordHash null → leave the super admin out (one already exists). Validate the password before calling: a refused one must leave the DB untouched. */
+export async function seedBase(prisma: PrismaClient, opts: { passwordHash: string | null; demo?: boolean }) {
+  await seedStates(prisma);
+  const districts = await importDistricts(prisma, { apply: true });
+  await seedPermissions(prisma);
+  await seedSystemRoles(prisma);
+  await seedPlans(prisma);
+  await seedHsn(prisma);
+  const superAdmin = opts.passwordHash ? await seedSuperAdmin(prisma, opts.passwordHash) : null;
+  if (opts.demo && opts.passwordHash) await seedDemo(prisma, opts.passwordHash);
+  // backfill defaults (karats, rate limits) for businesses created before the creation hook existed
+  for (const b of await prisma.business.findMany({ select: { id: true } })) await ensureBusinessDefaults(prisma, b.id);
+  return { districts, superAdmin };
+}

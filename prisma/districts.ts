@@ -8,12 +8,15 @@
  * An LGD code match always wins over a name match (one district is never updated twice). A district whose code moved to
  * another state is reported (movedState) with its reference count; references are never rewritten — review them by hand.
  */
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import type { Prisma, PrismaClient } from '@prisma/client';
 import { parseCsv } from '../src/lib/csv';
 import { INDIAN_STATES } from '../src/shared';
 
 export const LGD_DISTRICTS_CSV = new URL('./data/lgd-districts.csv', import.meta.url);
+// inside the esbuild bundle import.meta.url is dist/index.js, so fall back to the server's working dir (backend/)
+const lgdCsvPath = () => (existsSync(LGD_DISTRICTS_CSV) ? LGD_DISTRICTS_CSV : resolve('prisma/data/lgd-districts.csv'));
 
 export interface DistrictImportReport {
   sourceRows: number;
@@ -31,7 +34,7 @@ export interface DistrictImportReport {
 }
 
 export async function importDistricts(db: PrismaClient, opts: { apply: boolean; csv?: string }): Promise<DistrictImportReport> {
-  const [header, ...rows] = parseCsv(opts.csv ?? readFileSync(LGD_DISTRICTS_CSV, 'utf8'));
+  const [header, ...rows] = parseCsv(opts.csv ?? readFileSync(lgdCsvPath(), 'utf8'));
   const col = (h: string): number => {
     const i = header!.indexOf(h);
     if (i < 0) throw new Error(`LGD CSV: column "${h}" missing — the LGD export format changed, check prisma/data/README.md`);
